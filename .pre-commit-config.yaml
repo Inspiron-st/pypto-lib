@@ -1,0 +1,15 @@
+repos:
+  - repo: local
+    hooks:
+      - id: check-headers
+        name: check-headers
+        entry: python tests/lint/check_headers.py
+        language: python
+        pass_filenames: false
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.3
+    hooks:
+      - id: ruff
+        types_or: [python]
+        args: [--config, ruff.toml]
