@@ -153,10 +153,11 @@ def build_deepseek_v3_2_decode_front_program(
             dispatch_buf: pl.Tensor[[EP_NODES_CFG, BATCH_CFG, ATTN_OUT_CFG], pl.BF16],
         ) -> pl.Tensor[[EP_NODES_CFG, BATCH_CFG, ATTN_OUT_CFG], pl.BF16]:
             # Scope 1: input RMSNorm + Q/K/V projection.
+            qr = pl.create_tensor([BATCH_CFG, Q_LORA_RANK_CFG], dtype=pl.BF16)
+            q_proj = pl.create_tensor([BATCH_CFG, NUM_HEADS_CFG * QK_HEAD_DIM_CFG], dtype=pl.BF16)
+            kv_a = pl.create_tensor([BATCH_CFG, KV_A_OUT], dtype=pl.BF16)
             with pl.auto_incore():
-                qr = pl.create_tensor([BATCH_CFG, Q_LORA_RANK_CFG], dtype=pl.BF16)
-                q_proj = pl.create_tensor([BATCH_CFG, NUM_HEADS_CFG * QK_HEAD_DIM_CFG], dtype=pl.BF16)
-                kv_a = pl.create_tensor([BATCH_CFG, KV_A_OUT], dtype=pl.BF16)
+
                 sq_sum = pl.create_tensor([BATCH_CFG, 1], dtype=pl.FP32)
                 sq_sum = pl.mul(sq_sum, 0.0)
                 # Keep an explicit local Vec pad tensor alive in this scope so
@@ -175,6 +176,7 @@ def build_deepseek_v3_2_decode_front_program(
                     sq_sum = pl.add(sq_sum, pl.row_sum(pl.mul(x_chunk, x_chunk)))
 
                 inv_rms = pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS))
+                # inv_rms = 1 / rms
                 for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
                     inv_rms_tile = pl.slice(inv_rms, [BATCH_TILE, 1], [b0, 0])
                     inv_rms_tile = pl.add(inv_rms_tile, pl.mul(usage_pad_sum, 0.0))
@@ -191,6 +193,7 @@ def build_deepseek_v3_2_decode_front_program(
                             wq_chunk = pl.slice(wq_a, [K_CHUNK, LORA_CHUNK], [k0, q0])
                             q_acc = pl.add(q_acc, pl.matmul(pl.cast(normed, target_type=pl.BF16), wq_chunk))
                         qr = pl.assemble(qr, pl.cast(q_acc, target_type=pl.BF16), [b0, q0])
+                    # qr = rmsnorm @ wq_a
 
                     for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=8):
                         q0 = ob * Q_OUT_CHUNK
@@ -204,6 +207,7 @@ def build_deepseek_v3_2_decode_front_program(
                             wq_chunk = pl.slice(wq_b, [LORA_CHUNK, Q_OUT_CHUNK], [k0, q0])
                             q_acc = pl.add(q_acc, pl.matmul(pl.cast(qn, target_type=pl.BF16), wq_chunk))
                         q_proj = pl.assemble(q_proj, pl.cast(q_acc, target_type=pl.BF16), [b0, q0])
+                    # q_proj = qr @ wq_b 
 
                     for ob in pl.parallel(0, KV_A_BLOCKS, 1, chunk=8):
                         kv0 = ob * KV_OUT_CHUNK
@@ -218,6 +222,7 @@ def build_deepseek_v3_2_decode_front_program(
                             wkv_chunk = pl.slice(wkv_a, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
                             kv_acc = pl.add(kv_acc, pl.matmul(pl.cast(normed, target_type=pl.BF16), wkv_chunk))
                         kv_a = pl.assemble(kv_a, pl.cast(kv_acc, target_type=pl.BF16), [b0, kv0])
+                    # kv_a = normed @ wkv_a
 
             # Scope 2: RoPE + cache update + indexer topk + sparse attention.
             # Fusion policy (aligned with prefill_front):
@@ -226,9 +231,10 @@ def build_deepseek_v3_2_decode_front_program(
             # - B1/B2: two-stage topk (block-local then global merge)
             # - C: sparse attention consumes merged topk immediately
             # This avoids materializing topk intermediates across kernel boundaries.
+            attn_front = pl.create_tensor([BATCH_CFG, ATTN_OUT_CFG], dtype=pl.FP32)
             with pl.auto_incore():
                 layer_id = pl.tensor.read(layer_id_t, [0])
-                attn_front = pl.create_tensor([BATCH_CFG, ATTN_OUT_CFG], dtype=pl.FP32)
+                # attn_front = pl.create_tensor([BATCH_CFG, ATTN_OUT_CFG], dtype=pl.FP32)
                 for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
                     ctx_len = pl.tensor.read(seq_lens, [b])
                     pos = ctx_len - 1
@@ -241,6 +247,7 @@ def build_deepseek_v3_2_decode_front_program(
                     kv_row = pl.cast(pl.slice(kv_a, [1, KV_LORA_RANK_CFG], [b, 0]), target_type=pl.FP32)
                     kv_gamma = pl.slice(kv_norm_weight, [1, KV_LORA_RANK_CFG], [0, 0])
                     kv_normed = pl.col_expand_mul(kv_row, kv_gamma)
+                    # issue: don't need to do rmsnorm?
                     pe_lo = pl.cast(
                         pl.slice(kv_a, [1, QK_ROPE_HEAD_DIM_CFG // 2], [b, KV_LORA_RANK_CFG]),
                         target_type=pl.FP32,
@@ -260,7 +267,7 @@ def build_deepseek_v3_2_decode_front_program(
                     pe_rot = pl.assemble(pe_rot, pe_rot_hi, [0, QK_ROPE_HEAD_DIM_CFG // 2])
                     kv_cache = pl.assemble(kv_cache, pl.cast(kv_normed, target_type=pl.BF16), [cache_row, 0])
                     pe_cache = pl.assemble(pe_cache, pl.cast(pe_rot, target_type=pl.BF16), [cache_row, 0])
-
+                    # After normalizing kv_nope split from kv_a, write to kv_cache; after doing RoPE on kv_rope, write to pe_cache
                     # Stage B1: block-local topk (2 blocks, each 2K candidates).
                     topk_vals = pl.create_tensor([1, INDEX_TOPK_CFG], dtype=pl.FP32)
                     topk_idx = pl.create_tensor([1, INDEX_TOPK_CFG], dtype=pl.INT32)
@@ -277,6 +284,12 @@ def build_deepseek_v3_2_decode_front_program(
                         topk_idx = pl.assemble(topk_idx, neg_one, [0, kk])
                         blk_topk_idx = pl.assemble(blk_topk_idx, neg_one, [0, kk])
                         blk_topk_idx = pl.assemble(blk_topk_idx, neg_one, [1, kk])
+                    # topk_vals:    [-inf, -inf, -inf, ..., -inf]  (2048 个)
+                    # topk_idx:     [ -1,   -1,   -1,  ...,  -1 ]  (2048 个)
+                    # blk_topk_vals: [[-inf, -inf, ..., -inf],     (block 0)
+                    #                 [-inf, -inf, ..., -inf]]     (block 1)
+                    # blk_topk_idx:  [[ -1,   -1,  ...,  -1 ],     (block 0)
+                    #                 [ -1,   -1,  ...,  -1 ]]     (block 1)
 
                     q_col0 = 0
                     q_nope0 = pl.cast(
@@ -296,8 +309,10 @@ def build_deepseek_v3_2_decode_front_program(
                     q0_rot = pl.assemble(q0_rot, pl.add(pl.col_expand_mul(q0_hi, cos_hi), pl.col_expand_mul(q0_lo, sin_hi)), [0, QK_ROPE_HEAD_DIM_CFG // 2])
                     q0_nope_latent = pl.matmul(
                         pl.cast(q_nope0, target_type=pl.BF16),
-                        pl.slice(w_q_nope_to_latent, [QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG], [0, 0, 0]),
+                        pl.reshape(pl.slice(w_q_nope_to_latent, [1, QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG], [0, 0, 0]), [QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG]),
                     )
+                    # q0_nope_latent = q_nope0 @ w_q_nope_to_latent
+                    # issue: N-axis not reflected. This design assumes different heads have similar attention distributions, is it sufficient to use one head for index selection?
 
                     sparse_k_gen = pl.min(INDEX_TOPK_CFG, ctx_len)
                     for blk in pl.range(2):
@@ -346,6 +361,7 @@ def build_deepseek_v3_2_decode_front_program(
                                             blk_topk_vals = pl.assemble(blk_topk_vals, cur_score_t, [blk, kk])
                                             blk_topk_idx = pl.assemble(blk_topk_idx, cur_index_t, [blk, kk])
                                             inserted = pl.assemble(inserted, one_t, [0, 0])
+                    # block-level topk val idx
 
                     # Stage B2: global merge from 2x(local topk) -> final topk.
                     for blk in pl.range(2):
@@ -383,6 +399,7 @@ def build_deepseek_v3_2_decode_front_program(
                                             topk_vals = pl.assemble(topk_vals, cand_val_t, [0, tkk])
                                             topk_idx = pl.assemble(topk_idx, cand_idx_t, [0, tkk])
                                             inserted = pl.assemble(inserted, one_t, [0, 0])
+                    # merge sort
 
                     # Stage C: sparse attention directly consumes merged topk_idx.
                     attn_row = pl.create_tensor([1, ATTN_OUT_CFG], dtype=pl.FP32)
@@ -404,7 +421,7 @@ def build_deepseek_v3_2_decode_front_program(
                         q_rot = pl.assemble(q_rot, pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi)), [0, QK_ROPE_HEAD_DIM_CFG // 2])
                         q_nope_latent = pl.matmul(
                             pl.cast(q_nope, target_type=pl.BF16),
-                            pl.slice(w_q_nope_to_latent, [QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG], [h, 0, 0]),
+                            pl.reshape(pl.slice(w_q_nope_to_latent, [1, QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG], [h, 0, 0]), [QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG]),
                         )
 
                         oi = pl.create_tensor([1, KV_LORA_RANK_CFG], dtype=pl.FP32)
@@ -444,7 +461,8 @@ def build_deepseek_v3_2_decode_front_program(
                         ctx_v = pl.mul(ctx_v, 0.0)
                         for vb in pl.range(V_OUT_BLOCKS):
                             v0 = vb * V_OUT_CHUNK
-                            wv_tile = pl.slice(w_latent_to_v, [KV_LORA_RANK_CFG, V_OUT_CHUNK], [h, 0, v0])
+                            wv_tile = pl.slice(w_latent_to_v, [1, KV_LORA_RANK_CFG, V_OUT_CHUNK], [h, 0, v0])
+                            wv_tile = pl.reshape(wv_tile, [KV_LORA_RANK_CFG, V_OUT_CHUNK])
                             v_part = pl.matmul(pl.cast(ctx_latent, target_type=pl.BF16), wv_tile, out_dtype=pl.FP32)
                             ctx_v = pl.assemble(ctx_v, v_part, [0, v0])
                         attn_row = pl.assemble(attn_row, ctx_v, [0, v_col])
