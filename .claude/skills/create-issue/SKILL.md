@@ -106,21 +106,17 @@ git -C "$SIMPLER_ROOT" branch --show-current
 cat /usr/local/Ascend/ascend-toolkit/latest/version.cfg 2>/dev/null || echo "not detected"
 ```
 
-### ptoas Installation Check
+### ptoas Version Detection
 
-ptoas version cannot be detected programmatically. Only verify that it is installed:
+Detect ptoas installation and version:
 
 ```bash
-# Linux: check binary exists
-test -x "$PTOAS_ROOT/ptoas" || test -x "$PTOAS_ROOT/bin/ptoas" && echo "installed" || echo "not found"
-
-# macOS: check pip package
-python3 -c "import ptoas" 2>/dev/null && echo "installed" || echo "not found"
+"$PTOAS_ROOT/ptoas" --version 2>/dev/null || echo "not found"
 ```
 
-If ptoas is **not installed**, use the `/setup_env` skill's Step 5 to install it before proceeding.
+If ptoas is **not found** or `PTOAS_ROOT` is not set, install it following the version pinned in the **pypto** repo's CI configuration (`$PYPTO_ROOT/.github/workflows/ci.yml`, look for `PTOAS_VERSION=...`). After installation, re-run the version check.
 
-The ptoas version will be confirmed with the user later in Step 7 when formatting the issue body. If installed via `/setup_env`, use the version pinned in the setup_env skill (check `SKILL.md` for the current pinned version, e.g., `v0.6`).
+Record the detected ptoas version for use in the Environment table.
 
 Record all other values. If any version cannot be detected, use "unknown" and continue.
 
@@ -284,13 +280,6 @@ More content
 ```
 
 **For dropdown fields**, state the selected value as plain text.
-
-### ptoas Version Confirmation
-
-Before formatting the Environment table, **ask the user** to confirm the ptoas version:
-
-- "Was ptoas installed via `/setup_env`?" — If **yes**, read the pinned version from `.claude/skills/setup_env/SKILL.md` (look for `PTOAS_VERSION=...`) and use that.
-- If **no**, ask the user to provide the version they installed.
 
 **For all bug reports**, include these sections automatically:
 

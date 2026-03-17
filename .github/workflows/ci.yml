@@ -44,8 +44,7 @@ jobs:
 
       - name: Install ptoas
         run: |
-          PTOAS_VERSION=v0.7
-          pip install https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-0.1.1-cp310-none-manylinux_2_34_x86_64.whl
+          PTOAS_VERSION=v0.8
           curl --fail --location --retry 3 --retry-all-errors \
             https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-x86_64.tar.gz \
             -o /tmp/ptoas-bin-x86_64.tar.gz

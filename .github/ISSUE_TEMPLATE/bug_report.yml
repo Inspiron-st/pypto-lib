@@ -41,7 +41,7 @@ body:
         | pypto-lib | `abc1234` |
         | pypto | `def5678` (branch: main) |
         | simpler | `ghi9012` (branch: stable) |
-        | ptoas | v0.6 |
+        | ptoas | v0.8 |
         | CANN | 8.0.RC3 or "not detected" |
     validations:
       required: true

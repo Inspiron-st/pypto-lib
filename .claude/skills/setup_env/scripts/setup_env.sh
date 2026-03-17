@@ -13,9 +13,9 @@ WORKSPACE_DIR="$(cd "$REPO_ROOT/.." && pwd)"
 # Pinned PTOAS version — keep in sync with pypto CI
 # Override via environment variable, e.g. PTOAS_VERSION=v0.7 bash setup_env.sh
 # ---------------------------------------------------------------------------
-PTOAS_VERSION="${PTOAS_VERSION:-v0.6}"
-PTOAS_SHA256_AARCH64="b2082034faf20a2eae9e0355c9c3587353f4a20b39dc68d59bd02a8eb341ca33"
-PTOAS_SHA256_X86_64="696782b1c9c0ec24279aaaed83bbb9db97c950584f2c29d229650508824e0851"
+PTOAS_VERSION="${PTOAS_VERSION:-v0.8}"
+PTOAS_SHA256_AARCH64="7c73ba35accca6f0b1a05e09bbb1966ff1d390462c2193fa09ccf181a6af9982"
+PTOAS_SHA256_X86_64="0434fb472978bd7f19a9bf03634e25b970193f8527fd18e6a38b4b6ee932413f"
 
 # ---------------------------------------------------------------------------
 # Platform detection

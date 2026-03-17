@@ -101,7 +101,7 @@ The installation method depends on the platform detected in Step 1.
 
 #### Step 5a: Linux — download pre-built binary tarball
 
-On Linux, ptoas is **not** a Python package. Download the pinned version `v0.6` `tar.gz` from
+On Linux, ptoas is **not** a Python package. Download the pinned version `v0.8` `tar.gz` from
 `https://github.com/zhangstevenunity/PTOAS/releases` and extract it next to pypto-lib.
 
 Use the helper script for automated download:
@@ -116,9 +116,9 @@ Or manually:
    - `aarch64` → `ptoas-bin-aarch64.tar.gz`
    - `x86_64`  → `ptoas-bin-x86_64.tar.gz`
 
-2. Download the tarball (pinned to `v0.6`):
+2. Download the tarball (pinned to `v0.8`):
    ```bash
-   PTOAS_VERSION=v0.6
+   PTOAS_VERSION=v0.8
    curl --fail --location --retry 3 --retry-all-errors \
      -o /tmp/ptoas-bin-<arch>.tar.gz \
      https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-<arch>.tar.gz
@@ -127,11 +127,11 @@ Or manually:
 3. Verify the checksum:
    - For **aarch64**:
      ```bash
-     echo "b2082034faf20a2eae9e0355c9c3587353f4a20b39dc68d59bd02a8eb341ca33  /tmp/ptoas-bin-aarch64.tar.gz" | sha256sum -c -
+     echo "7c73ba35accca6f0b1a05e09bbb1966ff1d390462c2193fa09ccf181a6af9982  /tmp/ptoas-bin-aarch64.tar.gz" | sha256sum -c -
      ```
    - For **x86_64**:
      ```bash
-     echo "696782b1c9c0ec24279aaaed83bbb9db97c950584f2c29d229650508824e0851  /tmp/ptoas-bin-x86_64.tar.gz" | sha256sum -c -
+     echo "0434fb472978bd7f19a9bf03634e25b970193f8527fd18e6a38b4b6ee932413f  /tmp/ptoas-bin-x86_64.tar.gz" | sha256sum -c -
      ```
 
 4. Create a target directory and extract into it (the tarball contains `ptoas` and
@@ -154,7 +154,7 @@ Or manually:
 
 **Slow download?** The tarball is ~40–50 MB. If the download speed is very slow (< 50 KB/s)
 or the command hangs for more than 2 minutes, **stop the download and ask the user to
-manually download the tarball** from `https://github.com/zhangstevenunity/PTOAS/releases/tag/v0.6`
+manually download the tarball** from `https://github.com/zhangstevenunity/PTOAS/releases/tag/v0.8`
 to their `~/Downloads` folder. Then extract from there:
 
 ```bash
@@ -169,7 +169,7 @@ export PTOAS_ROOT="$WORKSPACE_DIR/ptoas-bin"
 #### Step 5b: macOS — install via Python wheel
 
 On macOS, ptoas is distributed as a Python wheel. Download and install the matching wheel
-from `https://github.com/zhangstevenunity/PTOAS/releases/tag/v0.6` (pinned version).
+from `https://github.com/zhangstevenunity/PTOAS/releases/tag/v0.8` (pinned version).
 
 **Important:** This step requires full permissions (`required_permissions: ["all"]`) for
 both the download and the `pip install`.
@@ -182,12 +182,12 @@ bash .claude/skills/setup_env/scripts/setup_env.sh install-ptoas
 
 Or manually:
 
-1. Visit the [v0.6 release page](https://github.com/zhangstevenunity/PTOAS/releases/tag/v0.6)
+1. Visit the [v0.8 release page](https://github.com/zhangstevenunity/PTOAS/releases/tag/v0.8)
    and find the wheel matching your platform: `ptoas-0.1.1-{PY_TAG}-*-{OS_TAG}_*_{ARCH_TAG}.whl`
    (e.g. `ptoas-0.1.1-cp311-cp311-macosx_26_0_arm64.whl`).
 2. Download and install:
    ```bash
-   PTOAS_VERSION=v0.6
+   PTOAS_VERSION=v0.8
    curl --fail --location --retry 3 --retry-all-errors \
      -o /tmp/<matched_wheel_name> \
      https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/<matched_wheel_name>
@@ -196,7 +196,7 @@ Or manually:
 
 **Slow download?** If the download speed is very slow (< 50 KB/s)
 or the command hangs for more than 2 minutes, **stop the download and ask the user to
-manually download the wheel** from `https://github.com/zhangstevenunity/PTOAS/releases/tag/v0.6`
+manually download the wheel** from `https://github.com/zhangstevenunity/PTOAS/releases/tag/v0.8`
 to their `~/Downloads` folder. Then install from there:
 
 ```bash
