@@ -16,7 +16,7 @@ git diff --cached --name-only
 
 | File Types Changed | Run Example Validation |
 | ------------------ | ---------------------- |
-| Python (`.py`) in `examples/` or `projects/` | Yes — run a related example |
+| Python (`.py`) in `examples/` | Yes — run a related example |
 | Docs only (`.md`) | Skip |
 | Config only (`.yml`, `.json`, `.gitignore`) | Skip |
 
@@ -106,7 +106,7 @@ git show HEAD --stat    # Verify staged files
 ## Checklist
 
 - [ ] Only relevant files staged (no build artifacts)
-- [ ] Code follows `pypto-frontend-coding-style.md` conventions
+- [ ] Code follows `docs/pypto-frontend-coding-style.md` conventions
 - [ ] No hardcoded paths or private information
 - [ ] Message format: `Type: description` (under 72 chars, imperative, no period)
 - [ ] Body included for multi-file changes (what + why)

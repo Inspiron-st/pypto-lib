@@ -6,18 +6,17 @@ PyPTO-Lib is a **primitive tensor function library** built on the pypto programm
 
 ## Directory Structure
 
-- `examples/` — Model implementations and algorithm examples (DeepSeek V3.2, Qwen3-32B, Paged Attention, Softmax, etc.)
-- `projects/` — Experimental projects and active development
-- `junk_models/` — Archived reference model implementations (from pypto_v2 era)
-- `junk_tensor_functions/` — Archived reference tensor function implementations
+- `examples/` — Model implementations and algorithm examples (Hello World, DeepSeek V3.2, Qwen3-32B)
+- `docs/` — Reference documentation (coding style, runtime design, parallel loops)
+- `tests/` — Lint checks and tests
 - `build_output/` — Generated compilation artifacts (gitignored)
 
 ## Key Documentation
 
 - `README.md` — Library architecture: tensor vs tile, tiling, fusion, incore scope, primitive set
-- `pypto-frontend-coding-style.md` — PyPTO frontend syntax and coding conventions
-- `pto2_rt.md` — PTO2 runtime (simpler) design principles
-- `para_for.md` — Parallel loop constructs
+- `docs/pypto-frontend-coding-style.md` — PyPTO frontend syntax and coding conventions
+- `docs/pto2_rt.md` — PTO2 runtime (simpler) design principles
+- `docs/para_for.md` — Parallel loop constructs
 
 ## External Dependencies
 
@@ -35,7 +34,7 @@ Use the `/setup_env` skill to set up the development environment, or refer to `.
 
 ### Run an example (requires pypto + ptoas installed)
 ```bash
-python examples/softmax_example.py
+python examples/hello_world.py
 ```
 
 ### Check codegen output
@@ -45,7 +44,7 @@ ls build_output/
 
 ## Coding Conventions
 
-1. **Follow `pypto-frontend-coding-style.md`** for all pypto frontend code
+1. **Follow `docs/pypto-frontend-coding-style.md`** for all pypto frontend code
 2. Use `import pypto.language as pl` as the standard module prefix
 3. Define tensor functions as **opaque functions** (no incore/orchestration boundary specified)
 4. Use `pl.Tensor`, `pl.Tile`, `pl.Scalar` types with explicit shapes and dtypes
@@ -53,7 +52,7 @@ ls build_output/
 
 ## Important Rules
 
-1. **Read relevant documentation first** — consult `README.md` and `pypto-frontend-coding-style.md` before writing new tensor functions or models
+1. **Read relevant documentation first** — consult `README.md` and `docs/pypto-frontend-coding-style.md` before writing new tensor functions or models
 2. **Consult `.claude/rules/`** for coding conventions (when available)
 3. **Consult `.claude/skills/`** for task-specific workflows (e.g., `setup_env/` for environment setup)
 4. **Avoid including private information** such as usernames, absolute paths with usernames, or other personally identifiable information in documentation or code
