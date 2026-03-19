@@ -24,8 +24,6 @@ Design goals:
   to avoid writing garbage into the KV cache
 """
 
-import os
-
 import pypto.language as pl
 
 
