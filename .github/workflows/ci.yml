@@ -56,10 +56,12 @@ jobs:
 
       - name: Install ptoas
         run: |
-          PTOAS_VERSION=v0.8
+          PTOAS_VERSION=v0.9
+          PTOAS_SHA256=e133b8f4f9736f480574d5afc99c9cebd4d4b5a115af1d4d01d5666df6c4e69a
           curl --fail --location --retry 3 --retry-all-errors \
             https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-x86_64.tar.gz \
             -o /tmp/ptoas-bin-x86_64.tar.gz
+          echo "${PTOAS_SHA256}  /tmp/ptoas-bin-x86_64.tar.gz" | sha256sum -c -
           mkdir -p $GITHUB_WORKSPACE/ptoas-bin
           tar -xzf /tmp/ptoas-bin-x86_64.tar.gz -C $GITHUB_WORKSPACE/ptoas-bin
           chmod +x $GITHUB_WORKSPACE/ptoas-bin/ptoas
@@ -76,6 +78,12 @@ jobs:
 
       - name: Run matmul sim test
         run: python examples/matmul.py --sim
+
+      - name: Run softmax sim test
+        run: python examples/softmax.py --sim
+
+      - name: Run rms_norm sim test
+        run: python examples/rms_norm.py --sim
 
   a2a3:
     runs-on: [self-hosted, linux, arm64, npu]
@@ -114,8 +122,8 @@ jobs:
 
       - name: Install ptoas
         run: |
-          PTOAS_VERSION=v0.8
-          PTOAS_SHA256=7c73ba35accca6f0b1a05e09bbb1966ff1d390462c2193fa09ccf181a6af9982
+          PTOAS_VERSION=v0.9
+          PTOAS_SHA256=fca96d1af813ce4c3b46cd4c7d31e1a47ab2cff3e62fc25a88b4d41a5083a549
           curl --fail --location --retry 3 --retry-all-errors \
             https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-aarch64.tar.gz \
             -o /tmp/ptoas-bin-aarch64.tar.gz
@@ -136,3 +144,9 @@ jobs:
 
       - name: Run matmul a2a3 test
         run: python examples/matmul.py --device=$DEVICE_ID
+
+      - name: Run softmax a2a3 test
+        run: python examples/softmax.py --device=$DEVICE_ID
+
+      - name: Run rms_norm a2a3 test
+        run: python examples/rms_norm.py --device=$DEVICE_ID
