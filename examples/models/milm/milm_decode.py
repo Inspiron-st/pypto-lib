@@ -98,11 +98,12 @@ def build_milm_decode_program(
             wk: pl.Tensor[[HIDDEN_CFG, KV_HIDDEN_CFG], pl.BF16],
             wv: pl.Tensor[[HIDDEN_CFG, KV_HIDDEN_CFG], pl.BF16],
             wo: pl.Tensor[[HIDDEN_CFG, HIDDEN_CFG], pl.BF16],
+            # Post-attention RMSNorm weight
+            post_rms_weight: pl.Tensor[[1, HIDDEN_CFG], pl.FP32],
             # MLP weights (SwiGLU)
             w_gate: pl.Tensor[[HIDDEN_CFG, INTER_CFG], pl.BF16],
             w_up: pl.Tensor[[HIDDEN_CFG, INTER_CFG], pl.BF16],
             w_down: pl.Tensor[[INTER_CFG, HIDDEN_CFG], pl.BF16],
-            post_rms_weight: pl.Tensor[[1, HIDDEN_CFG], pl.FP32],
             out: pl.Tensor[[BATCH_CFG, HIDDEN_CFG], pl.BF16],
         ) -> pl.Tensor[[BATCH_CFG, HIDDEN_CFG], pl.BF16]:
             """

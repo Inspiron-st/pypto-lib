@@ -103,6 +103,8 @@ def build_kimi_k2_decode_program(
             wk: pl.Tensor[[HIDDEN_CFG, KV_HIDDEN_CFG], pl.BF16],
             wv: pl.Tensor[[HIDDEN_CFG, KV_HIDDEN_CFG], pl.BF16],
             wo: pl.Tensor[[HIDDEN_CFG, HIDDEN_CFG], pl.BF16],
+            # Post-attention RMSNorm weight
+            post_rms_weight: pl.Tensor[[1, HIDDEN_CFG], pl.FP32],
             # MoE gate & experts
             moe_gate: pl.Tensor[[HIDDEN_CFG, NUM_EXPERTS_CFG], pl.FP32],
             w_gate_shared: pl.Tensor[[HIDDEN_CFG, INTER_CFG], pl.BF16],  # Shared expert gate
@@ -359,7 +361,7 @@ def build_kimi_k2_decode_program(
                     for kb in pl.range(HIDDEN_BLOCKS):
                         k0 = kb * K_CHUNK
                         x_chunk = pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, k0])
-                        gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
+                        gamma = pl.slice(post_rms_weight, [1, K_CHUNK], [0, k0])
                         normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms), gamma)
                         post_norm_tile = pl.assemble(post_norm_tile, pl.cast(normed, target_type=pl.BF16), [0, k0])
 
@@ -369,7 +371,7 @@ def build_kimi_k2_decode_program(
                     moe_out = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.FP32)
                     moe_out = pl.mul(moe_out, 0.0)
 
-                    # Compute gating scores
+                    # Compute gating scores (accumulate over HIDDEN_BLOCKS)
                     gate_scores = pl.create_tensor([BATCH_TILE, NUM_EXPERTS_CFG], dtype=pl.FP32)
                     gate_scores = pl.mul(gate_scores, 0.0)
                     for eb in pl.range(NUM_EXPERTS_CFG):
@@ -378,7 +380,9 @@ def build_kimi_k2_decode_program(
                             post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                             gate_chunk = pl.slice(moe_gate, [K_CHUNK, 1], [k0, eb])
                             score = pl.row_sum(pl.mul(pl.cast(post_chunk, target_type=pl.FP32), pl.cast(gate_chunk, target_type=pl.FP32)))
-                            gate_scores = pl.assemble(gate_scores, score, [0, eb])
+                            # Accumulate score: gate_scores[0, eb] += score
+                            prev_score = pl.slice(gate_scores, [BATCH_TILE, 1], [0, eb])
+                            gate_scores = pl.assemble(gate_scores, pl.add(prev_score, score), [0, eb])
 
                     # Softmax over experts and select top-K
                     gate_max = pl.row_max(gate_scores)
@@ -433,8 +437,12 @@ def build_kimi_k2_decode_program(
                             for kb in pl.range(HIDDEN_BLOCKS):
                                 k0 = kb * K_CHUNK
                                 post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
+                                # Slice 3D expert weights and reshape to 2D
                                 wg = pl.slice(w_gate_experts, [NUM_EXPERTS_CFG, K_CHUNK, MLP_OUT_CHUNK], [exp_idx, k0, o0])
                                 wu = pl.slice(w_up_experts, [NUM_EXPERTS_CFG, K_CHUNK, MLP_OUT_CHUNK], [exp_idx, k0, o0])
+                                # Reshape from [1, K_CHUNK, MLP_OUT_CHUNK] to [K_CHUNK, MLP_OUT_CHUNK]
+                                wg = pl.reshape(wg, [K_CHUNK, MLP_OUT_CHUNK])
+                                wu = pl.reshape(wu, [K_CHUNK, MLP_OUT_CHUNK])
                                 gate_acc = pl.add(gate_acc, pl.matmul(post_chunk, wg))
                                 up_acc = pl.add(up_acc, pl.matmul(post_chunk, wu))
 
@@ -445,7 +453,9 @@ def build_kimi_k2_decode_program(
                             for dob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=4):
                                 d0 = dob * Q_OUT_CHUNK
                                 down_prev = pl.slice(expert_out, [BATCH_TILE, Q_OUT_CHUNK], [0, d0])
+                                # Slice and reshape 3D down weights to 2D
                                 w_down_chunk = pl.slice(w_down_experts, [NUM_EXPERTS_CFG, MLP_OUT_CHUNK, Q_OUT_CHUNK], [exp_idx, o0, d0])
+                                w_down_chunk = pl.reshape(w_down_chunk, [MLP_OUT_CHUNK, Q_OUT_CHUNK])
                                 down_next = pl.add(down_prev, pl.matmul(mlp_chunk_bf16, w_down_chunk))
                                 expert_out = pl.assemble(expert_out, down_next, [0, d0])
 
