@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """
-Kimi K2 (月之暗面) single-layer decode forward implementation in PyPTO.
+Kimi K2 single-layer decode forward implementation in PyPTO.
 
 Kimi K2 Architecture Highlights:
 - MoE (Mixture of Experts) with shared expert

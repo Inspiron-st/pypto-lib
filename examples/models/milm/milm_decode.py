@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """
-Xiaomi MiLM (小米大模型) single-layer decode forward implementation in PyPTO.
+Xiaomi MiLM single-layer decode forward implementation in PyPTO.
 
 MiLM Architecture Highlights:
 - Llama-style Transformer with SwiGLU
