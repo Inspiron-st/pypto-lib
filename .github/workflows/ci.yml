@@ -21,7 +21,7 @@ jobs:
           python-version: "3.10"
       - uses: pre-commit/action@v3.0.0
 
-  sim:
+  a2a3sim:
     runs-on: ubuntu-latest
     env:
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
@@ -56,7 +56,7 @@ jobs:
 
       - name: Install ptoas
         run: |
-          PTOAS_VERSION=v0.12
+          PTOAS_VERSION=v0.17
           curl --fail --location --retry 3 --retry-all-errors \
             https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-x86_64.tar.gz \
             -o /tmp/ptoas-bin-x86_64.tar.gz
@@ -71,11 +71,69 @@ jobs:
       - name: Clone simpler repository (stable)
         run: git clone --branch stable https://github.com/ChaoWao/simpler.git $GITHUB_WORKSPACE/simpler
 
-      - name: Run sim tests
+      - name: Run a2a3sim tests
         run: |
           for f in $(find examples/beginner examples/intermediate -name '*.py' | sort); do
             echo "::group::$f"
-            python "$f" --sim
+            python "$f" -p a2a3sim
+            echo "::endgroup::"
+          done
+
+  a5sim:
+    runs-on: ubuntu-latest
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
+      SIMPLER_ROOT: ${{ github.workspace }}/simpler
+      PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
+
+    steps:
+      - name: Checkout pypto-lib
+        uses: actions/checkout@v4
+
+      - name: Set up C++ compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-15 || sudo apt-get install -y g++
+          if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install nanobind
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install pypto
+        run: |
+          git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
+          pip install -v /tmp/pypto
+
+      - name: Install ptoas
+        run: |
+          PTOAS_VERSION=v0.17
+          curl --fail --location --retry 3 --retry-all-errors \
+            https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-x86_64.tar.gz \
+            -o /tmp/ptoas-bin-x86_64.tar.gz
+          mkdir -p $GITHUB_WORKSPACE/ptoas-bin
+          tar -xzf /tmp/ptoas-bin-x86_64.tar.gz -C $GITHUB_WORKSPACE/ptoas-bin
+          chmod +x $GITHUB_WORKSPACE/ptoas-bin/ptoas
+          chmod +x $GITHUB_WORKSPACE/ptoas-bin/bin/ptoas
+
+      - name: Clone pto-isa repository
+        run: git clone --depth=1 https://github.com/PTO-ISA/pto-isa.git $GITHUB_WORKSPACE/pto-isa
+
+      - name: Clone simpler repository (stable)
+        run: git clone --branch stable https://github.com/ChaoWao/simpler.git $GITHUB_WORKSPACE/simpler
+
+      - name: Run a5sim tests
+        run: |
+          for f in $(find examples/beginner examples/intermediate -name '*.py' | sort); do
+            echo "::group::$f"
+            python "$f" -p a5sim
             echo "::endgroup::"
           done
 
@@ -116,7 +174,7 @@ jobs:
 
       - name: Install ptoas
         run: |
-          PTOAS_VERSION=v0.12
+          PTOAS_VERSION=v0.17
           curl --fail --location --retry 3 --retry-all-errors \
             https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-aarch64.tar.gz \
             -o /tmp/ptoas-bin-aarch64.tar.gz
@@ -135,6 +193,6 @@ jobs:
         run: |
           for f in $(find examples/beginner examples/intermediate -name '*.py' | sort); do
             echo "::group::$f"
-            python "$f" --device=$DEVICE_ID
+            python "$f" -p a2a3 -d $DEVICE_ID
             echo "::endgroup::"
           done

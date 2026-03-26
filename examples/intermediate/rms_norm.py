@@ -118,6 +118,8 @@ def compile_and_run(
     from pypto.ir.pass_manager import OptimizationStrategy
     from pypto.runtime import RunConfig, run
 
+    backend = BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B_PTO
+
     program = build_rms_norm_program(
         rows=rows,
         hidden=hidden,
@@ -140,7 +142,7 @@ def compile_and_run(
             atol=1e-2,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
-            backend_type=BackendType.Ascend910B_PTO,
+            backend_type=backend,
         ),
     )
     if not result.passed and result.error and "code_runner" in result.error:
@@ -155,12 +157,13 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sim", action="store_true")
+    parser.add_argument("-p", "--platform", type=str, default="a2a3",
+                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     args = parser.parse_args()
 
     result = compile_and_run(
-        platform="a2a3sim" if args.sim else "a2a3",
+        platform=args.platform,
         device_id=args.device,
     )
     if not result.passed:

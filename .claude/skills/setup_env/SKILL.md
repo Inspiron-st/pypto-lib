@@ -46,7 +46,7 @@ If pypto is already installed and up to date, skip this step.
 The pinned version is in `.github/workflows/ci.yml` (`PTOAS_VERSION`).
 
 ```bash
-PTOAS_VERSION=v0.12
+PTOAS_VERSION=v0.17
 ARCH=$(uname -m)   # x86_64 or aarch64
 curl --fail --location --retry 3 --retry-all-errors \
   -o /tmp/ptoas-bin-${ARCH}.tar.gz \
