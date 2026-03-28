@@ -650,7 +650,7 @@ def compile_and_run(
             atol=2e-2,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
-            backend_type=BackendType.Ascend910B_PTO,
+            backend_type=BackendType.Ascend910B,
         ),
     )
     if not result.passed and result.error and "code_runner" in result.error:

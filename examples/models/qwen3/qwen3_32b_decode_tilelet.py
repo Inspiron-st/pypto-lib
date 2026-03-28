@@ -228,22 +228,30 @@ def build_qwen3_single_layer_decode_program(
                             [ki, 0],
                         )
 
+                k_rot_tensor = pl.create_tensor([NUM_KV_HEADS_CFG, HEAD_DIM_CFG], dtype=pl.FP32)
                 with pl.incore():
-                    # Stage 1b: rotate K and update the caches.
+                    # Stage 1b: rotate K halves and assemble to GM (no concat).
                     k_lo = pl.slice(k_group, [NUM_KV_HEADS_CFG, HEAD_DIM_CFG // 2], [0, 0])
                     k_hi = pl.slice(k_group, [NUM_KV_HEADS_CFG, HEAD_DIM_CFG // 2],
                                     [0, HEAD_DIM_CFG // 2])
-                    k_rot = pl.concat(
-                        pl.sub(pl.col_expand_mul(k_lo, cos_lo),
-                               pl.col_expand_mul(k_hi, sin_lo)),
-                        pl.add(pl.col_expand_mul(k_hi, cos_hi),
-                               pl.col_expand_mul(k_lo, sin_hi)),
+                    rot_lo = pl.sub(
+                        pl.col_expand_mul(k_lo, cos_lo),
+                        pl.col_expand_mul(k_hi, sin_lo),
                     )
+                    rot_hi = pl.add(
+                        pl.col_expand_mul(k_hi, cos_hi),
+                        pl.col_expand_mul(k_lo, sin_hi),
+                    )
+                    k_rot_tensor = pl.assemble(k_rot_tensor, rot_lo, [0, 0])
+                    k_rot_tensor = pl.assemble(k_rot_tensor, rot_hi, [0, HEAD_DIM_CFG // 2])
+
+                with pl.incore():
+                    # Stage 1c: update the caches from rotated K tensor.
                     for ki in pl.range(NUM_KV_HEADS_CFG):
                         cache_row = b * NUM_KV_HEADS_CFG * MAX_SEQ_CFG + ki * MAX_SEQ_CFG + pos
                         k_cache = pl.assemble(
                             k_cache,
-                            pl.cast(pl.slice(k_rot, [1, HEAD_DIM_CFG], [ki, 0]),
+                            pl.cast(pl.slice(k_rot_tensor, [1, HEAD_DIM_CFG], [ki, 0]),
                                     target_type=pl.BF16),
                             [cache_row, 0],
                         )
@@ -258,8 +266,7 @@ def build_qwen3_single_layer_decode_program(
                     # Zero-init attn_row in [1, ATTN_INIT_CHUNK] = [1, 512] FP32 = 2 KB chunks.
                     for zi in pl.range(ATTN_INIT_BLOCKS):
                         z0 = zi * ATTN_INIT_CHUNK
-                        z = pl.create_tensor([1, ATTN_INIT_CHUNK], dtype=pl.FP32)
-                        z = pl.mul(z, 0.0)
+                        z = pl.full([1, ATTN_INIT_CHUNK], dtype=pl.FP32, value=0.0)
                         attn_row = pl.assemble(attn_row, z, [0, z0])
 
                 # Manually split the decode attention into smaller incore stages so
@@ -281,25 +288,29 @@ def build_qwen3_single_layer_decode_program(
                                 [qi, 0],
                             )
 
+                    q_rot_bf16 = pl.create_tensor([Q_HEAD_BATCH, HEAD_DIM_CFG], dtype=pl.BF16)
                     with pl.incore():
-                        # Stage 2b: apply RoPE and cast once for the cube stages.
+                        # Stage 2b: apply RoPE halves, cast and assemble to GM (no concat).
                         q_lo = pl.slice(q_group, [Q_HEAD_BATCH, HEAD_DIM_CFG // 2], [0, 0])
                         q_hi = pl.slice(q_group, [Q_HEAD_BATCH, HEAD_DIM_CFG // 2],
                                         [0, HEAD_DIM_CFG // 2])
-                        q_rot = pl.concat(
-                            pl.sub(pl.col_expand_mul(q_lo, cos_lo),
-                                   pl.col_expand_mul(q_hi, sin_lo)),
-                            pl.add(pl.col_expand_mul(q_hi, cos_hi),
-                                   pl.col_expand_mul(q_lo, sin_hi)),
+                        q_rot_lo = pl.sub(
+                            pl.col_expand_mul(q_lo, cos_lo),
+                            pl.col_expand_mul(q_hi, sin_lo),
                         )
-                        q_rot_bf16 = pl.cast(q_rot, target_type=pl.BF16)
+                        q_rot_hi = pl.add(
+                            pl.col_expand_mul(q_hi, cos_hi),
+                            pl.col_expand_mul(q_lo, sin_hi),
+                        )
+                        q_rot_lo_bf16 = pl.cast(q_rot_lo, target_type=pl.BF16)
+                        q_rot_hi_bf16 = pl.cast(q_rot_hi, target_type=pl.BF16)
+                        q_rot_bf16 = pl.assemble(q_rot_bf16, q_rot_lo_bf16, [0, 0])
+                        q_rot_bf16 = pl.assemble(q_rot_bf16, q_rot_hi_bf16, [0, HEAD_DIM_CFG // 2])
 
-                    oi = pl.create_tensor([Q_HEAD_BATCH, HEAD_DIM_CFG], dtype=pl.FP32)
-                    li = pl.create_tensor([Q_HEAD_BATCH, 1], dtype=pl.FP32)
-                    mi = pl.create_tensor([Q_HEAD_BATCH, 1], dtype=pl.FP32)
-                    oi = pl.mul(oi, 0.0)
-                    li = pl.mul(li, 0.0)
-                    mi = pl.mul(mi, 0.0)
+                    with pl.incore():
+                        oi = pl.full([Q_HEAD_BATCH, HEAD_DIM_CFG], dtype=pl.FP32, value=0.0)
+                        li = pl.full([Q_HEAD_BATCH, 1], dtype=pl.FP32, value=0.0)
+                        mi = pl.full([Q_HEAD_BATCH, 1], dtype=pl.FP32, value=0.0)
 
                     for sb in pl.range(ctx_blocks):
                         s0 = sb * SEQ_TILE
@@ -307,34 +318,40 @@ def build_qwen3_single_layer_decode_program(
                         cache_row0 = b * NUM_KV_HEADS_CFG * MAX_SEQ_CFG + kvh * MAX_SEQ_CFG + s0
 
                         with pl.incore():
+                            # QK matmul: load full K tile without valid_shape.
                             k_tile = pl.slice(
                                 k_cache,
                                 [SEQ_TILE, HEAD_DIM_CFG],
                                 [cache_row0, 0],
-                                valid_shape=[valid_len, HEAD_DIM_CFG],
                             )
                             raw_scores = pl.matmul(q_rot_bf16, k_tile, b_trans=True, out_dtype=pl.FP32)
 
                         with pl.incore():
-                            scores = pl.mul(raw_scores, ATTN_SCALE)
+                            # Softmax (pypto unaligned style):
+                            # 1. valid_shape + fillpad before scale
                             scores_valid = pl.slice(
-                                scores,
+                                raw_scores,
                                 [Q_HEAD_BATCH, SEQ_TILE],
                                 [0, 0],
                                 valid_shape=[Q_HEAD_BATCH, valid_len],
                             )
                             scores_padded = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
-                            cur_mi = pl.cast(pl.row_max(scores_padded), target_type=pl.FP32)
-                            exp_scores = pl.exp(pl.row_expand_sub(scores_padded, cur_mi))
-                            cur_li = pl.cast(pl.row_sum(exp_scores), target_type=pl.FP32)
+                            # 2. scale after fillpad
+                            scores = pl.mul(scores_padded, ATTN_SCALE)
+                            # 3. row_max, exp
+                            cur_mi = pl.cast(pl.row_max(scores), target_type=pl.FP32)
+                            exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
+                            # 4. BF16 round-trip before row_sum (li matches SV matmul weights)
                             exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
+                            exp_scores_fp32 = pl.cast(exp_scores_bf16, target_type=pl.FP32)
+                            cur_li = pl.cast(pl.row_sum(exp_scores_fp32), target_type=pl.FP32)
 
                         with pl.incore():
+                            # SV matmul: load full V tile without valid_shape.
                             v_tile = pl.slice(
                                 v_cache,
                                 [SEQ_TILE, HEAD_DIM_CFG],
                                 [cache_row0, 0],
-                                valid_shape=[valid_len, HEAD_DIM_CFG],
                             )
                             oi_tmp = pl.matmul(exp_scores_bf16, v_tile, out_dtype=pl.FP32)
 

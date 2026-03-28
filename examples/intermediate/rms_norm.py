@@ -118,7 +118,7 @@ def compile_and_run(
     from pypto.ir.pass_manager import OptimizationStrategy
     from pypto.runtime import RunConfig, run
 
-    backend = BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B_PTO
+    backend = BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B
 
     program = build_rms_norm_program(
         rows=rows,
