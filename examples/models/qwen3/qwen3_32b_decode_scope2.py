@@ -422,7 +422,7 @@ def compile_and_run(
     num_kv_heads: int = NUM_KV_HEADS,
     head_dim: int = HEAD_DIM,
     platform: str = "a5",
-    device_id: int = 11,
+    device_id: int = 0,
     dump_passes: bool = True,
 ):
     from pypto.backend import BackendType
