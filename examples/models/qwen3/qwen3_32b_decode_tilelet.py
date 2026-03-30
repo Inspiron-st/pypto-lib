@@ -70,7 +70,8 @@ HIDDEN_INV = 1.0 / HIDDEN
 #   [BATCH_TILE, KV_OUT_CHUNK]  FP32 = [4, 64] × 4 = 1024 B = 1 KB  ✓
 #   [BATCH_TILE, MLP_OUT_CHUNK] FP32 = [4, 64] × 4 = 1024 B = 1 KB  ✓
 #   [BATCH_TILE, K_CHUNK]       FP32 = [4,128] × 4 = 2048 B = 2 KB  ✓ MAX (down proj add)
-#   [Q_HEAD_BATCH, HEAD_DIM]    FP32 = [4,128] × 4 = 2048 B = 2 KB  ✓ MAX (attn)
+#   [Q_HEAD_BATCH, HEAD_DIM]    FP32 = [8,128] × 4 = 4096 B = 4 KB  (attn, 2×TILELET)
+#   [Q_HEAD_BATCH, SEQ_TILE]   FP32 = [8, 64] × 4 = 2048 B = 2 KB  ✓ MAX (attn scores)
 #   [NUM_KV_HEADS, HEAD_DIM//2] FP32 = [8, 64] × 4 = 2048 B = 2 KB  ✓ MAX (K RoPE)
 #
 # Cube TILE budget (16 KB = 16384 B, BF16 = 2 B/elem):
@@ -85,7 +86,11 @@ KV_OUT_CHUNK = 64
 SEQ_TILE = 64
 MLP_OUT_CHUNK = 64
 BATCH_TILE = 4
-Q_HEAD_BATCH = 4
+# Q_HEAD_BATCH=8 so that li/mi can be shaped [Q_HEAD_BATCH, 1] via
+# pl.full([1, Q_HEAD_BATCH]) + pl.reshape; Q_HEAD_PAD=16 pads the matmul
+# M-dimension to a cube fractal-friendly multiple.
+Q_HEAD_BATCH = 8
+Q_HEAD_PAD = 16
 
 
 def build_qwen3_single_layer_decode_program(
@@ -200,8 +205,8 @@ def build_qwen3_single_layer_decode_program(
             # Scope 2: RoPE + cache update + decode attention.
             # K RoPE batches all NUM_KV_HEADS=8 heads together so that
             # RoPE half-vectors are [8, 64] FP32 = 2 KB = TILELET MAX.
-            # Q attention batches Q_HEAD_BATCH=4 Q heads per group so that
-            # oi / ctx vectors are [4, 128] FP32 = 2 KB = TILELET MAX.
+            # Q attention batches Q_HEAD_BATCH=8 Q heads per group;
+            # matmul M-dim is padded to Q_HEAD_PAD=16 for cube fractal alignment.
             # Attention cube tiles [64,128] BF16 = 16 KB remain at MAX.
             for b in pl.parallel(BATCH_CFG):
                 ctx_len = pl.tensor.read(seq_lens, [b])
@@ -306,25 +311,31 @@ def build_qwen3_single_layer_decode_program(
                         mi_flat = pl.full([1, Q_HEAD_BATCH], dtype=pl.FP32, value=0.0)
                         mi = pl.reshape(mi_flat, [Q_HEAD_BATCH, 1])
 
+                    # Pad Q for cube fractal alignment.
+                    q_padded = pl.create_tensor([Q_HEAD_PAD, HEAD_DIM_CFG], dtype=pl.BF16)
+                    with pl.incore():
+                        q_bf16_tile = pl.slice(q_rot_bf16, [Q_HEAD_BATCH, HEAD_DIM_CFG], [0, 0])
+                        q_padded = pl.assemble(q_padded, q_bf16_tile, [0, 0])
+
                     for sb in pl.range(ctx_blocks):
                         s0 = sb * SEQ_TILE
                         valid_len = pl.min(SEQ_TILE, ctx_len - s0)
                         cache_row0 = b * NUM_KV_HEADS_CFG * MAX_SEQ_CFG + kvh * MAX_SEQ_CFG + s0
 
+                        raw_scores_pad = pl.create_tensor([Q_HEAD_PAD, SEQ_TILE], dtype=pl.FP32)
                         with pl.incore():
-                            # QK matmul: load full K tile without valid_shape.
+                            # QK matmul: padded Q × K^T.
                             k_tile = pl.slice(
                                 k_cache,
                                 [SEQ_TILE, HEAD_DIM_CFG],
                                 [cache_row0, 0],
                             )
-                            raw_scores = pl.matmul(q_rot_bf16, k_tile, b_trans=True, out_dtype=pl.FP32)
+                            raw_scores_pad = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
 
                         with pl.incore():
-                            # Softmax (pypto unaligned style):
-                            # 1. valid_shape + fillpad before scale
+                            # Softmax: slice valid rows from padded scores.
                             scores_valid = pl.slice(
-                                raw_scores,
+                                raw_scores_pad,
                                 [Q_HEAD_BATCH, SEQ_TILE],
                                 [0, 0],
                                 valid_shape=[Q_HEAD_BATCH, valid_len],
@@ -340,16 +351,25 @@ def build_qwen3_single_layer_decode_program(
                             exp_scores_fp32 = pl.cast(exp_scores_bf16, target_type=pl.FP32)
                             cur_li = pl.row_sum(exp_scores_fp32)
 
+                        # Pad exp_scores for SV matmul.
+                        exp_padded = pl.create_tensor([Q_HEAD_PAD, SEQ_TILE], dtype=pl.BF16)
                         with pl.incore():
-                            # SV matmul: load full V tile without valid_shape.
+                            exp_tile = pl.slice(exp_scores_bf16, [Q_HEAD_BATCH, SEQ_TILE], [0, 0])
+                            exp_padded = pl.assemble(exp_padded, exp_tile, [0, 0])
+
+                        oi_tmp_pad = pl.create_tensor([Q_HEAD_PAD, HEAD_DIM_CFG], dtype=pl.FP32)
+                        with pl.incore():
+                            # SV matmul: padded exp_scores × V.
                             v_tile = pl.slice(
                                 v_cache,
                                 [SEQ_TILE, HEAD_DIM_CFG],
                                 [cache_row0, 0],
                             )
-                            oi_tmp = pl.matmul(exp_scores_bf16, v_tile, out_dtype=pl.FP32)
+                            oi_tmp_pad = pl.matmul(exp_padded, v_tile, out_dtype=pl.FP32)
 
                         with pl.incore():
+                            # Slice valid rows from padded SV result.
+                            oi_tmp = pl.slice(oi_tmp_pad, [Q_HEAD_BATCH, HEAD_DIM_CFG], [0, 0])
                             if sb == 0:
                                 oi = oi_tmp
                                 li = cur_li

@@ -6,10 +6,10 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Decode Attention (pypto unaligned style, large) — RoPE + KV cache update + grouped-query attention.
+"""Qwen3-32B decode Scope 2 — RoPE + KV cache update + grouped-query attention.
 
-Same as decode_attention.py but with larger dimensions
-(NUM_HEADS=32, Q_HEAD_BATCH=16) matching flash_attention_big.py's parameters.
+Standalone test for the attention scope of the Qwen3-32B decode layer,
+with parameters aligned to qwen3_32b_decode_tilelet.py.
 
 Valid_shape handling aligned to pypto's kernel_softmax_prepare_unaligned approach:
   - K/V tiles are loaded as full SEQ_TILE blocks without valid_shape.
@@ -25,27 +25,26 @@ For each batch element:
      c. Write normalised attention output.
 
 Hardware TILELET / TILE sizing (at default HEAD_DIM=128):
-  * K RoPE half-vectors [NUM_KV_HEADS, HEAD_DIM//2] FP32
-  * Q/attention group   [Q_HEAD_BATCH, HEAD_DIM]     FP32 = [16,128]*4 = 8 KB
+  * K RoPE half-vectors [NUM_KV_HEADS, HEAD_DIM//2] FP32 = [8,64]*4 = 2 KB = MAX
+  * Q/attention group   [Q_HEAD_BATCH, HEAD_DIM]     FP32 = [4,128]*4 = 2 KB = MAX
   * Attention K tile    [SEQ_TILE, HEAD_DIM]          BF16 = [64,128]*2 = 16 KB = MAX
 
 Input projections are BF16; cos/sin tables are FP32; KV caches are BF16.
 Output attention is FP32.
-
-Defaults use reduced dimensions (vs Qwen3-32B) for faster testing.
 """
 from __future__ import annotations
 
 import pypto.language as pl
 
-BATCH = 4
-MAX_SEQ = 256
-NUM_HEADS = 32
-NUM_KV_HEADS = 2
+BATCH = 16
+MAX_SEQ = 4096
+NUM_HEADS = 64
+NUM_KV_HEADS = 8
 HEAD_DIM = 128
 
-# Tiling constants (same as Qwen3 decode tilelet).
-Q_HEAD_BATCH = 16       # Q heads batched per attention group (must be multiple of 16 for matmul)
+# Tiling constants (aligned to qwen3_32b_decode_tilelet).
+Q_HEAD_BATCH = 8        # Q heads batched per attention group
+Q_HEAD_PAD = 16         # padded Q rows for cube fractal alignment
 SEQ_TILE = 64           # sequence tile for attention loop
 
 
@@ -183,25 +182,31 @@ def build_decode_attention_program(
                         mi_flat = pl.full([1, Q_HEAD_BATCH], dtype=pl.FP32, value=0.0)
                         mi = pl.reshape(mi_flat, [Q_HEAD_BATCH, 1])
 
+                    # Pad Q for cube fractal alignment.
+                    q_padded = pl.create_tensor([Q_HEAD_PAD, head_dim], dtype=pl.BF16)
+                    with pl.incore():
+                        q_bf16_tile = pl.slice(q_rot_bf16, [Q_HEAD_BATCH, head_dim], [0, 0])
+                        q_padded = pl.assemble(q_padded, q_bf16_tile, [0, 0])
+
                     for sb in pl.range(ctx_blocks):
                         s0 = sb * SEQ_TILE
                         valid_len = pl.min(SEQ_TILE, ctx_len - s0)
                         cache_row0 = b * num_kv_heads * max_seq + kvh * max_seq + s0
 
+                        raw_scores_pad = pl.create_tensor([Q_HEAD_PAD, SEQ_TILE], dtype=pl.FP32)
                         with pl.incore():
-                            # QK matmul: load full K tile without valid_shape.
+                            # QK matmul: padded Q × K^T.
                             k_tile = pl.slice(
                                 k_cache,
                                 [SEQ_TILE, head_dim],
                                 [cache_row0, 0],
                             )
-                            raw_scores = pl.matmul(q_rot_bf16, k_tile, b_trans=True, out_dtype=pl.FP32)
+                            raw_scores_pad = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
 
                         with pl.incore():
-                            # Softmax (pypto unaligned style):
-                            # 1. valid_shape + fillpad before scale
+                            # Softmax: slice valid rows from padded scores.
                             scores_valid = pl.slice(
-                                raw_scores,
+                                raw_scores_pad,
                                 [Q_HEAD_BATCH, SEQ_TILE],
                                 [0, 0],
                                 valid_shape=[Q_HEAD_BATCH, valid_len],
@@ -217,16 +222,25 @@ def build_decode_attention_program(
                             exp_scores_fp32 = pl.cast(exp_scores_bf16, target_type=pl.FP32)
                             cur_li = pl.row_sum(exp_scores_fp32)
 
+                        # Pad exp_scores for SV matmul.
+                        exp_padded = pl.create_tensor([Q_HEAD_PAD, SEQ_TILE], dtype=pl.BF16)
                         with pl.incore():
-                            # SV matmul: load full V tile without valid_shape.
+                            exp_tile = pl.slice(exp_scores_bf16, [Q_HEAD_BATCH, SEQ_TILE], [0, 0])
+                            exp_padded = pl.assemble(exp_padded, exp_tile, [0, 0])
+
+                        oi_tmp_pad = pl.create_tensor([Q_HEAD_PAD, head_dim], dtype=pl.FP32)
+                        with pl.incore():
+                            # SV matmul: padded exp_scores × V.
                             v_tile = pl.slice(
                                 v_cache,
                                 [SEQ_TILE, head_dim],
                                 [cache_row0, 0],
                             )
-                            oi_tmp = pl.matmul(exp_scores_bf16, v_tile, out_dtype=pl.FP32)
+                            oi_tmp_pad = pl.matmul(exp_padded, v_tile, out_dtype=pl.FP32)
 
                         with pl.incore():
+                            # Slice valid rows from padded SV result.
+                            oi_tmp = pl.slice(oi_tmp_pad, [Q_HEAD_BATCH, head_dim], [0, 0])
                             if sb == 0:
                                 oi = oi_tmp
                                 li = cur_li
