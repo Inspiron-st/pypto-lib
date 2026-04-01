@@ -88,7 +88,7 @@ MLP_OUT_CHUNK = 64
 BATCH_TILE = 4
 # Q_HEAD_BATCH=8 so that li/mi can be shaped [Q_HEAD_BATCH, 1] via
 # pl.full([1, Q_HEAD_BATCH]) + pl.reshape; Q_HEAD_PAD=16 pads the matmul
-# M-dimension to a cube fractal-friendly multiple.
+# M-dimension to a cube fractal-friendly multiple
 Q_HEAD_BATCH = 8
 Q_HEAD_PAD = 16
 
