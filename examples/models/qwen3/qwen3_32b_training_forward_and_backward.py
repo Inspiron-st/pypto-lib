@@ -928,9 +928,10 @@ def compile_and_run(
     hidden_size: int = HIDDEN,
     intermediate_size: int = INTERMEDIATE,
     platform: str = "a2a3",
-    device_id: int = 11,
+    device_id: int = 0,
     work_dir: str | None = None,
     dump_passes: bool = True,
+    enable_profiling: bool = False,
 ):
     from pypto.backend import BackendType
     from pypto.ir.pass_manager import OptimizationStrategy
@@ -970,13 +971,27 @@ def compile_and_run(
             dump_passes=dump_passes,
             backend_type=BackendType.CCE,
             work_dir=work_dir,
+            enable_profiling=enable_profiling,
         ),
     )
     return result
 
 
 if __name__ == "__main__":
-    result = compile_and_run()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", type=str, default="a2a3",
+                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--enable-profiling", action="store_true", default=False)
+    args = parser.parse_args()
+
+    result = compile_and_run(
+        platform=args.platform,
+        device_id=args.device,
+        enable_profiling=args.enable_profiling,
+    )
     if not result.passed:
         if result.error:
             print(f"Result: {result.error}")
