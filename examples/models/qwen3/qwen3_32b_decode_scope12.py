@@ -101,16 +101,23 @@ def build_decode_scope12_program(
                 normed_tile = pl.create_tensor([BATCH_TILE, hidden], dtype=pl.BF16)
 
                 with pl.incore():
-                    partial_sq_flat = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
-                    partial_sq = pl.reshape(partial_sq_flat, [BATCH_TILE, 1])
+                    partial_sq = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
                     for kb in pl.range(hidden_blocks):
                         k0 = kb * K_CHUNK
                         x_chunk = pl.cast(
                             pl.slice(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0]),
                             target_type=pl.FP32,
                         )
-                        partial_sq = pl.add(partial_sq, pl.row_sum(pl.mul(x_chunk, x_chunk)))
-                    inv_rms_tile = pl.rsqrt(pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS))
+                        partial_sq = pl.add(
+                            partial_sq,
+                            pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, BATCH_TILE]),
+                        )
+                    # Compute variance in [1, BATCH_TILE], then reshape to [BATCH_TILE, 1]
+                    # for row_expand_mul broadcasting.
+                    variance = pl.reshape(
+                        pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS),
+                        [BATCH_TILE, 1],
+                    )
 
                     for kb in pl.range(hidden_blocks):
                         k0 = kb * K_CHUNK
@@ -119,7 +126,7 @@ def build_decode_scope12_program(
                             target_type=pl.FP32,
                         )
                         gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
-                        normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms_tile), gamma)
+                        normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, variance), gamma)
                         normed_tile = pl.assemble(normed_tile, pl.cast(normed, target_type=pl.BF16), [0, k0])
 
                 for ob in pl.range(q_out_blocks):
@@ -295,28 +302,56 @@ def build_tensor_specs(
     kv_hidden = num_kv_heads * head_dim
     cache_rows = batch * num_kv_heads * max_seq
 
-    seq_lens_data = torch.randint(1, max_seq + 1, (batch,), dtype=torch.int32)
+    def init_hidden_states():
+        return torch.rand(batch, hidden_size) - 0.5
+
+    def init_rms_weight():
+        return torch.rand(1, hidden_size) - 0.5
+
+    def init_wq():
+        return torch.rand(hidden_size, hidden_size) - 0.5
+
+    def init_wk():
+        return torch.rand(hidden_size, kv_hidden) - 0.5
+
+    def init_wv():
+        return torch.rand(hidden_size, kv_hidden) - 0.5
+
+    def init_seq_lens():
+        return torch.randint(1, max_seq + 1, (batch,), dtype=torch.int32)
+
+    def init_rope_cos():
+        return torch.rand(max_seq, head_dim) - 0.5
+
+    def init_rope_sin():
+        return torch.rand(max_seq, head_dim) - 0.5
+
+    def init_k_cache():
+        return torch.rand(cache_rows, head_dim) - 0.5
+
+    def init_v_cache():
+        return torch.rand(cache_rows, head_dim) - 0.5
 
     return [
         TensorSpec("hidden_states", [batch, hidden_size], torch.bfloat16,
-                   init_value=torch.rand(batch, hidden_size) * 2 - 1),
+                   init_value=init_hidden_states),
         TensorSpec("input_rms_weight", [1, hidden_size], torch.float32,
-                   init_value=torch.rand(1, hidden_size) * 2 - 1),
+                   init_value=init_rms_weight),
         TensorSpec("wq", [hidden_size, hidden_size], torch.bfloat16,
-                   init_value=torch.rand(hidden_size, hidden_size) * 2 - 1),
+                   init_value=init_wq),
         TensorSpec("wk", [hidden_size, kv_hidden], torch.bfloat16,
-                   init_value=torch.rand(hidden_size, kv_hidden) * 2 - 1),
+                   init_value=init_wk),
         TensorSpec("wv", [hidden_size, kv_hidden], torch.bfloat16,
-                   init_value=torch.rand(hidden_size, kv_hidden) * 2 - 1),
-        TensorSpec("seq_lens", [batch], torch.int32, init_value=seq_lens_data),
+                   init_value=init_wv),
+        TensorSpec("seq_lens", [batch], torch.int32, init_value=init_seq_lens),
         TensorSpec("rope_cos", [max_seq, head_dim], torch.float32,
-                   init_value=torch.rand(max_seq, head_dim) * 2 - 1),
+                   init_value=init_rope_cos),
         TensorSpec("rope_sin", [max_seq, head_dim], torch.float32,
-                   init_value=torch.rand(max_seq, head_dim) * 2 - 1),
+                   init_value=init_rope_sin),
         TensorSpec("k_cache", [cache_rows, head_dim], torch.bfloat16,
-                   init_value=torch.rand(cache_rows, head_dim) * 2 - 1),
+                   init_value=init_k_cache),
         TensorSpec("v_cache", [cache_rows, head_dim], torch.bfloat16,
-                   init_value=torch.rand(cache_rows, head_dim) * 2 - 1),
+                   init_value=init_v_cache),
         TensorSpec("attn_out", [batch, hidden], torch.bfloat16, is_output=True),
     ]
 
@@ -363,8 +398,8 @@ def golden_decode_scope12(tensors, params):
         for k0 in range(0, hidden_size, K_CHUNK):
             x_chunk = x_tile[:, k0:k0 + K_CHUNK]
             sq_sum = sq_sum + (x_chunk ** 2).sum(dim=-1, keepdim=True)
-        inv_rms = torch.rsqrt(sq_sum / hidden_size + EPS)
-        normed = (x_tile * inv_rms * input_rms_weight.float()).bfloat16()
+        variance = sq_sum / hidden_size + EPS
+        normed = (x_tile * variance * input_rms_weight.float()).bfloat16()
 
         q_proj[b0:b_end, :] = (normed.float() @ wq.float()).float()
         k_proj[b0:b_end, :] = (normed.float() @ wk.float()).float()

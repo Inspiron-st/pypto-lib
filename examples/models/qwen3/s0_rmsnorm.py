@@ -44,16 +44,25 @@ def build_rmsnorm_program(
             for b0 in pl.range(0, batch, BATCH_TILE):
 
                 with pl.incore():
-                    partial_sq_flat = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
-                    partial_sq = pl.reshape(partial_sq_flat, [BATCH_TILE, 1])
+                    # Accumulate in [1, BATCH_TILE] row-major to avoid col-major layout
+                    # constraints (matches qwen3_32b_scope1_incore0_rmsnorm.py pattern).
+                    partial_sq = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
                     for kb in pl.range(hidden_blocks):
                         k0 = kb * K_CHUNK
                         x_chunk = pl.cast(
                             pl.slice(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0]),
                             target_type=pl.FP32,
                         )
-                        partial_sq = pl.add(partial_sq, pl.row_sum(pl.mul(x_chunk, x_chunk)))
-                    variance = pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS)
+                        partial_sq = pl.add(
+                            partial_sq,
+                            pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, BATCH_TILE]),
+                        )
+                    # Compute variance in [1, BATCH_TILE], then reshape to [BATCH_TILE, 1]
+                    # for row_expand_mul broadcasting.
+                    variance = pl.reshape(
+                        pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS),
+                        [BATCH_TILE, 1],
+                    )
 
                     for kb in pl.range(hidden_blocks):
                         k0 = kb * K_CHUNK
@@ -77,9 +86,15 @@ def build_tensor_specs(
     import torch
     from pypto.runtime import TensorSpec
 
+    def init_hidden_states():
+        return torch.rand(batch, hidden_size) * 2 - 1
+
+    def init_rms_weight():
+        return torch.rand(1, hidden_size) * 2 - 1
+
     return [
-        TensorSpec("hidden_states", [batch, hidden_size], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("input_rms_weight", [1, hidden_size], torch.float32, init_value=torch.randn),
+        TensorSpec("hidden_states", [batch, hidden_size], torch.bfloat16, init_value=init_hidden_states),
+        TensorSpec("input_rms_weight", [1, hidden_size], torch.float32, init_value=init_rms_weight),
         TensorSpec("normed_out", [batch, hidden_size], torch.bfloat16, is_output=True),
     ]
 

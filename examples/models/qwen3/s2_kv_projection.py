@@ -100,10 +100,19 @@ def build_tensor_specs(
 
     kv_hidden = num_kv_heads * head_dim
 
+    def init_normed():
+        return torch.rand(batch, hidden_size) * 2 - 1
+
+    def init_wk():
+        return torch.rand(hidden_size, kv_hidden) * 2 - 1
+
+    def init_wv():
+        return torch.rand(hidden_size, kv_hidden) * 2 - 1
+
     return [
-        TensorSpec("normed", [batch, hidden_size], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("wk", [hidden_size, kv_hidden], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("wv", [hidden_size, kv_hidden], torch.bfloat16, init_value=torch.randn),
+        TensorSpec("normed", [batch, hidden_size], torch.bfloat16, init_value=init_normed),
+        TensorSpec("wk", [hidden_size, kv_hidden], torch.bfloat16, init_value=init_wk),
+        TensorSpec("wv", [hidden_size, kv_hidden], torch.bfloat16, init_value=init_wv),
         TensorSpec("k_proj", [batch, kv_hidden], torch.float32, is_output=True),
         TensorSpec("v_proj", [batch, kv_hidden], torch.float32, is_output=True),
     ]

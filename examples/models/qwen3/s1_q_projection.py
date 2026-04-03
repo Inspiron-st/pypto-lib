@@ -72,9 +72,15 @@ def build_tensor_specs(
     import torch
     from pypto.runtime import TensorSpec
 
+    def init_normed():
+        return torch.rand(batch, hidden_size) * 2 - 1
+
+    def init_wq():
+        return torch.rand(hidden_size, hidden_size) * 2 - 1
+
     return [
-        TensorSpec("normed", [batch, hidden_size], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("wq", [hidden_size, hidden_size], torch.bfloat16, init_value=torch.randn),
+        TensorSpec("normed", [batch, hidden_size], torch.bfloat16, init_value=init_normed),
+        TensorSpec("wq", [hidden_size, hidden_size], torch.bfloat16, init_value=init_wq),
         TensorSpec("q_proj", [batch, hidden_size], torch.float32, is_output=True),
     ]
 
