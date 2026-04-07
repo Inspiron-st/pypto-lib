@@ -56,9 +56,9 @@ jobs:
 
       - name: Install ptoas
         run: |
-          PTOAS_VERSION=v0.17
+          PTOAS_VERSION=v0.24
           curl --fail --location --retry 3 --retry-all-errors \
-            https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-x86_64.tar.gz \
+            https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-x86_64.tar.gz \
             -o /tmp/ptoas-bin-x86_64.tar.gz
           mkdir -p $GITHUB_WORKSPACE/ptoas-bin
           tar -xzf /tmp/ptoas-bin-x86_64.tar.gz -C $GITHUB_WORKSPACE/ptoas-bin
@@ -117,9 +117,9 @@ jobs:
 
       - name: Install ptoas
         run: |
-          PTOAS_VERSION=v0.17
+          PTOAS_VERSION=v0.24
           curl --fail --location --retry 3 --retry-all-errors \
-            https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-x86_64.tar.gz \
+            https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-x86_64.tar.gz \
             -o /tmp/ptoas-bin-x86_64.tar.gz
           mkdir -p $GITHUB_WORKSPACE/ptoas-bin
           tar -xzf /tmp/ptoas-bin-x86_64.tar.gz -C $GITHUB_WORKSPACE/ptoas-bin
@@ -180,9 +180,9 @@ jobs:
 
       - name: Install ptoas
         run: |
-          PTOAS_VERSION=v0.17
+          PTOAS_VERSION=v0.24
           curl --fail --location --retry 3 --retry-all-errors \
-            https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-aarch64.tar.gz \
+            https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-aarch64.tar.gz \
             -o /tmp/ptoas-bin-aarch64.tar.gz
           mkdir -p $GITHUB_WORKSPACE/ptoas-bin
           tar -xzf /tmp/ptoas-bin-aarch64.tar.gz -C $GITHUB_WORKSPACE/ptoas-bin

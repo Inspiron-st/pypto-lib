@@ -46,11 +46,11 @@ If pypto is already installed and up to date, skip this step.
 The pinned version is in `.github/workflows/ci.yml` (`PTOAS_VERSION`).
 
 ```bash
-PTOAS_VERSION=v0.17
+PTOAS_VERSION=v0.24
 ARCH=$(uname -m)   # x86_64 or aarch64
 curl --fail --location --retry 3 --retry-all-errors \
   -o /tmp/ptoas-bin-${ARCH}.tar.gz \
-  https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-${ARCH}.tar.gz
+  https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-${ARCH}.tar.gz
 mkdir -p "$WORKSPACE_DIR/ptoas-bin"
 tar -xzf /tmp/ptoas-bin-${ARCH}.tar.gz -C "$WORKSPACE_DIR/ptoas-bin"
 chmod +x "$WORKSPACE_DIR/ptoas-bin/ptoas" "$WORKSPACE_DIR/ptoas-bin/bin/ptoas"
@@ -71,7 +71,7 @@ export PTO_ISA_ROOT="$WORKSPACE_DIR/pto-isa"
 ## Step 6: Install simpler (stable branch)
 
 ```bash
-git clone --branch stable https://github.com/ChaoWao/simpler.git "$WORKSPACE_DIR/simpler"
+git clone --branch stable https://github.com/hw-native-sys/simpler.git "$WORKSPACE_DIR/simpler"
 pip install "$WORKSPACE_DIR/simpler"
 export SIMPLER_ROOT="$WORKSPACE_DIR/simpler"
 ```

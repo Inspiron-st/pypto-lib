@@ -67,7 +67,7 @@ get_upstream_remote() {
 }
 
 PYPTO_REMOTE=$(get_upstream_remote "$PYPTO_ROOT" "hw-native-sys/pypto")
-SIMPLER_REMOTE=$(get_upstream_remote "$SIMPLER_ROOT" "ChaoWao/simpler")
+SIMPLER_REMOTE=$(get_upstream_remote "$SIMPLER_ROOT" "hw-native-sys/simpler")
 ```
 
 Then pull the latest code:
@@ -198,7 +198,7 @@ If the error is a **pypto** or **ptoas** issue, **skip this step** — pypto is 
 > Search the following repos based on the diagnosed component:
 > - **Always** search `hw-native-sys/pypto-lib`
 > - If diagnosed as **pypto** issue, also search `hw-native-sys/pypto`
-> - If diagnosed as **simpler** issue, also search `ChaoWao/simpler`
+> - If diagnosed as **simpler** issue, also search `hw-native-sys/simpler`
 >
 > For each repo, follow the two-step process below. Then return EXACTLY one of: `DUPLICATE REPO#N`, `RELATED REPO#N1 REPO#N2 ...`, or `NO_MATCH`. Keep your response to 1-3 sentences plus the verdict.
 
@@ -326,7 +326,7 @@ Before creating the issue, **print the full issue content** to the user for revi
 2. **Determine the target repository** based on the diagnosis:
    - Default: the current repository (pypto-lib), determined by `gh repo view --json nameWithOwner -q .nameWithOwner`
    - If the diagnosis clearly points to **pypto** → ask the user: "This issue appears to be a pypto problem. Would you like to file it to **hw-native-sys/pypto** instead of pypto-lib?"
-   - If the diagnosis clearly points to **simpler** → ask the user: "This issue appears to be a simpler problem. Would you like to file it to **ChaoWao/simpler** instead of pypto-lib?"
+   - If the diagnosis clearly points to **simpler** → ask the user: "This issue appears to be a simpler problem. Would you like to file it to **hw-native-sys/simpler** instead of pypto-lib?"
    - If **ptoas** or unclear → file to pypto-lib (default).
 3. Wait for the user to confirm or request changes before proceeding to Step 9.
 

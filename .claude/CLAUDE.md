@@ -26,8 +26,8 @@ PyPTO-Lib is a **primitive tensor function library** built on the pypto programm
 | Dependency | Purpose | Repository |
 |------------|---------|------------|
 | **pypto** | Compiler framework (IR, codegen, passes) | `hw-native-sys/pypto` |
-| **ptoas** | PTO assembler & optimizer toolchain | `zhangstevenunity/PTOAS` |
-| **simpler** | Runtime (pto-rt2) | `ChaoWao/simpler` |
+| **ptoas** | PTO assembler & optimizer toolchain | `hw-native-sys/PTOAS` |
+| **simpler** | Runtime (pto-rt2) | `hw-native-sys/simpler` |
 
 ## Environment Setup
 
