@@ -120,6 +120,7 @@ def build_decode_scope12_program(
                         pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS),
                         [BATCH_TILE, 1],
                     )
+                    inv_rms = pl.recip(pl.sqrt(variance))
 
                     for kb in pl.range(hidden_blocks):
                         k0 = kb * K_CHUNK
@@ -128,7 +129,7 @@ def build_decode_scope12_program(
                             target_type=pl.FP32,
                         )
                         gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
-                        normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, variance), gamma)
+                        normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms), gamma)
                         normed_tile = pl.assemble(normed_tile, pl.cast(normed, target_type=pl.BF16), [0, k0])
 
                 for ob in pl.range(q_out_blocks):
@@ -396,13 +397,13 @@ def build_tensor_specs(
         return torch.rand(1, hidden_size) - 0.5
 
     def init_wq():
-        return torch.rand(hidden_size, hidden_size) - 0.5
+        return torch.randn(hidden_size, hidden_size) / hidden_size ** 0.5
 
     def init_wk():
-        return torch.rand(hidden_size, kv_hidden) - 0.5
+        return torch.randn(hidden_size, kv_hidden) / hidden_size ** 0.5
 
     def init_wv():
-        return torch.rand(hidden_size, kv_hidden) - 0.5
+        return torch.randn(hidden_size, kv_hidden) / hidden_size ** 0.5
 
     def init_seq_lens():
         return torch.randint(1, max_seq + 1, (batch,), dtype=torch.int32)
@@ -486,7 +487,8 @@ def golden_decode_scope12(tensors, params):
             x_chunk = x_tile[:, k0:k0 + K_CHUNK]
             sq_sum = sq_sum + (x_chunk ** 2).sum(dim=-1, keepdim=True)
         variance = sq_sum / hidden_size + EPS
-        normed = (x_tile * variance * input_rms_weight.float()).bfloat16()
+        rms = torch.sqrt(variance)
+        normed = (x_tile / rms * input_rms_weight.float()).bfloat16()
 
         q_proj[b0:b_end, :] = (normed.float() @ wq.float()).float()
         k_proj[b0:b_end, :] = (normed.float() @ wk.float()).float()
