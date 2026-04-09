@@ -77,12 +77,12 @@ def build_qwen3_scope3_program(
                     with pl.incore():
                         a_chunk_0 = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, 0])
                         w_chunk_0 = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [0, o0])
-                        o_acc = pl.matmul(a_chunk_0, w_chunk_0)
+                        o_acc = pl.matmul(a_chunk_0, w_chunk_0, out_dtype=pl.FP32)
                         for kb in pl.range(1, HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
                             a_chunk = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, k0])
                             w_chunk = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [k0, o0])
-                            o_acc = pl.add(o_acc, pl.matmul(a_chunk, w_chunk))
+                            o_acc = pl.matmul_acc(o_acc, a_chunk, w_chunk)
 
                         resid1_tile = pl.assemble(resid1_tile, o_acc, [0, o0])
 
@@ -121,21 +121,25 @@ def build_qwen3_scope3_program(
                     o0 = ob * MLP_OUT_CHUNK
                     # Stage 6a: MLP: gate projections
                     with pl.incore():
-                        gate_acc = pl.full([BATCH_TILE, MLP_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-                        for kb in pl.range(HIDDEN_BLOCKS):
+                        post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
+                        wg_0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
+                        gate_acc = pl.matmul(post_chunk_0, wg_0, out_dtype=pl.FP32)
+                        for kb in pl.range(1, HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
                             post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                             wg = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
-                            gate_acc = pl.add(gate_acc, pl.matmul(post_chunk, wg))
+                            gate_acc = pl.matmul_acc(gate_acc, post_chunk, wg)
 
                     # Stage 6b: MLP: up projections
                     with pl.incore():
-                        up_acc = pl.full([BATCH_TILE, MLP_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-                        for kb in pl.range(HIDDEN_BLOCKS):
+                        post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
+                        wu_0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
+                        up_acc = pl.matmul(post_chunk_0, wu_0, out_dtype=pl.FP32)
+                        for kb in pl.range(1, HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
                             post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                             wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
-                            up_acc = pl.add(up_acc, pl.matmul(post_chunk, wu))
+                            up_acc = pl.matmul_acc(up_acc, post_chunk, wu)
 
                     # Stage 6c: MLP: silu
                     with pl.auto_incore():
@@ -147,10 +151,12 @@ def build_qwen3_scope3_program(
                     for dob in pl.range(HIDDEN_BLOCKS):
                         d0 = dob * K_CHUNK
                         with pl.incore():
-                            down_prev = pl.slice(down_proj_tile, [BATCH_TILE, K_CHUNK], [0, d0])
                             w_down_chunk = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [o0, d0])
-                            down_next = pl.add(down_prev, pl.matmul(mlp_chunk_bf16, w_down_chunk))
-                            down_proj_tile = pl.assemble(down_proj_tile, down_next, [0, d0])
+                            down_next = pl.matmul(mlp_chunk_bf16, w_down_chunk, out_dtype=pl.FP32)
+
+                        with pl.incore():
+                            down_prev = pl.slice(down_proj_tile, [BATCH_TILE, K_CHUNK], [0, d0])
+                            down_proj_tile = pl.assemble(down_proj_tile, pl.add(down_prev, down_next), [0, d0])
 
                 # Stage 8: Final residual: down_proj + resid1, write to output.
                 for ob in pl.range(HIDDEN_BLOCKS):
