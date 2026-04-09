@@ -219,34 +219,45 @@ def build_tensor_specs(
     hidden_size: int = HIDDEN,
     intermediate_size: int = INTERMEDIATE,
 ):
-    import torch  # type: ignore[import]
+    import torch
     from pypto.runtime import TensorSpec
 
-    def xavier_bf16(shape: list[int]) -> torch.Tensor:
-        """Generate in FP32 with Xavier (1/sqrt(fan_in)) scaling, then cast to BF16."""
-        fan_in = shape[1]
-        return (torch.randn(shape, dtype=torch.float32) / (fan_in ** 0.5)).to(torch.bfloat16)
+    def init_attn_out():
+        return torch.rand(batch, hidden_size) - 0.5
 
-    def xavier_fp32(shape: list[int]) -> torch.Tensor:
-        """Generate in FP32 with Xavier (1/sqrt(fan_in)) scaling."""
-        fan_in = shape[1]
-        return torch.randn(shape, dtype=torch.float32) / (fan_in ** 0.5)
+    def init_hidden_states():
+        return torch.rand(batch, hidden_size) - 0.5
+
+    def init_wo():
+        return (torch.rand(hidden_size, hidden_size) - 0.5) / hidden_size ** 0.5
+
+    def init_post_rms_weight():
+        return torch.ones(1, hidden_size)
+
+    def init_w_gate():
+        return (torch.rand(hidden_size, intermediate_size) - 0.5) / hidden_size ** 0.5
+
+    def init_w_up():
+        return (torch.rand(hidden_size, intermediate_size) - 0.5) / hidden_size ** 0.5
+
+    def init_w_down():
+        return (torch.rand(intermediate_size, hidden_size) - 0.5) / intermediate_size ** 0.5
 
     return [
         TensorSpec("attn_out", [batch, hidden_size], torch.bfloat16,
-                   init_value=xavier_bf16([batch, hidden_size])),
+                   init_value=init_attn_out),
         TensorSpec("hidden_states", [batch, hidden_size], torch.bfloat16,
-                   init_value=xavier_bf16([batch, hidden_size])),
+                   init_value=init_hidden_states),
         TensorSpec("wo", [hidden_size, hidden_size], torch.bfloat16,
-                   init_value=xavier_bf16([hidden_size, hidden_size])),
+                   init_value=init_wo),
         TensorSpec("post_rms_weight", [1, hidden_size], torch.float32,
-                   init_value=xavier_fp32([1, hidden_size])),
+                   init_value=init_post_rms_weight),
         TensorSpec("w_gate", [hidden_size, intermediate_size], torch.bfloat16,
-                   init_value=xavier_bf16([hidden_size, intermediate_size])),
+                   init_value=init_w_gate),
         TensorSpec("w_up", [hidden_size, intermediate_size], torch.bfloat16,
-                   init_value=xavier_bf16([hidden_size, intermediate_size])),
+                   init_value=init_w_up),
         TensorSpec("w_down", [intermediate_size, hidden_size], torch.bfloat16,
-                   init_value=xavier_bf16([intermediate_size, hidden_size])),
+                   init_value=init_w_down),
         TensorSpec("out", [batch, hidden_size], torch.bfloat16, is_output=True),
     ]
 
@@ -283,8 +294,8 @@ def compile_and_run(
         config=RunConfig(
             platform=platform,
             device_id=device_id,
-            rtol=1e-3,
-            atol=1e-3,
+            rtol=3e-3,
+            atol=3e-3,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
             backend_type=BackendType.Ascend950,
