@@ -60,44 +60,50 @@ def build_qwen3_scope3_program(
             w_down: pl.Tensor[[INTER_CFG, HIDDEN_CFG], pl.BF16],
             out: pl.Tensor[[BATCH_CFG, HIDDEN_CFG], pl.BF16],
         ) -> pl.Tensor[[BATCH_CFG, HIDDEN_CFG], pl.BF16]:
-            with pl.auto_incore(split=pl.SplitMode.UP_DOWN):
-                for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
-                    resid1_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.FP32)
-                    for ob in pl.parallel(0, Q_OUT_BLOCKS):
+            for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
+                resid1_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.FP32)
+
+                # Stage 1: Initialize resid1_tile accumulator in parallel.
+                with pl.auto_incore():
+                    for ob in pl.parallel(0, Q_OUT_BLOCKS, chunk=8):
                         o0 = ob * Q_OUT_CHUNK
                         zero_resid1 = pl.full([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
                         resid1_tile = pl.assemble(resid1_tile, zero_resid1, [0, o0])
 
-                    # Output projection: attn_out × wo, tiled by Q_OUT_CHUNK.
-                    for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=8):
-                        o0 = ob * Q_OUT_CHUNK
-                        o_acc = pl.full([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-                        for kb in pl.range(HIDDEN_BLOCKS):
+                # Stage 2: Output projection: attn_out × wo, tiled by Q_OUT_CHUNK.
+                for ob in pl.range(Q_OUT_BLOCKS):
+                    o0 = ob * Q_OUT_CHUNK
+
+                    with pl.incore():
+                        a_chunk_0 = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, 0])
+                        w_chunk_0 = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [0, o0])
+                        o_acc = pl.matmul(a_chunk_0, w_chunk_0)
+                        for kb in pl.range(1, HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
                             a_chunk = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, k0])
                             w_chunk = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [k0, o0])
                             o_acc = pl.add(o_acc, pl.matmul(a_chunk, w_chunk))
+
+                        resid1_tile = pl.assemble(resid1_tile, o_acc, [0, o0])
+
+                    with pl.incore():
                         resid = pl.cast(
                             pl.slice(hidden_states, [BATCH_TILE, Q_OUT_CHUNK], [b0, o0]),
                             target_type=pl.FP32,
                         )
-                        resid1_tile = pl.assemble(resid1_tile, pl.add(o_acc, resid), [0, o0])
+                        mm_out = pl.slice(resid1_tile, [BATCH_TILE, Q_OUT_CHUNK], [0, o0])
+                        resid1_tile = pl.assemble(resid1_tile, pl.add(mm_out, resid), [0, o0])
 
-                    # Post-attention RMSNorm: compute inv_rms over resid1_tile.
+                # Stage 3 & 4 & 5: Post-attention RMSNorm: compute inv_rms over resid1_tile + normalize + initialize down_proj_tile accumulator.
+                post_norm_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.BF16)
+                down_proj_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.FP32)
+                with pl.auto_incore():
                     sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
                     for kb in pl.range(HIDDEN_BLOCKS):
                         k0 = kb * K_CHUNK
                         x_chunk = pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                         sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, BATCH_TILE]))
                     inv_rms = pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS))
-
-                    # Normalize and zero-init down_proj accumulator.
-                    post_norm_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.BF16)
-                    down_proj_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.FP32)
-                    for zi in pl.range(HIDDEN_BLOCKS):
-                        z0 = zi * K_CHUNK
-                        down_zero_chunk = pl.full([BATCH_TILE, K_CHUNK], dtype=pl.FP32, value=0.0)
-                        down_proj_tile = pl.assemble(down_proj_tile, down_zero_chunk, [0, z0])
 
                     for kb in pl.range(HIDDEN_BLOCKS):
                         k0 = kb * K_CHUNK
@@ -107,35 +113,49 @@ def build_qwen3_scope3_program(
                         post_norm_tile = pl.assemble(
                             post_norm_tile, pl.cast(normed, target_type=pl.BF16), [0, k0]
                         )
+                        down_zero_chunk = pl.full([BATCH_TILE, K_CHUNK], dtype=pl.FP32, value=0.0)
+                        down_proj_tile = pl.assemble(down_proj_tile, down_zero_chunk, [0, k0])
 
-                    # MLP: gate/up projections + SiLU + down projection.
-                    for ob in pl.range(MLP_OUT_BLOCKS):
-                        o0 = ob * MLP_OUT_CHUNK
+                # Stage 6: MLP: gate/up projections + SiLU.
+                for ob in pl.range(MLP_OUT_BLOCKS):
+                    o0 = ob * MLP_OUT_CHUNK
+                    # Stage 6a: MLP: gate projections
+                    with pl.incore():
                         gate_acc = pl.full([BATCH_TILE, MLP_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-                        up_acc = pl.full([BATCH_TILE, MLP_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-
                         for kb in pl.range(HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
                             post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                             wg = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
-                            wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
                             gate_acc = pl.add(gate_acc, pl.matmul(post_chunk, wg))
+
+                    # Stage 6b: MLP: up projections
+                    with pl.incore():
+                        up_acc = pl.full([BATCH_TILE, MLP_OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                        for kb in pl.range(HIDDEN_BLOCKS):
+                            k0 = kb * K_CHUNK
+                            post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
+                            wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
                             up_acc = pl.add(up_acc, pl.matmul(post_chunk, wu))
 
+                    # Stage 6c: MLP: silu
+                    with pl.auto_incore():
                         sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
                         mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
                         mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
 
-                        for dob in pl.parallel(0, HIDDEN_BLOCKS, 1, chunk=4):
-                            d0 = dob * K_CHUNK
+                    # Stage 7: Down projection: accumulate in parallel.
+                    for dob in pl.range(HIDDEN_BLOCKS):
+                        d0 = dob * K_CHUNK
+                        with pl.incore():
                             down_prev = pl.slice(down_proj_tile, [BATCH_TILE, K_CHUNK], [0, d0])
                             w_down_chunk = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [o0, d0])
                             down_next = pl.add(down_prev, pl.matmul(mlp_chunk_bf16, w_down_chunk))
                             down_proj_tile = pl.assemble(down_proj_tile, down_next, [0, d0])
 
-                    # Final residual: down_proj + resid1, write to output.
-                    for ob in pl.parallel(0, HIDDEN_BLOCKS, 1, chunk=4):
-                        o0 = ob * K_CHUNK
+                # Stage 8: Final residual: down_proj + resid1, write to output.
+                for ob in pl.range(HIDDEN_BLOCKS):
+                    o0 = ob * K_CHUNK
+                    with pl.incore():
                         down_acc = pl.add(
                             pl.slice(down_proj_tile, [BATCH_TILE, K_CHUNK], [0, o0]),
                             pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, o0]),
