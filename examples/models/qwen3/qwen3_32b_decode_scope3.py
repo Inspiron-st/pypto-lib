@@ -92,7 +92,8 @@ def build_qwen3_scope3_program(
                             target_type=pl.FP32,
                         )
                         mm_out = pl.slice(resid1_tile, [BATCH_TILE, Q_OUT_CHUNK], [0, o0])
-                        resid1_tile = pl.assemble(resid1_tile, pl.add(mm_out, resid), [0, o0])
+                        add_resid = pl.add(mm_out, resid)
+                        resid1_tile = pl.assemble(resid1_tile, add_resid, [0, o0])
 
                 # Stage 3 & 4 & 5: Post-attention RMSNorm: compute inv_rms over resid1_tile + normalize + initialize down_proj_tile accumulator.
                 post_norm_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.BF16)
@@ -156,7 +157,8 @@ def build_qwen3_scope3_program(
 
                         with pl.incore():
                             down_prev = pl.slice(down_proj_tile, [BATCH_TILE, K_CHUNK], [0, d0])
-                            down_proj_tile = pl.assemble(down_proj_tile, pl.add(down_prev, down_next), [0, d0])
+                            accum = pl.add(down_prev, down_next)
+                            down_proj_tile = pl.assemble(down_proj_tile, accum, [0, d0])
 
                 # Stage 8: Final residual: down_proj + resid1, write to output.
                 for ob in pl.range(HIDDEN_BLOCKS):
@@ -166,7 +168,8 @@ def build_qwen3_scope3_program(
                             pl.slice(down_proj_tile, [BATCH_TILE, K_CHUNK], [0, o0]),
                             pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, o0]),
                         )
-                        out = pl.assemble(out, pl.cast(down_acc, target_type=pl.BF16), [b0, o0])
+                        out_f32 = pl.cast(down_acc, target_type=pl.BF16)
+                        out = pl.assemble(out, out_f32, [b0, o0])
 
             return out
 
