@@ -125,7 +125,7 @@ def build_decode_projection_program(
                             tile_b_i = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [k0, q0])
                             q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
 
-                        q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
+                    q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
 
                 # Stage 3: K/V projection (matmul + matmul_acc in single incore).
                 for ob in pl.range(kv_out_blocks):
@@ -142,7 +142,7 @@ def build_decode_projection_program(
                             tile_wk_i = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
                             k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
 
-                        k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
+                    k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
 
                     with pl.incore():
                         tile_a = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, 0])
@@ -155,7 +155,7 @@ def build_decode_projection_program(
                             tile_wv_i = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
                             v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
 
-                        v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
+                    v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
 
             return q_proj, k_proj, v_proj
 

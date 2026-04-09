@@ -143,7 +143,7 @@ def build_decode_scope12_program(
                             tile_a_i = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                             tile_b_i = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [k0, q0])
                             q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
-                        q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
+                    q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
 
                 for ob in pl.range(kv_out_blocks):
                     kv0 = ob * KV_OUT_CHUNK
@@ -156,7 +156,7 @@ def build_decode_scope12_program(
                             tile_a_i = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                             tile_wk_i = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
                             k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
-                        k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
+                    k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
                     with pl.incore():
                         tile_a = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                         tile_wv = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
@@ -166,7 +166,7 @@ def build_decode_scope12_program(
                             tile_a_i = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                             tile_wv_i = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
                             v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
-                        v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
+                    v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
 
             # ── Scope 2: RoPE + KV cache update + grouped-query attention ──
             for b in pl.range(batch):
