@@ -18,7 +18,6 @@ Scope 2:
   3. Softmax
   4. SV matmul
   5. Online-softmax accumulation + final normalisation
-
 Intermediate q_proj/k_proj/v_proj are FP32 GM tensors between the two scopes.
 """
 from __future__ import annotations
@@ -92,20 +91,6 @@ def build_qwen3_scope12_program(
             k_proj = pl.create_tensor([batch, kv_hidden], dtype=pl.FP32)
             v_proj = pl.create_tensor([batch, kv_hidden], dtype=pl.FP32)
 
-            # Initialize intermediate tensors to zero so assemble generates inout.
-            for ob in pl.range(q_out_blocks):
-                q0 = ob * Q_OUT_CHUNK
-                with pl.incore():
-                    zero_q = pl.full([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-                    q_proj = pl.assemble(q_proj, zero_q, [0, q0])
-            for ob in pl.range(kv_out_blocks):
-                kv0 = ob * KV_OUT_CHUNK
-                with pl.incore():
-                    zero_k = pl.full([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-                    zero_v = pl.full([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-                    k_proj = pl.assemble(k_proj, zero_k, [0, kv0])
-                    v_proj = pl.assemble(v_proj, zero_v, [0, kv0])
-
             # ── Scope 1: input RMSNorm + Q/K/V projection ──
             for b0 in pl.range(0, batch, BATCH_TILE):
                 normed_tile = pl.create_tensor([BATCH_TILE, hidden], dtype=pl.BF16)
@@ -176,6 +161,16 @@ def build_qwen3_scope12_program(
                             v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
                     v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
 
+            # Padding q
+            all_q_padded = pl.create_tensor([batch * total_q_groups * Q_HEAD_PAD, head_dim], dtype=pl.BF16)
+            with pl.incore():
+                for idx in pl.range(batch * total_q_groups):
+                    all_q_padded = pl.assemble(
+                        all_q_padded,
+                        pl.cast(pl.full([Q_HEAD_PAD - Q_HEAD_BATCH, head_dim], dtype=pl.FP32, value=0.0), target_type=pl.BF16),
+                        [idx * Q_HEAD_PAD + Q_HEAD_BATCH, 0],
+                    )
+
             # ── Scope 2: RoPE + KV cache update + grouped-query attention ──
             for b in pl.range(batch):
                 ctx_len = pl.tensor.read(seq_lens, [b])
@@ -187,16 +182,6 @@ def build_qwen3_scope12_program(
                 cos_hi = pl.slice(cos_row, [1, half_dim], [0, half_dim])
                 sin_lo = pl.slice(sin_row, [1, half_dim], [0, 0])
                 sin_hi = pl.slice(sin_row, [1, half_dim], [0, half_dim])
-
-                # Workaround
-                all_q_padded = pl.create_tensor([total_q_groups * Q_HEAD_PAD, head_dim], dtype=pl.BF16)
-                with pl.incore():
-                    for gi in pl.range(total_q_groups):
-                        all_q_padded = pl.assemble(
-                            all_q_padded,
-                            pl.cast(pl.full([Q_HEAD_PAD, head_dim], dtype=pl.FP32, value=0.0), target_type=pl.BF16),
-                            [gi * Q_HEAD_PAD, 0],
-                        )
 
                 # Stage 1: K RoPE + cache update + V cache + Q RoPE + pad.
                 with pl.auto_incore():
@@ -236,15 +221,15 @@ def build_qwen3_scope12_program(
                                 pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi)),
                                 target_type=pl.BF16,
                             )
-                            all_q_padded = pl.assemble(all_q_padded, rot_lo_bf16, [ki * Q_HEAD_PAD + qi, 0])
-                            all_q_padded = pl.assemble(all_q_padded, rot_hi_bf16, [ki * Q_HEAD_PAD + qi, half_dim])
+                            all_q_padded = pl.assemble(all_q_padded, rot_lo_bf16, [b * total_q_groups * Q_HEAD_PAD + ki * Q_HEAD_PAD + qi, 0])
+                            all_q_padded = pl.assemble(all_q_padded, rot_hi_bf16, [b * total_q_groups * Q_HEAD_PAD + ki * Q_HEAD_PAD + qi, half_dim])
 
                 attn_row = pl.create_tensor([1, hidden], dtype=pl.BF16)
                 for gi in pl.range(total_q_groups):
                     kvh = gi // q_groups
                     qg = gi - kvh * q_groups
                     q_base = kvh * q_per_kv + qg * Q_HEAD_BATCH
-                    q_padded = pl.slice(all_q_padded, [Q_HEAD_PAD, head_dim], [gi * Q_HEAD_PAD, 0])
+                    q_padded = pl.slice(all_q_padded, [Q_HEAD_PAD, head_dim], [b * total_q_groups * Q_HEAD_PAD + gi * Q_HEAD_PAD, 0])
 
                     # Workaround
                     all_raw_scores = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, SEQ_TILE], dtype=pl.FP32)
@@ -347,38 +332,22 @@ def build_qwen3_scope12_program(
                                     oi_tmp = pl.matmul(exp_tile, v_tile, out_dtype=pl.FP32)
                                     all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [sb * Q_HEAD_PAD, 0])
 
-                    # Workaround
+                    # Stage 5: online softmax accumulation and normalisation.
                     with pl.incore():
-                        oi = pl.full([Q_HEAD_BATCH, head_dim], dtype=pl.FP32, value=0.0)
-                        li_flat = pl.full([1, Q_HEAD_BATCH], dtype=pl.FP32, value=0.0)
-                        li = pl.reshape(li_flat, [Q_HEAD_BATCH, 1])
-                        mi_flat = pl.full([1, Q_HEAD_BATCH], dtype=pl.FP32, value=0.0)
-                        mi = pl.reshape(mi_flat, [Q_HEAD_BATCH, 1])
-
-                    # Stage 5: online softmax accumulation for active sb blocks.
-                    for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
-                        with pl.incore():
-                            for si in pl.range(SB_BATCH):
-                                sb = sb0 + si
-                                if sb < ctx_blocks:
-                                    oi_tmp_valid = pl.slice(all_oi_tmp, [Q_HEAD_BATCH, head_dim], [sb * Q_HEAD_PAD, 0])
-                                    cur_mi = pl.slice(all_cur_mi, [Q_HEAD_BATCH, 1], [sb * Q_HEAD_BATCH, 0])
-                                    cur_li = pl.slice(all_cur_li, [Q_HEAD_BATCH, 1], [sb * Q_HEAD_BATCH, 0])
-                                    if sb == 0:
-                                        oi = oi_tmp_valid
-                                        li = cur_li
-                                        mi = cur_mi
-                                    else:
-                                        mi_new = pl.maximum(mi, cur_mi)
-                                        alpha = pl.exp(pl.sub(mi, mi_new))
-                                        beta = pl.exp(pl.sub(cur_mi, mi_new))
-                                        li = pl.add(pl.mul(alpha, li), pl.mul(beta, cur_li))
-                                        oi = pl.add(pl.row_expand_mul(oi, alpha),
-                                                    pl.row_expand_mul(oi_tmp_valid, beta))
-                                        mi = mi_new
-
-                    # Stage 6: normalise and write back one Q-head batch.
-                    with pl.incore():
+                        oi = pl.slice(all_oi_tmp, [Q_HEAD_BATCH, head_dim], [0, 0])
+                        mi = pl.slice(all_cur_mi, [Q_HEAD_BATCH, 1], [0, 0])
+                        li = pl.slice(all_cur_li, [Q_HEAD_BATCH, 1], [0, 0])
+                        for sb in pl.range(1, ctx_blocks):
+                            oi_tmp_valid = pl.slice(all_oi_tmp, [Q_HEAD_BATCH, head_dim], [sb * Q_HEAD_PAD, 0])
+                            cur_mi = pl.slice(all_cur_mi, [Q_HEAD_BATCH, 1], [sb * Q_HEAD_BATCH, 0])
+                            cur_li = pl.slice(all_cur_li, [Q_HEAD_BATCH, 1], [sb * Q_HEAD_BATCH, 0])
+                            mi_new = pl.maximum(mi, cur_mi)
+                            alpha = pl.exp(pl.sub(mi, mi_new))
+                            beta = pl.exp(pl.sub(cur_mi, mi_new))
+                            li = pl.add(pl.mul(alpha, li), pl.mul(beta, cur_li))
+                            oi = pl.add(pl.row_expand_mul(oi, alpha),
+                                        pl.row_expand_mul(oi_tmp_valid, beta))
+                            mi = mi_new
                         ctx = pl.row_expand_div(oi, li)
                         ctx_flat = pl.reshape(ctx, [1, Q_HEAD_BATCH * head_dim])
                         ctx_flat_bf16 = pl.cast(ctx_flat, target_type=pl.BF16)
