@@ -273,7 +273,7 @@ def compile_and_run(
     device_id: int = 0,
     work_dir: str | None = None,
     dump_passes: bool = True,
-    enable_profiling: bool = False,
+    runtime_profiling: bool = False,
 ):
     from pypto.backend import BackendType
     from pypto.ir.pass_manager import OptimizationStrategy
@@ -305,7 +305,7 @@ def compile_and_run(
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
             backend_type=backend,
-            enable_profiling=enable_profiling,
+            runtime_profiling=runtime_profiling,
         ),
     )
     if not result.passed and result.error and "code_runner" in result.error:
@@ -322,13 +322,13 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a5",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--enable-profiling", action="store_true", default=False)
+    parser.add_argument("--runtime-profiling", action="store_true", default=False)
     args = parser.parse_args()
 
     result = compile_and_run(
         platform=args.platform,
         device_id=args.device,
-        enable_profiling=args.enable_profiling,
+        runtime_profiling=args.runtime_profiling,
     )
     if not result.passed:
         if result.error:
