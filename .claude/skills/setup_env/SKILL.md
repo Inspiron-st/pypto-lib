@@ -68,12 +68,13 @@ git -C "$WORKSPACE_DIR/pto-isa" checkout a652804
 export PTO_ISA_ROOT="$WORKSPACE_DIR/pto-isa"
 ```
 
-## Step 6: Install simpler (stable branch)
+## Step 6: Install simpler (bundled in pypto submodule)
+
+simpler is now a git submodule of pypto at `runtime/`. After cloning pypto
+in Step 3, install it directly:
 
 ```bash
-git clone --branch stable https://github.com/hw-native-sys/simpler.git "$WORKSPACE_DIR/simpler"
-pip install "$WORKSPACE_DIR/simpler"
-export SIMPLER_ROOT="$WORKSPACE_DIR/simpler"
+pip install "$WORKSPACE_DIR/pypto/runtime"
 ```
 
 ## Environment Variables
@@ -84,7 +85,6 @@ After setup, these must be set:
 |----------|-----------|
 | `PTOAS_ROOT` | `../ptoas-bin` |
 | `PTO_ISA_ROOT` | `../pto-isa` |
-| `SIMPLER_ROOT` | `../simpler` |
 | `ASCEND_HOME_PATH` | `/usr/local/Ascend/cann-8.5.0` (device only) |
 
 ## Troubleshooting

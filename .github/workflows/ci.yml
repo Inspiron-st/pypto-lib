@@ -35,7 +35,6 @@ jobs:
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
       PTOAS_VERSION: v0.25
       PTOAS_SHA256: 9027409aebbdd9ca416e82197c84210fa8f7f61e666c748dc376abd55f94cc70
-      SIMPLER_ROOT: ${{ github.workspace }}/simpler
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
       PTO_ISA_COMMIT: d96c8784
 
@@ -69,26 +68,12 @@ jobs:
           pip install nanobind
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-      - name: Get pypto HEAD commit
-        id: pypto-hash
-        run: |
-          echo "hash=$(git ls-remote https://github.com/hw-native-sys/pypto.git HEAD | cut -f1)" >> $GITHUB_OUTPUT
-
-      - name: Cache pypto wheel
-        id: cache-pypto
-        uses: actions/cache@v4
-        with:
-          path: /tmp/pypto-wheel
-          key: pypto-${{ runner.os }}-${{ runner.arch }}-py3.10-${{ steps.pypto-hash.outputs.hash }}
-
-      - name: Build pypto wheel
-        if: steps.cache-pypto.outputs.cache-hit != 'true'
+      - name: Clone and install pypto (with simpler submodule)
         run: |
           git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
-          pip wheel /tmp/pypto -w /tmp/pypto-wheel --no-deps
-
-      - name: Install pypto
-        run: pip install /tmp/pypto-wheel/*.whl
+          pip install /tmp/pypto
+          pip install /tmp/pypto/runtime
+          ln -s /tmp/pypto/runtime $GITHUB_WORKSPACE/runtime
 
       - name: Cache ptoas binary
         id: cache-ptoas
@@ -115,12 +100,6 @@ jobs:
           cd $GITHUB_WORKSPACE/pto-isa
           git checkout ${{ env.PTO_ISA_COMMIT }}
 
-      - name: Install simpler (stable)
-        run: |
-          git clone --branch stable --depth 1 https://github.com/hw-native-sys/simpler.git $GITHUB_WORKSPACE/simpler
-          cd $GITHUB_WORKSPACE/simpler
-          pip install -v .
-
       - name: Run ${{ matrix.platform }} tests
         run: |
           for f in $(find examples/beginner examples/intermediate -name '*.py' | sort); do
@@ -137,7 +116,6 @@ jobs:
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
       PTOAS_VERSION: v0.25
       PTOAS_SHA256: 66dee5d9ebbd713db7934570bb95eb7870895a49905c248ca95da9289cd4a1aa
-      SIMPLER_ROOT: ${{ github.workspace }}/simpler
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
       PTO_ISA_COMMIT: d96c8784
     container:
@@ -163,26 +141,11 @@ jobs:
           pip install nanobind
           pip install torch
 
-      - name: Get pypto HEAD commit
-        id: pypto-hash
-        run: |
-          echo "hash=$(git ls-remote https://github.com/hw-native-sys/pypto.git HEAD | cut -f1)" >> $GITHUB_OUTPUT
-
-      - name: Cache pypto wheel
-        id: cache-pypto
-        uses: actions/cache@v4
-        with:
-          path: /tmp/pypto-wheel
-          key: pypto-${{ runner.os }}-${{ runner.arch }}-py3.10-${{ steps.pypto-hash.outputs.hash }}
-
-      - name: Build pypto wheel
-        if: steps.cache-pypto.outputs.cache-hit != 'true'
+      - name: Clone and install pypto (with simpler submodule)
         run: |
           git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
-          pip wheel /tmp/pypto -w /tmp/pypto-wheel --no-deps
-
-      - name: Install pypto
-        run: pip install /tmp/pypto-wheel/*.whl
+          pip install /tmp/pypto
+          ln -s /tmp/pypto/runtime $GITHUB_WORKSPACE/runtime
 
       - name: Cache ptoas binary
         id: cache-ptoas
@@ -206,17 +169,14 @@ jobs:
       - name: Add Ascend tools to PATH
         run: echo "$ASCEND_HOME_PATH/bin" >> $GITHUB_PATH
 
+      - name: Install simpler
+        run: pip install /tmp/pypto/runtime
+
       - name: Clone pto-isa repository (pinned)
         run: |
           git clone https://github.com/hw-native-sys/pto-isa.git $GITHUB_WORKSPACE/pto-isa
           cd $GITHUB_WORKSPACE/pto-isa
           git checkout ${{ env.PTO_ISA_COMMIT }}
-
-      - name: Install simpler (stable)
-        run: |
-          git clone --branch stable --depth 1 https://github.com/hw-native-sys/simpler.git $GITHUB_WORKSPACE/simpler
-          cd $GITHUB_WORKSPACE/simpler
-          pip install -v .
 
       - name: Run a2a3 tests
         run: |

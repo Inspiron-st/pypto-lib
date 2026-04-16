@@ -44,8 +44,7 @@ If not authenticated, tell the user to run `gh auth login` and **stop**.
 
 Use the `/setup_env` skill to ensure the development environment is ready (pypto, ptoas, simpler), with the following adjustments to ensure we test against the latest code:
 
-- **pypto**: pull latest `main` and reinstall
-- **simpler**: pull latest `stable`
+- **pypto**: pull latest `main` and reinstall (this also updates simpler submodule)
 - **ptoas**: install if missing (via `/setup_env` Step 5)
 
 Before pulling, determine the correct remote for each repo. The upstream remote may be `origin` or `upstream` depending on whether the user cloned from the original repo or a fork:
@@ -67,25 +66,20 @@ get_upstream_remote() {
 }
 
 PYPTO_REMOTE=$(get_upstream_remote "$PYPTO_ROOT" "hw-native-sys/pypto")
-SIMPLER_REMOTE=$(get_upstream_remote "$SIMPLER_ROOT" "hw-native-sys/simpler")
 ```
 
 Then pull the latest code:
 
 ```bash
-# pypto: ensure latest main
+# pypto: ensure latest main (includes simpler submodule)
 cd "$PYPTO_ROOT"
 git fetch "$PYPTO_REMOTE"
 git checkout main
 git pull "$PYPTO_REMOTE" main
+git submodule update --init --recursive
 rm -rf build/
 python3 -m pip install -e .
-
-# simpler: ensure latest stable
-cd "$SIMPLER_ROOT"
-git fetch "$SIMPLER_REMOTE"
-git checkout stable
-git pull "$SIMPLER_REMOTE" stable
+pip install "$PYPTO_ROOT/runtime"
 ```
 
 After setup, collect dependency versions:
@@ -98,9 +92,9 @@ git rev-parse --short HEAD
 git -C "$PYPTO_ROOT" log -1 --format="%h"
 git -C "$PYPTO_ROOT" branch --show-current
 
-# simpler commit-id (short, 7 chars) + branch
-git -C "$SIMPLER_ROOT" log -1 --format="%h"
-git -C "$SIMPLER_ROOT" branch --show-current
+# simpler commit-id (short, 7 chars) + branch (submodule of pypto)
+git -C "$PYPTO_ROOT/runtime" log -1 --format="%h"
+git -C "$PYPTO_ROOT/runtime" branch --show-current
 
 # CANN version
 cat /usr/local/Ascend/ascend-toolkit/latest/version.cfg 2>/dev/null || echo "not detected"
@@ -160,12 +154,14 @@ Record the diagnosed component for inclusion in the issue body.
 
 Since Step 2 already updated pypto to latest main and simpler to latest stable, the only remaining retry is switching simpler to `main`.
 
-**Only if the error is diagnosed as a simpler (runtime) issue**, try switching simpler to the latest `main` branch:
+**Only if the error is diagnosed as a simpler (runtime) issue**, try switching the simpler submodule to the latest `main` branch:
 
 ```bash
-cd "$SIMPLER_ROOT"
+cd "$PYPTO_ROOT/runtime"
+git fetch origin
 git checkout main
-git pull "$SIMPLER_REMOTE" main
+git pull origin main
+pip install "$PYPTO_ROOT/runtime"
 ```
 
 Re-run the reproduction script.
