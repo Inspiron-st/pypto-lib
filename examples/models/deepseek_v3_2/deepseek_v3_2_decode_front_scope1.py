@@ -14,7 +14,7 @@ DeepSeek V3.2-EXP single-layer decode FRONT part — Scope 1 only (batch=16).
 Scope 1: input RMSNorm + Q/KV projection.
 - Compute RMSNorm of hidden_states
 - Project to Q latent (qr) via wq_a
-- Project from Q latent to Q heads (q_proj) via wq_b after q_norm
+- Apply q_norm to Q latent, then project to Q heads (q_proj) via wq_b
 - Project to KV latent (kv_a) via wkv_a
 
 Aligned to official v3.2-exp MLA shapes:
@@ -81,6 +81,7 @@ def build_deepseek_v3_2_decode_front_scope1_program(
     QK_HEAD_DIM_CFG = qk_nope_head_dim + qk_rope_head_dim
     V_HEAD_DIM_CFG = v_head_dim
     KV_A_OUT_CFG = kv_lora_rank + qk_rope_head_dim
+    Q_LORA_INV_CFG = 1.0 / q_lora_rank
 
     RMSNORM_BLOCKS = (HIDDEN_CFG + RMSNORM_K - 1) // RMSNORM_K
     PROJ_BLOCKS = (HIDDEN_CFG + PROJ_K - 1) // PROJ_K
@@ -105,14 +106,9 @@ def build_deepseek_v3_2_decode_front_scope1_program(
             kv_a_out: pl.Tensor[[BATCH_CFG, KV_A_OUT_CFG], pl.BF16],
         ) -> pl.Tensor[[BATCH_CFG, NUM_HEADS_CFG * QK_HEAD_DIM_CFG], pl.BF16]:
             # Scope 1: input RMSNorm + Q/KV projection.
-            qr = pl.create_tensor([BATCH_CFG, Q_LORA_RANK_CFG], dtype=pl.BF16)
-            q_proj = pl.create_tensor([BATCH_CFG, NUM_HEADS_CFG * QK_HEAD_DIM_CFG], dtype=pl.BF16)
-            kv_a = pl.create_tensor([BATCH_CFG, KV_A_OUT_CFG], dtype=pl.BF16)
-
             for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
                 normed_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.BF16)
                 qr_fp32_tile = pl.create_tensor([BATCH_TILE, Q_LORA_RANK_CFG], dtype=pl.FP32)
-                qr_tile = pl.create_tensor([BATCH_TILE, Q_LORA_RANK_CFG], dtype=pl.BF16)
                 kv_a_fp32_tile = pl.create_tensor([BATCH_TILE, KV_A_OUT_CFG], dtype=pl.FP32)
 
                 # Stage 1: RMSNorm + apply weights, matching the Qwen3
@@ -150,7 +146,7 @@ def build_deepseek_v3_2_decode_front_scope1_program(
 
                 # Stage 2: Q latent projection, accumulated in Cube Acc.
                 with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                    for ob in pl.parallel(0, QR_BLOCKS, 1, chunk=4):
+                    for ob in pl.parallel(0, QR_BLOCKS, 1, chunk=2):
                         q0 = ob * LORA_CHUNK
                         q_tile_a = pl.slice(normed_tile, [BATCH_TILE, PROJ_K], [0, 0])
                         q_tile_b = pl.slice(wq_a, [PROJ_K, LORA_CHUNK], [0, q0])
@@ -162,16 +158,34 @@ def build_deepseek_v3_2_decode_front_scope1_program(
                             q_acc = pl.matmul_acc(q_acc, q_tile_a_i, q_tile_b_i)
                         qr_fp32_tile = pl.assemble(qr_fp32_tile, q_acc, [0, q0])
 
-                # Stage 3: cast Q latent output to BF16.
-                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                # Stage 3: q_norm(wq_a(normed)), matching ds32.py MLA.forward.
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    q_partial_sq = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
+                    for kb in pl.range(QR_BLOCKS):
+                        k0 = kb * LORA_CHUNK
+                        qr_chunk_fp32 = pl.slice(qr_fp32_tile, [BATCH_TILE, LORA_CHUNK], [0, k0])
+                        q_partial_sq = pl.add(
+                            q_partial_sq,
+                            pl.reshape(pl.row_sum(pl.mul(qr_chunk_fp32, qr_chunk_fp32)), [1, BATCH_TILE]),
+                        )
+
+                    q_variance = pl.reshape(
+                        pl.add(pl.mul(q_partial_sq, Q_LORA_INV_CFG), EPS),
+                        [BATCH_TILE, 1],
+                    )
+                    q_inv_rms = pl.recip(pl.sqrt(q_variance))
+
                     for kb in pl.range(QR_BLOCKS):
                         k0 = kb * LORA_CHUNK
                         qr_chunk_bf16 = pl.cast(
                             pl.slice(qr_fp32_tile, [BATCH_TILE, LORA_CHUNK], [0, k0]),
                             target_type=pl.BF16,
                         )
-                        qr_tile = pl.assemble(qr_tile, qr_chunk_bf16, [0, k0])
-                        qr = pl.assemble(qr, qr_chunk_bf16, [b0, k0])
+                        qr_chunk_fp32 = pl.cast(qr_chunk_bf16, target_type=pl.FP32)
+                        q_gamma = pl.slice(q_norm_weight, [1, LORA_CHUNK], [0, k0])
+                        q_normed = pl.col_expand_mul(pl.row_expand_mul(qr_chunk_fp32, q_inv_rms), q_gamma)
+                        q_normed_bf16 = pl.cast(q_normed, target_type=pl.BF16)
+                        qr_out = pl.assemble(qr_out, q_normed_bf16, [b0, k0])
 
                 # Stage 4: Q head projection. Keep the original per-K-block
                 # accumulation form; materializing the full FP32 q_proj
@@ -182,22 +196,17 @@ def build_deepseek_v3_2_decode_front_scope1_program(
                         q_out_acc = pl.full([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
                         for kb in pl.range(QR_BLOCKS):
                             k0 = kb * LORA_CHUNK
-                            q_chunk = pl.cast(
-                                pl.slice(qr_tile, [BATCH_TILE, LORA_CHUNK], [0, k0]),
-                                target_type=pl.FP32,
-                            )
-                            q_gamma = pl.slice(q_norm_weight, [1, LORA_CHUNK], [0, k0])
-                            qn = pl.col_expand_mul(q_chunk, q_gamma)
+                            q_chunk = pl.slice(qr_out, [BATCH_TILE, LORA_CHUNK], [b0, k0])
                             wq_b_chunk = pl.slice(wq_b, [LORA_CHUNK, Q_OUT_CHUNK], [k0, q0])
                             q_out_acc = pl.add(
                                 q_out_acc,
-                                pl.matmul(pl.cast(qn, target_type=pl.BF16), wq_b_chunk),
+                                pl.matmul(q_chunk, wq_b_chunk),
                             )
-                        q_proj = pl.assemble(q_proj, pl.cast(q_out_acc, target_type=pl.BF16), [b0, q0])
+                        q_proj_out = pl.assemble(q_proj_out, pl.cast(q_out_acc, target_type=pl.BF16), [b0, q0])
 
                 # Stage 5: KV latent projection, accumulated in Cube Acc.
                 with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                    for ob in pl.parallel(0, KV_A_BLOCKS, 1, chunk=8):
+                    for ob in pl.parallel(0, KV_A_BLOCKS, 1, chunk=4):
                         kv0 = ob * KV_OUT_CHUNK
                         kv_tile_a = pl.slice(normed_tile, [BATCH_TILE, PROJ_K], [0, 0])
                         kv_tile_b = pl.slice(wkv_a, [PROJ_K, KV_OUT_CHUNK], [0, kv0])
@@ -217,11 +226,8 @@ def build_deepseek_v3_2_decode_front_scope1_program(
                             pl.slice(kv_a_fp32_tile, [BATCH_TILE, KV_OUT_CHUNK], [0, kv0]),
                             target_type=pl.BF16,
                         )
-                        kv_a = pl.assemble(kv_a, kv_chunk, [b0, kv0])
+                        kv_a_out = pl.assemble(kv_a_out, kv_chunk, [b0, kv0])
 
-            qr_out = pl.assemble(qr_out, qr, [0, 0])
-            q_proj_out = pl.assemble(q_proj_out, q_proj, [0, 0])
-            kv_a_out = pl.assemble(kv_a_out, kv_a, [0, 0])
             return q_proj_out
 
     return DeepSeekV32DecodeFrontScope1
@@ -242,12 +248,14 @@ def golden_decode_front_scope1(tensors):
     inv_rms = torch.rsqrt(sq_sum * HIDDEN_INV + EPS)
     normed = (hidden_states * inv_rms * input_rms_weight).to(torch.bfloat16).float()
 
-    # Q latent projection
-    qr = (normed @ wq_a).to(torch.bfloat16)
+    # Q latent projection + q_norm, matching ds32.py MLA.forward.
+    qr_raw = (normed @ wq_a).to(torch.bfloat16)
+    qr_raw_fp32 = qr_raw.float()
+    q_var = torch.mean(qr_raw_fp32 * qr_raw_fp32, dim=1, keepdim=True)
+    qr = (qr_raw_fp32 * torch.rsqrt(q_var + EPS) * q_norm_weight).to(torch.bfloat16)
 
     # Q head projection
-    qn = (qr.float() * q_norm_weight).to(torch.bfloat16).float()
-    q_proj = (qn @ wq_b).to(torch.bfloat16)
+    q_proj = (qr.float() @ wq_b).to(torch.bfloat16)
 
     # KV latent projection
     kv_a = (normed @ wkv_a).to(torch.bfloat16)
