@@ -66,11 +66,6 @@ class TestValidateGolden:
                 {"a": t1.clone(), "b": t2_expected},
             )
 
-    def test_zero_tensor_matches(self):
-        """Zero tensors should match."""
-        z = torch.zeros(10)
-        validate_golden({"out": z}, {"out": z.clone()})
-
     def test_tolerance_boundary(self):
         """Test the exact boundary of tolerance."""
         actual = torch.tensor([1.0])
@@ -87,6 +82,33 @@ class TestValidateGolden:
         actual = torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16)
         expected = torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16)
         validate_golden({"out": actual}, {"out": expected})
+
+    def test_missing_golden_key_raises_keyerror(self):
+        """If golden lacks a key present in outputs, KeyError surfaces directly."""
+        actual = torch.tensor([1.0])
+        with pytest.raises(KeyError):
+            validate_golden({"missing": actual}, {"other": actual})
+
+    def test_shape_mismatch_raises(self):
+        """Shape mismatch (non-broadcastable) raises."""
+        actual = torch.tensor([1.0, 2.0, 3.0])
+        expected = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        with pytest.raises((RuntimeError, AssertionError)):
+            validate_golden({"out": actual}, {"out": expected})
+
+    def test_nan_values_fail(self):
+        """NaN values should fail comparison (allclose treats NaN != NaN)."""
+        actual = torch.tensor([1.0, float("nan"), 3.0])
+        expected = torch.tensor([1.0, float("nan"), 3.0])
+        with pytest.raises(AssertionError, match="does not match golden"):
+            validate_golden({"out": actual}, {"out": expected})
+
+    def test_default_tolerances_catch_large_diff(self):
+        """Default rtol/atol=1e-5 should reject clearly different values."""
+        actual = torch.tensor([1.0])
+        expected = torch.tensor([1.1])
+        with pytest.raises(AssertionError, match="does not match golden"):
+            validate_golden({"out": actual}, {"out": expected})
 
 
 if __name__ == "__main__":

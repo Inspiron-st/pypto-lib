@@ -18,8 +18,8 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from golden import TensorSpec, run
-from golden.runner import _save_tensors
+from golden import RunConfig, TensorSpec, run
+from golden.runner import RunResult, _backend_for_platform, _save_tensors
 
 
 class _FakeCompiled:
@@ -236,6 +236,200 @@ class TestGoldenDataCacheMiss:
         assert "golden_data is missing files" in (r.error or "")
         assert str(partial / "in" / "x.pt") in r.error
         assert str(partial / "in" / "state.pt") in r.error
+
+
+class TestGoldenFnPath:
+    """No ``golden_data`` — the classic path that generates inputs, calls
+    ``golden_fn``, and persists ``data/in/`` + ``data/out/`` under the
+    compiled output directory."""
+
+    def test_golden_fn_called_and_matches(self, three_kinds_specs, tmp_path):
+        """``golden_fn`` runs, writes expected outputs, and validation passes."""
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+
+        # golden_fn is called with a {name: tensor} dict — mutate y/state in place.
+        def golden_fn(tensors):
+            tensors["y"][:] = tensors["x"] + 1
+            tensors["state"][:] = tensors["state"] + 100
+
+        # execute_compiled must write the same values to the actual tensors.
+        def fake_execute(work_dir, tensors, **_kwargs):
+            # tensors positional: [x, y, state]; state was zero-initialized by
+            # spec (init_value=torch.zeros), x was random.
+            tensors[1][:] = tensors[0] + 1
+            tensors[2][:] = tensors[2] + 100
+
+        fake = _FakeCompiled(compiled_dir)
+        with patch("pypto.ir.compile", return_value=fake), \
+             patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
+            r = run(
+                program=object(),
+                tensor_specs=three_kinds_specs,
+                golden_fn=golden_fn,
+            )
+
+        assert r.passed, f"unexpected failure: {r.error}"
+        # Persistence: data/in/ and data/out/ written under compiled.output_dir.
+        assert (compiled_dir / "data" / "in" / "x.pt").is_file()
+        assert (compiled_dir / "data" / "in" / "state.pt").is_file()
+        assert (compiled_dir / "data" / "out" / "y.pt").is_file()
+        assert (compiled_dir / "data" / "out" / "state.pt").is_file()
+
+    def test_golden_fn_sees_cloned_inputs_not_live_tensors(
+        self, three_kinds_specs, tmp_path,
+    ):
+        """``golden_fn`` receives a *clone* of inputs, not the live tensors
+        handed to ``execute_compiled`` — so device writes don't corrupt the
+        golden computation."""
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+
+        captured = {}
+
+        def golden_fn(tensors):
+            captured["x_ptr"] = tensors["x"].data_ptr()
+            tensors["y"][:] = tensors["x"] + 1
+            tensors["state"][:] = tensors["state"] + 100
+
+        device_x_ptrs = {}
+
+        def fake_execute(work_dir, tensors, **_kwargs):
+            device_x_ptrs["x"] = tensors[0].data_ptr()
+            tensors[1][:] = tensors[0] + 1
+            tensors[2][:] = tensors[2] + 100
+
+        fake = _FakeCompiled(compiled_dir)
+        with patch("pypto.ir.compile", return_value=fake), \
+             patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
+            r = run(
+                program=object(),
+                tensor_specs=three_kinds_specs,
+                golden_fn=golden_fn,
+            )
+
+        assert r.passed
+        # The golden_fn copy must not share storage with the device tensor.
+        assert captured["x_ptr"] != device_x_ptrs["x"]
+
+    def test_golden_fn_mismatch_fails(self, three_kinds_specs, tmp_path):
+        """Device output diverges from golden_fn output → FAIL."""
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+
+        def golden_fn(tensors):
+            tensors["y"][:] = tensors["x"] + 1
+            tensors["state"][:] = tensors["state"] + 100
+
+        def bad_execute(work_dir, tensors, **_kwargs):
+            tensors[1][:] = tensors[0] - 99  # wrong
+            tensors[2][:] = tensors[2] + 100
+
+        fake = _FakeCompiled(compiled_dir)
+        with patch("pypto.ir.compile", return_value=fake), \
+             patch("pypto.runtime.execute_compiled", side_effect=bad_execute):
+            r = run(
+                program=object(),
+                tensor_specs=three_kinds_specs,
+                golden_fn=golden_fn,
+            )
+
+        assert not r.passed
+        assert "does not match golden" in (r.error or "")
+
+
+class TestNoValidation:
+    """Neither ``golden_fn`` nor ``golden_data`` — validation is skipped."""
+
+    def test_skip_validation_passes_even_on_nonsense_outputs(
+        self, three_kinds_specs, tmp_path,
+    ):
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+
+        def fake_execute(work_dir, tensors, **_kwargs):
+            tensors[1][:] = torch.full_like(tensors[1], 9999.0)
+
+        fake = _FakeCompiled(compiled_dir)
+        with patch("pypto.ir.compile", return_value=fake), \
+             patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
+            r = run(
+                program=object(),
+                tensor_specs=three_kinds_specs,
+                golden_fn=None,
+                golden_data=None,
+            )
+
+        assert r.passed
+        # Inputs are still persisted (classic path), outputs are NOT computed/saved.
+        assert (compiled_dir / "data" / "in" / "x.pt").is_file()
+        assert not (compiled_dir / "data" / "out").exists()
+
+
+class TestCompileOnly:
+    """``RunConfig.compile_only`` short-circuits after compile."""
+
+    def test_compile_only_skips_runtime_and_validation(
+        self, three_kinds_specs, tmp_path,
+    ):
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        fake = _FakeCompiled(compiled_dir)
+
+        def exec_must_not_run(*_args, **_kwargs):
+            pytest.fail("execute_compiled must not run when compile_only=True")
+
+        def golden_fn_must_not_run(_tensors):
+            pytest.fail("golden_fn must not run when compile_only=True")
+
+        with patch("pypto.ir.compile", return_value=fake), \
+             patch("pypto.runtime.execute_compiled", side_effect=exec_must_not_run):
+            r = run(
+                program=object(),
+                tensor_specs=three_kinds_specs,
+                config=RunConfig(compile_only=True),
+                golden_fn=golden_fn_must_not_run,
+            )
+
+        assert r.passed
+        assert r.error is None
+        # compile_only path must not persist anything under data/.
+        assert not (compiled_dir / "data").exists()
+
+
+class TestBackendForPlatform:
+    """``_backend_for_platform`` maps platform strings to BackendType values."""
+
+    @pytest.mark.parametrize(
+        "platform, expected_name",
+        [
+            ("a2a3", "Ascend910B"),
+            ("a2a3sim", "Ascend910B"),
+            ("a5", "Ascend950"),
+            ("a5sim", "Ascend950"),
+        ],
+    )
+    def test_known_platforms(self, platform, expected_name):
+        backend = _backend_for_platform(platform)
+        assert backend.name == expected_name
+
+    def test_unknown_platform_raises_valueerror(self):
+        with pytest.raises(ValueError, match="Unknown runtime platform"):
+            _backend_for_platform("notaplatform")
+
+
+class TestRunResultStr:
+    """``RunResult.__str__`` formatting — quick regression pins."""
+
+    def test_pass_with_time(self):
+        assert str(RunResult(passed=True, execution_time=1.234)) == "PASS (1.23s)"
+
+    def test_fail_with_error_and_time(self):
+        s = str(RunResult(passed=False, error="boom", execution_time=0.5))
+        assert s == "FAIL: boom (0.50s)"
+
+    def test_fail_without_error(self):
+        assert str(RunResult(passed=False)) == "FAIL"
 
 
 if __name__ == "__main__":
