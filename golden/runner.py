@@ -124,10 +124,12 @@ def run(
     # Compile
     compile_kwargs = dict(config.compile)
     platform = config.runtime.get("platform")
-    if platform is not None and "backend_type" not in compile_kwargs:
-        compile_kwargs["backend_type"] = (
-            BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B
-        )
+    if platform is not None:
+        compile_kwargs.setdefault("platform", platform)
+        if "backend_type" not in compile_kwargs:
+            compile_kwargs["backend_type"] = (
+                BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B
+            )
     compiled = ir.compile(program, **compile_kwargs)
 
     if config.compile_only:
