@@ -74,31 +74,26 @@ def build_deepseek_v3_2_decode_back_program(
             w_down: pl.Tensor[[INTER_SIZE, HIDDEN_SIZE], pl.BF16],
             out: pl.Tensor[[BATCH_SIZE, HIDDEN_SIZE], pl.BF16],
         ) -> pl.Tensor[[BATCH_SIZE, HIDDEN_SIZE], pl.BF16]:
-            # Read combine results from this node view.
-            node_id = pl.tensor.read(node_id_t, [0])
-            combined = pl.create_tensor([BATCH_SIZE, ATTN_OUT_SIZE], dtype=pl.BF16)
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                for b in pl.parallel(0, BATCH_SIZE, 1, chunk=4):
-                    row_3d = pl.slice(
-                        combine_buf, [1, 1, ATTN_OUT_SIZE], [pl.cast(node_id, pl.INDEX), b, 0]
-                    )
-                    row = pl.reshape(row_3d, [1, ATTN_OUT_SIZE])
-                    combined = pl.assemble(combined, row, [b, 0])
-
             # Scope: output projection + residual + post-rms + MLP + residual.
+            node_id = pl.cast(pl.tensor.read(node_id_t, [0]), pl.INDEX)
             for b0 in pl.range(0, BATCH_SIZE, BATCH_TILE):
                 resid1_tile = pl.create_tensor([BATCH_TILE, HIDDEN_SIZE], dtype=pl.FP32)
+                # Read combine results from this node view.
+                combined_3d = pl.slice(
+                    combine_buf, [1, BATCH_TILE, ATTN_OUT_SIZE], [node_id, b0, 0]
+                )
+                combined = pl.reshape(combined_3d, [BATCH_TILE, ATTN_OUT_SIZE])
 
                 # O projection and residual.
                 for ob in pl.range(Q_OUT_BLOCKS):
                     o0 = ob * Q_OUT_CHUNK
                     with pl.at(level=pl.Level.CORE_GROUP):
-                        a_chunk_0 = pl.slice(combined, [BATCH_TILE, K_CHUNK], [b0, 0])
+                        a_chunk_0 = pl.slice(combined, [BATCH_TILE, K_CHUNK], [0, 0])
                         w_chunk_0 = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [0, o0])
                         o_acc = pl.matmul(a_chunk_0, w_chunk_0, out_dtype=pl.FP32)
                         for kb in pl.range(1, ATTN_BLOCKS):
                             k0 = kb * K_CHUNK
-                            a_chunk = pl.slice(combined, [BATCH_TILE, K_CHUNK], [b0, k0])
+                            a_chunk = pl.slice(combined, [BATCH_TILE, K_CHUNK], [0, k0])
                             w_chunk = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [k0, o0])
                             o_acc = pl.matmul_acc(o_acc, a_chunk, w_chunk)
 
