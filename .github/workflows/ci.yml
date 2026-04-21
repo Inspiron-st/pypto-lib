@@ -60,10 +60,10 @@ jobs:
         platform: [a2a3sim, a5sim]
     env:
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
-      PTOAS_VERSION: v0.25
-      PTOAS_SHA256: 9027409aebbdd9ca416e82197c84210fa8f7f61e666c748dc376abd55f94cc70
+      PTOAS_VERSION: v0.27
+      PTOAS_SHA256: 80cc39095abbf40af7f670a4b93a4aba2749a081df9f9b57e496d0123ba9bd2a
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
-      PTO_ISA_COMMIT: ed0b4643
+      PTO_ISA_COMMIT: 6eecebc5
 
     steps:
       - name: Checkout pypto-lib
@@ -155,10 +155,10 @@ jobs:
     env:
       ASCEND_HOME_PATH: /usr/local/Ascend/cann-8.5.0
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
-      PTOAS_VERSION: v0.25
-      PTOAS_SHA256: 66dee5d9ebbd713db7934570bb95eb7870895a49905c248ca95da9289cd4a1aa
+      PTOAS_VERSION: v0.27
+      PTOAS_SHA256: 278db325be4503e4ab8afb7c131fecb018d7ce168192723471333d429979d401
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
-      PTO_ISA_COMMIT: ed0b4643
+      PTO_ISA_COMMIT: 6eecebc5
     container:
       image: localhost:5000/ci-device-py310:latest
       options: >-
