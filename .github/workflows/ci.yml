@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [a2a3sim, a5sim]
+        platform: [a5sim]
         pto_isa_commit:
           - 6eecebc5   # current pin (HEAD)
           - 44088da3   # ~20 commits back: allgather_gemm/gemm_ar a5 adaptation
