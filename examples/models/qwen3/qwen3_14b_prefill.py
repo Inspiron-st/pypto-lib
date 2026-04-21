@@ -193,12 +193,12 @@ def build_prefill_scope123_program(
 
                         # Stage 2.1: K RoPE + cache update + V cache + Q RoPE + pad.
                         all_q_padded = pl.create_tensor([total_q_groups * Q_HEAD_PAD, head_dim], dtype=pl.BF16)
-                        with pl.at(level=pl.Level.CORE_GROUP):
-                            for gi in pl.range(total_q_groups):
+                        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                            for gi in pl.parallel(0, total_q_groups, chunk=total_q_groups):
                                 all_q_padded = pl.assemble(
                                     all_q_padded,
-                                    pl.cast(pl.full([Q_HEAD_PAD, head_dim], dtype=pl.FP32, value=0.0), target_type=pl.BF16),
-                                    [gi * Q_HEAD_PAD, 0],
+                                    pl.cast(pl.full([Q_HEAD_PAD - Q_HEAD_BATCH, head_dim], dtype=pl.FP32, value=0.0), target_type=pl.BF16),
+                                    [gi * Q_HEAD_PAD + Q_HEAD_BATCH, 0],
                                 )
                         with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                             for ki in pl.parallel(0, num_kv_heads, chunk=8):
@@ -269,8 +269,8 @@ def build_prefill_scope123_program(
                             all_raw_scores = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, SEQ_TILE], dtype=pl.FP32)
                             all_exp_padded = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, SEQ_TILE], dtype=pl.BF16)
                             all_oi_tmp = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, head_dim], dtype=pl.FP32)
-                            all_cur_mi = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, 1], dtype=pl.FP32)
-                            all_cur_li = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, 1], dtype=pl.FP32)
+                            all_cur_mi = pl.create_tensor([max_ctx_blocks * Q_HEAD_BATCH, 1], dtype=pl.FP32)
+                            all_cur_li = pl.create_tensor([max_ctx_blocks * Q_HEAD_BATCH, 1], dtype=pl.FP32)
 
                             # Stage 2.2: QK matmul for all active sb blocks.
                             with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
@@ -287,7 +287,7 @@ def build_prefill_scope123_program(
                                     s0 = sb * SEQ_TILE
                                     valid_len = pl.min(SEQ_TILE, ctx_len - s0)
                                     scores_valid = pl.slice(
-                                        all_raw_scores, [Q_HEAD_PAD, SEQ_TILE],
+                                        all_raw_scores, [Q_HEAD_BATCH, SEQ_TILE],
                                         [sb * Q_HEAD_PAD, 0],
                                         valid_shape=[Q_HEAD_BATCH, valid_len],
                                     )
@@ -298,8 +298,8 @@ def build_prefill_scope123_program(
                                     exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
                                     cur_li = pl.row_sum(pl.cast(exp_scores_bf16, target_type=pl.FP32))
                                     all_exp_padded = pl.assemble(all_exp_padded, exp_scores_bf16, [sb * Q_HEAD_PAD, 0])
-                                    all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [sb * Q_HEAD_PAD, 0])
-                                    all_cur_li = pl.assemble(all_cur_li, cur_li, [sb * Q_HEAD_PAD, 0])
+                                    all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [sb * Q_HEAD_BATCH, 0])
+                                    all_cur_li = pl.assemble(all_cur_li, cur_li, [sb * Q_HEAD_BATCH, 0])
 
                             # Stage 2.4: SV matmul for all active sb blocks.
                             with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
@@ -313,28 +313,41 @@ def build_prefill_scope123_program(
 
                             # Stage 2.5: online softmax accumulation.
                             with pl.at(level=pl.Level.CORE_GROUP):
-                                oi = pl.slice(all_oi_tmp, [Q_HEAD_BATCH, head_dim], [0, 0])
-                                mi = pl.slice(all_cur_mi, [Q_HEAD_BATCH, 1], [0, 0])
-                                li = pl.slice(all_cur_li, [Q_HEAD_BATCH, 1], [0, 0])
-                                for sb in pl.range(1, ctx_blocks):
-                                    oi_sb = pl.slice(all_oi_tmp, [Q_HEAD_BATCH, head_dim], [sb * Q_HEAD_PAD, 0])
-                                    mi_sb = pl.slice(all_cur_mi, [Q_HEAD_BATCH, 1], [sb * Q_HEAD_PAD, 0])
-                                    li_sb = pl.slice(all_cur_li, [Q_HEAD_BATCH, 1], [sb * Q_HEAD_PAD, 0])
-                                    mi_new = pl.maximum(mi, mi_sb)
-                                    alpha = pl.exp(pl.sub(mi, mi_new))
-                                    beta = pl.exp(pl.sub(mi_sb, mi_new))
-                                    li = pl.add(pl.mul(alpha, li), pl.mul(beta, li_sb))
-                                    oi = pl.add(pl.row_expand_mul(oi, alpha),
-                                                pl.row_expand_mul(oi_sb, beta))
-                                    mi = mi_new
+                                oi = pl.full([Q_HEAD_BATCH, head_dim], dtype=pl.FP32, value=0.0)
+                                li_flat = pl.full([1, Q_HEAD_BATCH], dtype=pl.FP32, value=0.0)
+                                li = pl.reshape(li_flat, [Q_HEAD_BATCH, 1])
+                                mi_flat = pl.full([1, Q_HEAD_BATCH], dtype=pl.FP32, value=0.0)
+                                mi = pl.reshape(mi_flat, [Q_HEAD_BATCH, 1])
 
-                            # Finalize ctx = oi / li and extract valid Q_HEAD_BATCH rows.
+                            for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
+                                with pl.at(level=pl.Level.CORE_GROUP):
+                                    for si in pl.range(SB_BATCH):
+                                        sb = sb0 + si
+                                        if sb < ctx_blocks:
+                                            oi_sb = pl.slice(all_oi_tmp, [Q_HEAD_BATCH, head_dim], [sb * Q_HEAD_PAD, 0])
+                                            mi_sb = pl.slice(all_cur_mi, [Q_HEAD_BATCH, 1], [sb * Q_HEAD_BATCH, 0])
+                                            li_sb = pl.slice(all_cur_li, [Q_HEAD_BATCH, 1], [sb * Q_HEAD_BATCH, 0])
+                                            if sb == 0:
+                                                oi = oi_sb
+                                                li = li_sb
+                                                mi = mi_sb
+                                            else:
+                                                mi_new = pl.maximum(mi, mi_sb)
+                                                alpha = pl.exp(pl.sub(mi, mi_new))
+                                                beta = pl.exp(pl.sub(mi_sb, mi_new))
+                                                li = pl.add(pl.mul(alpha, li), pl.mul(beta, li_sb))
+                                                oi = pl.add(pl.row_expand_mul(oi, alpha),
+                                                            pl.row_expand_mul(oi_sb, beta))
+                                                mi = mi_new
+
+                            # Finalize ctx = oi / li and write back with single assemble.
                             with pl.at(level=pl.Level.CORE_GROUP):
                                 ctx = pl.row_expand_div(oi, li)
-                                for qi in pl.range(Q_HEAD_BATCH):
-                                    q_col = (q_base + qi) * head_dim
-                                    row_bf16 = pl.cast(pl.slice(ctx, [1, head_dim], [qi, 0]), target_type=pl.BF16)
-                                    attn_row = pl.assemble(attn_row, row_bf16, [0, q_col])
+                                ctx_flat = pl.reshape(ctx, [1, Q_HEAD_BATCH * head_dim])
+                                ctx_flat_bf16 = pl.cast(ctx_flat, target_type=pl.BF16)
+                                attn_row = pl.assemble(
+                                    attn_row, ctx_flat_bf16, [0, q_base * head_dim],
+                                )
 
                         # Keep the attention row in the local tile.
                         attn_tile = pl.assemble(attn_tile, attn_row, [ti, 0])
@@ -422,36 +435,32 @@ def build_prefill_scope123_program(
                                 up_acc = pl.matmul_acc(up_acc, pci, wui)
 
                         # SiLU activation: silu(gate) * up -> BF16.
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                             sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
                             mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
                             mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
                             mlp_silu_tile = pl.assemble(mlp_silu_tile, mlp_chunk_bf16, [0, o0])
 
-                    # Stage 3.3b: Down projection (matmul_acc chain over intermediate dim).
-                    down_fp32_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.FP32)
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                        for dob in pl.parallel(hidden_blocks, chunk=4):
-                            d0 = dob * K_CHUNK
-                            dn_a = pl.slice(mlp_silu_tile, [TOK_TILE, MLP_OUT_CHUNK], [0, 0])
-                            dn_w = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [0, d0])
-                            down_acc = pl.matmul(dn_a, dn_w, out_dtype=pl.FP32)
+                    # Stage 3.3b: Down projection (matmul_acc chain) + final residual -> output.
+                    for dob in pl.range(hidden_blocks):
+                        d0 = dob * K_CHUNK
+                        with pl.at(level=pl.Level.CORE_GROUP):
+                            mlp_chunk_0 = pl.slice(mlp_silu_tile, [TOK_TILE, MLP_OUT_CHUNK], [0, 0])
+                            w_down_chunk_0 = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [0, d0])
+                            down_acc = pl.matmul(mlp_chunk_0, w_down_chunk_0, out_dtype=pl.FP32)
                             for ob in pl.range(1, mlp_out_blocks):
                                 o0 = ob * MLP_OUT_CHUNK
-                                dn_a_i = pl.slice(mlp_silu_tile, [TOK_TILE, MLP_OUT_CHUNK], [0, o0])
-                                dn_w_i = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [o0, d0])
-                                down_acc = pl.matmul_acc(down_acc, dn_a_i, dn_w_i)
-                            down_fp32_tile = pl.assemble(down_fp32_tile, down_acc, [0, d0])
+                                mlp_chunk_i = pl.slice(mlp_silu_tile, [TOK_TILE, MLP_OUT_CHUNK], [0, o0])
+                                w_down_chunk_i = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [o0, d0])
+                                down_acc = pl.matmul_acc(down_acc, mlp_chunk_i, w_down_chunk_i)
 
-                    # Stage 3.4: Final residual add -> BF16 output.
-                    for ob in pl.range(hidden_blocks):
-                        o0 = ob * K_CHUNK
                         with pl.at(level=pl.Level.CORE_GROUP):
-                            final_sum = pl.add(
-                                pl.slice(down_fp32_tile, [TOK_TILE, K_CHUNK], [0, o0]),
-                                pl.slice(resid1_tile, [TOK_TILE, K_CHUNK], [0, o0]),
+                            out_chunk = pl.add(
+                                down_acc,
+                                pl.slice(resid1_tile, [TOK_TILE, K_CHUNK], [0, d0]),
                             )
-                            out = pl.assemble(out, pl.cast(final_sum, target_type=pl.BF16), [b, p0, o0])
+                            out_chunk_bf16 = pl.cast(out_chunk, target_type=pl.BF16)
+                            out = pl.assemble(out, out_chunk_bf16, [b, p0, d0])
 
             return out
 
