@@ -6,7 +6,21 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Qwen3-14B decode Scope 2 — q/k norm + RoPE + KV cache update + decode attention.
+"""Qwen3-14B decode Scope 2 — q/k norm + RoPE + paged KV update + decode attention.
+
+Implements the PagedAttention contract described in ``pa_impl.md``:
+- ``block_table`` maps logical attention blocks to physical cache blocks.
+- ``slot_mapping`` identifies the write slot for the current decode token.
+
+Due to current backend scalar-load lowering, ``block_table`` is passed as a
+flattened 1D tensor of length ``batch * max_blocks_per_seq`` instead of a 2D
+``[batch, max_blocks_per_seq]`` view. The logical mapping is unchanged.
+
+The device path stores KV cache as a 2D tensor with logical row order
+``[physical_block, kv_head, token_in_block]`` flattened to
+``[num_blocks * num_kv_heads * BLOCK_SIZE, head_dim]``. That lets each paged
+K/V block for one KV head be read back as a single contiguous
+``[BLOCK_SIZE, head_dim]`` slice without extra staging buffers.
 
 Input projections are FP32; q_norm/k_norm weights are FP32; KV caches are BF16.
 Output attention is BF16.
@@ -31,6 +45,7 @@ Q_HEAD_PAD = 16
 SEQ_TILE = 64
 BATCH_TILE = 16
 SB_BATCH = 64
+BLOCK_SIZE = SEQ_TILE
 
 
 def build_qwen3_scope2_program(
@@ -43,12 +58,13 @@ def build_qwen3_scope2_program(
     hidden = num_heads * head_dim
     kv_hidden = num_kv_heads * head_dim
     q_per_kv = num_heads // num_kv_heads
-    cache_rows = batch * num_kv_heads * max_seq
     half_dim = head_dim // 2
     q_groups = q_per_kv // Q_HEAD_BATCH
     total_q_groups = num_kv_heads * q_groups
     attn_scale = 1.0 / (head_dim ** 0.5)
-    max_ctx_blocks = (max_seq + SEQ_TILE - 1) // SEQ_TILE
+    max_ctx_blocks = (max_seq + BLOCK_SIZE - 1) // BLOCK_SIZE
+    max_blocks_per_seq = max_ctx_blocks
+    num_blocks = batch * max_blocks_per_seq
 
     @pl.program
     class Qwen3Scope2:
@@ -61,10 +77,12 @@ def build_qwen3_scope2_program(
             q_norm_weight: pl.Tensor[[1, head_dim], pl.FP32],
             k_norm_weight: pl.Tensor[[1, head_dim], pl.FP32],
             seq_lens: pl.Tensor[[batch], pl.INT32],
+            block_table: pl.Tensor[[batch * max_blocks_per_seq], pl.INT32],
+            slot_mapping: pl.Tensor[[batch], pl.INT32],
             rope_cos: pl.Tensor[[max_seq, head_dim], pl.FP32],
             rope_sin: pl.Tensor[[max_seq, head_dim], pl.FP32],
-            k_cache: pl.Tensor[[cache_rows, head_dim], pl.BF16],
-            v_cache: pl.Tensor[[cache_rows, head_dim], pl.BF16],
+            k_cache: pl.Tensor[[num_blocks * num_kv_heads * BLOCK_SIZE, head_dim], pl.BF16],
+            v_cache: pl.Tensor[[num_blocks * num_kv_heads * BLOCK_SIZE, head_dim], pl.BF16],
             attn_out: pl.Out[pl.Tensor[[batch, hidden], pl.BF16]],
         ) -> pl.Tensor[[batch, hidden], pl.BF16]:
             q_proj_norm = pl.create_tensor([batch, hidden], dtype=pl.FP32)
@@ -109,7 +127,11 @@ def build_qwen3_scope2_program(
             for b in pl.range(batch):
                 ctx_len = pl.tensor.read(seq_lens, [b])
                 pos = ctx_len - 1
-                ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
+                ctx_blocks = (ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+                block_table_base = b * max_blocks_per_seq
+                slot = pl.tensor.read(slot_mapping, [b])
+                slot_block = slot // BLOCK_SIZE
+                slot_offset = slot - slot_block * BLOCK_SIZE
                 cos_row = pl.slice(rope_cos, [1, head_dim], [pos, 0])
                 sin_row = pl.slice(rope_sin, [1, head_dim], [pos, 0])
                 cos_lo = pl.slice(cos_row, [1, half_dim], [0, 0])
@@ -120,6 +142,7 @@ def build_qwen3_scope2_program(
                 with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                     for ki in pl.parallel(0, num_kv_heads, chunk=8):
                         kv_col = ki * head_dim
+                        cache_row = (slot_block * num_kv_heads + ki) * BLOCK_SIZE + slot_offset
                         k_lo = pl.slice(k_proj_norm, [1, half_dim], [b, kv_col])
                         k_hi = pl.slice(k_proj_norm, [1, half_dim], [b, kv_col + half_dim])
                         rot_lo = pl.sub(
@@ -130,9 +153,16 @@ def build_qwen3_scope2_program(
                             pl.col_expand_mul(k_hi, cos_hi),
                             pl.col_expand_mul(k_lo, sin_hi),
                         )
-                        cache_row = b * num_kv_heads * max_seq + ki * max_seq + pos
-                        k_cache = pl.assemble(k_cache, pl.cast(rot_lo, target_type=pl.BF16), [cache_row, 0])
-                        k_cache = pl.assemble(k_cache, pl.cast(rot_hi, target_type=pl.BF16), [cache_row, half_dim])
+                        k_cache = pl.assemble(
+                            k_cache,
+                            pl.cast(rot_lo, target_type=pl.BF16),
+                            [cache_row, 0],
+                        )
+                        k_cache = pl.assemble(
+                            k_cache,
+                            pl.cast(rot_hi, target_type=pl.BF16),
+                            [cache_row, half_dim],
+                        )
                         v_cache = pl.assemble(
                             v_cache,
                             pl.cast(pl.slice(v_proj, [1, head_dim], [b, kv_col]), target_type=pl.BF16),
@@ -182,28 +212,28 @@ def build_qwen3_scope2_program(
                         [Q_HEAD_PAD, head_dim],
                         [b * total_q_groups * Q_HEAD_PAD + gi * Q_HEAD_PAD, 0],
                     )
-
-                    all_raw_scores = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, SEQ_TILE], dtype=pl.FP32)
-                    all_exp_padded = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, SEQ_TILE], dtype=pl.BF16)
+                    all_raw_scores = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, BLOCK_SIZE], dtype=pl.FP32)
+                    all_exp_padded = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, BLOCK_SIZE], dtype=pl.BF16)
                     all_oi_tmp = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, head_dim], dtype=pl.FP32)
                     all_cur_mi = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, 1], dtype=pl.FP32)
                     all_cur_li = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, 1], dtype=pl.FP32)
 
                     with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                         for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
-                            s0 = sb * SEQ_TILE
-                            cache_row0 = b * num_kv_heads * max_seq + kvh * max_seq + s0
-                            k_tile = pl.slice(k_cache, [SEQ_TILE, head_dim], [cache_row0, 0])
+                            block_table_idx = block_table_base + sb
+                            pbid = pl.cast(pl.tensor.read(block_table, [block_table_idx]), pl.INDEX)
+                            cache_row0 = (pbid * num_kv_heads + kvh) * BLOCK_SIZE
+                            k_tile = pl.slice(k_cache, [BLOCK_SIZE, head_dim], [cache_row0, 0])
                             raw_scores = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
                             all_raw_scores = pl.assemble(all_raw_scores, raw_scores, [sb * Q_HEAD_PAD, 0])
 
                     with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                         for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
-                            s0 = sb * SEQ_TILE
-                            valid_len = pl.min(SEQ_TILE, ctx_len - s0)
+                            s0 = sb * BLOCK_SIZE
+                            valid_len = pl.min(BLOCK_SIZE, ctx_len - s0)
                             scores_valid = pl.slice(
                                 all_raw_scores,
-                                [Q_HEAD_PAD, SEQ_TILE],
+                                [Q_HEAD_PAD, BLOCK_SIZE],
                                 [sb * Q_HEAD_PAD, 0],
                                 valid_shape=[Q_HEAD_PAD, valid_len],
                             )
@@ -220,14 +250,15 @@ def build_qwen3_scope2_program(
 
                     with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                         for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
-                            s0 = sb * SEQ_TILE
-                            cache_row0 = b * num_kv_heads * max_seq + kvh * max_seq + s0
+                            block_table_idx = block_table_base + sb
+                            pbid = pl.cast(pl.tensor.read(block_table, [block_table_idx]), pl.INDEX)
+                            cache_row0 = (pbid * num_kv_heads + kvh) * BLOCK_SIZE
                             exp_tile = pl.slice(
                                 all_exp_padded,
-                                [Q_HEAD_PAD, SEQ_TILE],
+                                [Q_HEAD_PAD, BLOCK_SIZE],
                                 [sb * Q_HEAD_PAD, 0],
                             )
-                            v_tile = pl.slice(v_cache, [SEQ_TILE, head_dim], [cache_row0, 0])
+                            v_tile = pl.slice(v_cache, [BLOCK_SIZE, head_dim], [cache_row0, 0])
                             oi_tmp = pl.matmul(exp_tile, v_tile, out_dtype=pl.FP32)
                             all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [sb * Q_HEAD_PAD, 0])
 
@@ -289,12 +320,18 @@ def build_tensor_specs(
 
     hidden = num_heads * head_dim
     kv_hidden = num_kv_heads * head_dim
-    cache_rows = batch * num_kv_heads * max_seq
+    max_ctx_blocks = (max_seq + BLOCK_SIZE - 1) // BLOCK_SIZE
+    max_blocks_per_seq = max_ctx_blocks
+    num_blocks = batch * max_blocks_per_seq
+    cache_rows = num_blocks * num_kv_heads * BLOCK_SIZE
+
+    if use_max_seq:
+        seq_lens_seed = torch.full((batch,), max_seq, dtype=torch.int32)
+    else:
+        seq_lens_seed = torch.randint(1, max_seq + 1, (batch,), dtype=torch.int32)
 
     def init_seq_lens():
-        if use_max_seq:
-            return torch.full((batch,), max_seq, dtype=torch.int32)
-        return torch.randint(1, max_seq + 1, (batch,), dtype=torch.int32)
+        return seq_lens_seed.clone()
 
     def init_q_proj():
         return torch.rand(batch, hidden) - 0.5
@@ -310,6 +347,20 @@ def build_tensor_specs(
 
     def init_k_norm_weight():
         return torch.ones(1, head_dim)
+
+    def init_block_table():
+        block_ids = torch.arange(num_blocks, dtype=torch.int32)
+        return block_ids.clone()
+
+    def init_slot_mapping():
+        slots = torch.empty(batch, dtype=torch.int32)
+        for b in range(batch):
+            pos = int(seq_lens_seed[b].item()) - 1
+            logical_block = pos // BLOCK_SIZE
+            page_offset = pos % BLOCK_SIZE
+            phys_block = b * max_blocks_per_seq + logical_block
+            slots[b] = phys_block * BLOCK_SIZE + page_offset
+        return slots
 
     def init_rope_cos():
         return torch.rand(max_seq, head_dim) - 0.5
@@ -330,6 +381,8 @@ def build_tensor_specs(
         TensorSpec("q_norm_weight", [1, head_dim], torch.float32, init_value=init_q_norm_weight),
         TensorSpec("k_norm_weight", [1, head_dim], torch.float32, init_value=init_k_norm_weight),
         TensorSpec("seq_lens", [batch], torch.int32, init_value=init_seq_lens),
+        TensorSpec("block_table", [batch * max_blocks_per_seq], torch.int32, init_value=init_block_table),
+        TensorSpec("slot_mapping", [batch], torch.int32, init_value=init_slot_mapping),
         TensorSpec("rope_cos", [max_seq, head_dim], torch.float32, init_value=init_rope_cos),
         TensorSpec("rope_sin", [max_seq, head_dim], torch.float32, init_value=init_rope_sin),
         TensorSpec("k_cache", [cache_rows, head_dim], torch.bfloat16, init_value=init_k_cache),
@@ -348,6 +401,8 @@ def golden_qwen3_scope2(tensors):
     q_norm_weight = tensors["q_norm_weight"]
     k_norm_weight = tensors["k_norm_weight"]
     seq_lens = tensors["seq_lens"]
+    block_table = tensors["block_table"]
+    slot_mapping = tensors["slot_mapping"]
     rope_cos = tensors["rope_cos"]
     rope_sin = tensors["rope_sin"]
     k_cache = tensors["k_cache"].clone()
@@ -361,6 +416,7 @@ def golden_qwen3_scope2(tensors):
     num_kv_heads = kv_hidden // head_dim
     num_heads = hidden // head_dim
     q_per_kv = num_heads // num_kv_heads
+    max_ctx_blocks = (max_seq + BLOCK_SIZE - 1) // BLOCK_SIZE
     half = head_dim // 2
     scale = 1.0 / math.sqrt(head_dim)
     eps = 1e-6
@@ -378,7 +434,7 @@ def golden_qwen3_scope2(tensors):
     for b in range(batch):
         ctx_len = seq_lens[b].item()
         pos = ctx_len - 1
-        ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
+        ctx_blocks = (ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
 
         cos_row = rope_cos[pos : pos + 1, :]
         sin_row = rope_sin[pos : pos + 1, :]
@@ -391,10 +447,13 @@ def golden_qwen3_scope2(tensors):
             [k_lo_h * cos_lo - k_hi_h * sin_lo, k_hi_h * cos_hi + k_lo_h * sin_hi],
             dim=-1,
         )
+        slot = int(slot_mapping[b].item())
+        slot_block = slot // BLOCK_SIZE
+        slot_offset = slot % BLOCK_SIZE
         for ki in range(num_kv_heads):
-            cr = b * num_kv_heads * max_seq + ki * max_seq + pos
-            k_cache[cr, :] = k_rot[ki].to(torch.bfloat16)
-            v_cache[cr, :] = v_proj[b, ki * head_dim : (ki + 1) * head_dim].to(torch.bfloat16)
+            cache_row = (slot_block * num_kv_heads + ki) * BLOCK_SIZE + slot_offset
+            k_cache[cache_row, :] = k_rot[ki].to(torch.bfloat16)
+            v_cache[cache_row, :] = v_proj[b, ki * head_dim : (ki + 1) * head_dim].to(torch.bfloat16)
 
         q_heads = q_heads_all[b]
         q_lo_h, q_hi_h = q_heads[:, :half], q_heads[:, half:]
@@ -415,14 +474,15 @@ def golden_qwen3_scope2(tensors):
                 mi = torch.zeros(Q_HEAD_BATCH, 1, dtype=torch.float32)
 
                 for sb in range(ctx_blocks):
-                    s0 = sb * SEQ_TILE
-                    valid_len = min(SEQ_TILE, ctx_len - s0)
-                    cb = b * num_kv_heads * max_seq + kvh * max_seq + s0
-                    k_tile = k_cache[cb : cb + SEQ_TILE, :]
-                    v_tile = v_cache[cb : cb + SEQ_TILE, :]
+                    s0 = sb * BLOCK_SIZE
+                    valid_len = min(BLOCK_SIZE, ctx_len - s0)
+                    pbid = int(block_table[b * max_ctx_blocks + sb].item())
+                    cache_row0 = (pbid * num_kv_heads + kvh) * BLOCK_SIZE
+                    k_tile = k_cache[cache_row0 : cache_row0 + BLOCK_SIZE, :]
+                    v_tile = v_cache[cache_row0 : cache_row0 + BLOCK_SIZE, :]
 
                     raw_scores = q_grp_bf16.float() @ k_tile.float().T
-                    if valid_len < SEQ_TILE:
+                    if valid_len < BLOCK_SIZE:
                         raw_scores[:, valid_len:] = torch.finfo(torch.float32).min
                     scores = raw_scores * scale
                     cur_mi = scores.max(dim=-1, keepdim=True).values
