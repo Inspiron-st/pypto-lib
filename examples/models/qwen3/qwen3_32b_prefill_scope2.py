@@ -81,12 +81,12 @@ def build_prefill_scope2_program(
 
                         # Stage 1: K RoPE + cache update + V cache + Q RoPE + pad.
                         all_q_padded = pl.create_tensor([total_q_groups * Q_HEAD_PAD, head_dim], dtype=pl.BF16)
-                        with pl.at(level=pl.Level.CORE_GROUP):
-                            for gi in pl.range(total_q_groups):
+                        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                            for gi in pl.parallel(0, total_q_groups, chunk=total_q_groups):
                                 all_q_padded = pl.assemble(
                                     all_q_padded,
-                                    pl.cast(pl.full([Q_HEAD_PAD, head_dim], dtype=pl.FP32, value=0.0), target_type=pl.BF16),
-                                    [gi * Q_HEAD_PAD, 0],
+                                    pl.cast(pl.full([Q_HEAD_PAD - Q_HEAD_BATCH, head_dim], dtype=pl.FP32, value=0.0), target_type=pl.BF16),
+                                    [gi * Q_HEAD_PAD + Q_HEAD_BATCH, 0],
                                 )
                         with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                             for ki in pl.parallel(0, num_kv_heads, chunk=8):
@@ -157,8 +157,8 @@ def build_prefill_scope2_program(
                             all_raw_scores = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, SEQ_TILE], dtype=pl.FP32)
                             all_exp_padded = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, SEQ_TILE], dtype=pl.BF16)
                             all_oi_tmp = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, head_dim], dtype=pl.FP32)
-                            all_cur_mi = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, 1], dtype=pl.FP32)
-                            all_cur_li = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, 1], dtype=pl.FP32)
+                            all_cur_mi = pl.create_tensor([max_ctx_blocks * Q_HEAD_BATCH, 1], dtype=pl.FP32)
+                            all_cur_li = pl.create_tensor([max_ctx_blocks * Q_HEAD_BATCH, 1], dtype=pl.FP32)
 
                             # Stage 2: QK matmul for all active sb blocks.
                             with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
@@ -175,7 +175,7 @@ def build_prefill_scope2_program(
                                     s0 = sb * SEQ_TILE
                                     valid_len = pl.min(SEQ_TILE, ctx_len - s0)
                                     scores_valid = pl.slice(
-                                        all_raw_scores, [Q_HEAD_PAD, SEQ_TILE],
+                                        all_raw_scores, [Q_HEAD_BATCH, SEQ_TILE],
                                         [sb * Q_HEAD_PAD, 0],
                                         valid_shape=[Q_HEAD_BATCH, valid_len],
                                     )
@@ -186,8 +186,8 @@ def build_prefill_scope2_program(
                                     exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
                                     cur_li = pl.row_sum(pl.cast(exp_scores_bf16, target_type=pl.FP32))
                                     all_exp_padded = pl.assemble(all_exp_padded, exp_scores_bf16, [sb * Q_HEAD_PAD, 0])
-                                    all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [sb * Q_HEAD_PAD, 0])
-                                    all_cur_li = pl.assemble(all_cur_li, cur_li, [sb * Q_HEAD_PAD, 0])
+                                    all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [sb * Q_HEAD_BATCH, 0])
+                                    all_cur_li = pl.assemble(all_cur_li, cur_li, [sb * Q_HEAD_BATCH, 0])
 
                             # Stage 4: SV matmul for all active sb blocks.
                             with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
@@ -201,11 +201,11 @@ def build_prefill_scope2_program(
 
                             # Stage 5a: initialize online-softmax accumulators.
                             with pl.at(level=pl.Level.CORE_GROUP):
-                                oi = pl.full([Q_HEAD_PAD, head_dim], dtype=pl.FP32, value=0.0)
-                                li_flat = pl.full([1, Q_HEAD_PAD], dtype=pl.FP32, value=0.0)
-                                li = pl.reshape(li_flat, [Q_HEAD_PAD, 1])
-                                mi_flat = pl.full([1, Q_HEAD_PAD], dtype=pl.FP32, value=0.0)
-                                mi = pl.reshape(mi_flat, [Q_HEAD_PAD, 1])
+                                oi = pl.full([Q_HEAD_BATCH, head_dim], dtype=pl.FP32, value=0.0)
+                                li_flat = pl.full([1, Q_HEAD_BATCH], dtype=pl.FP32, value=0.0)
+                                li = pl.reshape(li_flat, [Q_HEAD_BATCH, 1])
+                                mi_flat = pl.full([1, Q_HEAD_BATCH], dtype=pl.FP32, value=0.0)
+                                mi = pl.reshape(mi_flat, [Q_HEAD_BATCH, 1])
 
                             # Stage 5b: accumulate online softmax across active sb blocks.
                             for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
@@ -213,9 +213,9 @@ def build_prefill_scope2_program(
                                     for si in pl.range(SB_BATCH):
                                         sb = sb0 + si
                                         if sb < ctx_blocks:
-                                            oi_tmp_valid = pl.slice(all_oi_tmp, [Q_HEAD_PAD, head_dim], [sb * Q_HEAD_PAD, 0])
-                                            cur_mi = pl.slice(all_cur_mi, [Q_HEAD_PAD, 1], [sb * Q_HEAD_PAD, 0])
-                                            cur_li = pl.slice(all_cur_li, [Q_HEAD_PAD, 1], [sb * Q_HEAD_PAD, 0])
+                                            oi_tmp_valid = pl.slice(all_oi_tmp, [Q_HEAD_BATCH, head_dim], [sb * Q_HEAD_PAD, 0])
+                                            cur_mi = pl.slice(all_cur_mi, [Q_HEAD_BATCH, 1], [sb * Q_HEAD_BATCH, 0])
+                                            cur_li = pl.slice(all_cur_li, [Q_HEAD_BATCH, 1], [sb * Q_HEAD_BATCH, 0])
                                             if sb == 0:
                                                 oi = oi_tmp_valid
                                                 li = cur_li
@@ -229,16 +229,14 @@ def build_prefill_scope2_program(
                                                             pl.row_expand_mul(oi_tmp_valid, beta))
                                                 mi = mi_new
 
-                            # Finalize ctx = oi / li and extract valid Q_HEAD_BATCH rows.
-                            ctx_full_gm = pl.create_tensor([Q_HEAD_PAD, head_dim], dtype=pl.FP32)
+                            # Finalize ctx = oi / li and write back with single assemble.
                             with pl.at(level=pl.Level.CORE_GROUP):
-                                ctx_full_gm = pl.row_expand_div(oi, li)
-
-                            with pl.at(level=pl.Level.CORE_GROUP):
-                                for qi in pl.range(Q_HEAD_BATCH):
-                                    q_col = (q_base + qi) * head_dim
-                                    row_bf16 = pl.cast(pl.slice(ctx_full_gm, [1, head_dim], [qi, 0]), target_type=pl.BF16)
-                                    attn_row = pl.assemble(attn_row, row_bf16, [0, q_col])
+                                ctx = pl.row_expand_div(oi, li)
+                                ctx_flat = pl.reshape(ctx, [1, Q_HEAD_BATCH * head_dim])
+                                ctx_flat_bf16 = pl.cast(ctx_flat, target_type=pl.BF16)
+                                attn_row = pl.assemble(
+                                    attn_row, ctx_flat_bf16, [0, q_base * head_dim],
+                                )
 
                         # Write the attention row back to GM.
                         attn_out = pl.assemble(attn_out, attn_row, [b, pos, 0])
