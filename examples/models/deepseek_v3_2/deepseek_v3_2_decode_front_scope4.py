@@ -27,23 +27,16 @@ Current standalone differences versus ds32exp.py Scope 4:
 - the device path keeps duplicated 16-row intermediates through q-nope
     projection, online softmax state, and latent-to-V projection because that is
     the backend-safe lowering shape on a2a3, not because the model needs 16 rows
-- the q-nope-to-latent projection is chunked along the latent output dimension
-    via `Q_LATENT_CHUNK` so the full-profile cube Right/Mat buffers stay within
-    platform limits
-- the standalone validation harness still fills `topk_idx` with the dense
-    window `[0..sparse_k)` instead of the arbitrary device-side `topk_idx`
-    consumption that ds32exp Scope 4 intends
-    - Observation: read `topk_idx[b, 0]` and `topk_idx[b, kk]` directly.
-        - first element read is lowerable: the generated PTO contains a legal 
-            `pto.load_scalar %arg2[%arg6 * %c16_index + %c0_index]`.
-        - looped reads with the dynamic second index are not lowerable in this 
-            shape `compute_ctx_latent.pto` fails with `expected ']'`, the broken 
-            point appears when lowering the repeated topk_idx[b, kk] scalar load 
-            inside the helper loop.
-- the current `--profile full` preset keeps `batch=1` while restoring the large
-    inner dimensions from `batch=16`, this can accelerate the test while still 
+    - 1-row lowering is not allowed on a2a3; yet it's required on a5 (line 597 
+        and 601 in ds32exp.py).
+- the kernel now consumes `topk_idx` with a global 1-D internal view
+    (`topk_idx_flat = pl.reshape(topk_idx, [batch * index_topk])`) and linear
+    indexing (`topk_base + kk`) while keeping the input signature 2-D
+
+Note: The current `--profile full` preset keeps `max_seq_len=128` while restoring the large
+    inner dimensions from `max_seq_len=4096`, this can accelerate the test while still 
     validating the large-dimension logic (around < 10s), and it can be easily 
-    switched to `batch=16` if desired (time < 6min)
+    switched to `max_seq_len=4096` if desired (time < 6min)
 
 Kernel stage order in the rewritten reduced-profile path:
 - Stage 1: load per-head q_pe and project q_nope into the latent space
@@ -76,8 +69,8 @@ REDUCED_PROFILE = {
 }
 
 FULL_PROFILE = {
-    "batch": 1, #"batch": 16
-    "max_seq_len": 4096,
+    "batch": 16,
+    "max_seq_len": 128, #"max_seq_len": 4096
     "num_heads": 128,
     "kv_lora_rank": 512,
     "qk_nope_head_dim": 128,
@@ -128,6 +121,7 @@ def build_deepseek_v3_2_decode_front_scope4_program(
     v_head_dim_cfg = v_head_dim
     attn_out_cfg = num_heads * v_head_dim
     index_topk_cfg = index_topk
+    topk_flat_elems_cfg = batch_cfg * index_topk_cfg
     ep_nodes_cfg = ep_nodes
     cache_rows_cfg = batch * max_seq_len
     v_out_blocks = (v_head_dim_cfg + V_OUT_CHUNK - 1) // V_OUT_CHUNK
@@ -151,10 +145,12 @@ def build_deepseek_v3_2_decode_front_scope4_program(
             dispatch_buf: pl.Tensor[[ep_nodes_cfg, batch_cfg, attn_out_cfg], pl.BF16],
         ) -> pl.Tensor[[ep_nodes_cfg, batch_cfg, attn_out_cfg], pl.BF16]:
             attn_front = pl.create_tensor([batch_cfg, attn_out_cfg], dtype=pl.BF16)
+            topk_idx_flat = pl.reshape(topk_idx, [topk_flat_elems_cfg])
 
             for b in pl.parallel(0, batch_cfg, 1):
                 attn_row = pl.create_tensor([1, attn_out_cfg], dtype=pl.FP32)
                 sparse_k = pl.min(index_topk_cfg, pl.tensor.read(seq_lens, [b]))
+                topk_base = b * index_topk_cfg
 
                 for h in pl.parallel(0, num_heads_cfg, 1):
                     q_col = h * qk_head_dim_cfg
@@ -203,7 +199,8 @@ def build_deepseek_v3_2_decode_front_scope4_program(
                             q_nope_latent_batch = pl.assemble(q_nope_latent_batch, q_nope_latent_part, [0, q0])
 
                     with pl.at(level=pl.Level.CORE_GROUP):
-                        cache_s0 = b * max_seq_cfg
+                        topk_pos0 = pl.tensor.read(topk_idx_flat, [topk_base])
+                        cache_s0 = b * max_seq_cfg + topk_pos0
                         kv_s0 = pl.cast(
                             pl.slice(kv_cache, [1, kv_lora_rank_cfg], [cache_s0, 0]),
                             target_type=pl.FP32,
@@ -226,7 +223,8 @@ def build_deepseek_v3_2_decode_front_scope4_program(
                         li = pl.exp(pl.sub(mi, mi))
 
                         for kk in pl.range(1, sparse_k):
-                            cache_s = b * max_seq_cfg + kk
+                            topk_pos = pl.tensor.read(topk_idx_flat, [topk_base + kk])
+                            cache_s = b * max_seq_cfg + topk_pos
                             kv_s = pl.cast(
                                 pl.slice(kv_cache, [1, kv_lora_rank_cfg], [cache_s, 0]),
                                 target_type=pl.FP32,
@@ -305,7 +303,7 @@ def build_inputs(
 ):
     import torch
 
-    torch.manual_seed(42)
+    torch.manual_seed(4242)
 
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
     cache_rows = batch * max_seq_len
@@ -318,7 +316,8 @@ def build_inputs(
 
     topk_idx = torch.full((batch, index_topk), -1, dtype=torch.int32)
     for b in range(batch):
-        topk_idx[b, :sparse_k] = torch.arange(sparse_k, dtype=torch.int32)
+        topk_row = torch.randperm(max_seq_len, dtype=torch.int64)[:sparse_k].to(torch.int32)
+        topk_idx[b, :sparse_k] = torch.sort(topk_row).values
 
     seq_lens = torch.full((batch,), sparse_k, dtype=torch.int32)
     layer_id_t = torch.tensor([0], dtype=torch.int32)
