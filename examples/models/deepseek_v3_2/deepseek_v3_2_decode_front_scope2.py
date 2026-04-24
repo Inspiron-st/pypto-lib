@@ -13,11 +13,9 @@ This file prepares the indexer outputs consumed by scope3:
 - q = wq_b(qr), split as q_pe/q_nope with q_pe first
 - k = LayerNorm(wk(hidden_states)), split as k_pe/k_nope with k_pe first
 - apply non-interleaved RoPE to q_pe and k_pe
-- approximate rotate_activation with the scalar Hadamard scale
 - compute per-index-head weights
-- update k_cache_idx at the current decode position
-- reduce q_idx_full with weights to q_idx:
-  q_idx[b] = sum_h weights[b, h] * q_idx_full[b, h, :]
+- quantize q_idx_full and current-token k_idx to row-wise INT8
+- update k_cache_idx_i8 and k_cache_idx_scale at the current decode position
 """
 
 import pypto.language as pl
@@ -33,7 +31,10 @@ INDEX_HEADS = 64
 INDEX_HEAD_DIM = 128
 
 EPS = 1e-6
-HADAMARD_SCALE = INDEX_HEAD_DIM ** -0.5
+INT8_GROUP_SIZE = 128
+INT8_SCALE_MAX = 127.0
+INT8_AMAX_EPS = 1e-4
+INT8_SCALE_PACK = 8
 
 CACHE_ROWS = BATCH * MAX_SEQ
 
@@ -61,7 +62,14 @@ def build_deepseek_v3_2_decode_front_indexer_program(
     INDEX_HEAD_DIM_CFG = index_head_dim
     QK_ROPE_HEAD_DIM_CFG = qk_rope_head_dim
     INDEX_Q_OUT_CFG = index_heads * index_head_dim
+    INDEX_Q_ROWS_CFG = batch * index_heads
     CACHE_ROWS_CFG = batch * max_seq_len
+
+    if INDEX_HEAD_DIM_CFG != INT8_GROUP_SIZE:
+        raise ValueError(
+            f"INT8 quant path expects index_head_dim == {INT8_GROUP_SIZE}, "
+            f"got {INDEX_HEAD_DIM_CFG}"
+        )
 
     HIDDEN_BLOCKS = (hidden_size + K_CHUNK - 1) // K_CHUNK
     QR_BLOCKS = (q_lora_rank + LORA_CHUNK - 1) // LORA_CHUNK
@@ -70,7 +78,6 @@ def build_deepseek_v3_2_decode_front_indexer_program(
     WEIGHTS_BLOCKS = (index_heads + WEIGHTS_OUT_CHUNK - 1) // WEIGHTS_OUT_CHUNK
     INDEX_HEAD_DIM_INV = 1.0 / index_head_dim
     WEIGHT_SCALE = (index_heads ** -0.5) * (index_head_dim ** -0.5)
-    HADAMARD_SCALE_CFG = index_head_dim ** -0.5
 
     @pl.program
     class DeepSeekV32DecodeFrontIndexer:
@@ -87,12 +94,25 @@ def build_deepseek_v3_2_decode_front_indexer_program(
             seq_lens: pl.Tensor[[BATCH_CFG], pl.INT32],
             rope_cos: pl.Tensor[[MAX_SEQ_CFG, QK_ROPE_HEAD_DIM_CFG], pl.FP32],
             rope_sin: pl.Tensor[[MAX_SEQ_CFG, QK_ROPE_HEAD_DIM_CFG], pl.FP32],
-            k_cache_idx: pl.Tensor[[CACHE_ROWS_CFG, INDEX_HEAD_DIM_CFG], pl.BF16],
-            q_idx: pl.Tensor[[BATCH_CFG, INDEX_HEAD_DIM_CFG], pl.BF16],
-        ) -> pl.Tensor[[BATCH_CFG, INDEX_HEAD_DIM_CFG], pl.BF16]:
+            k_cache_idx_i8: pl.Tensor[[CACHE_ROWS_CFG, INDEX_HEAD_DIM_CFG], pl.INT8],
+            k_cache_idx_scale: pl.Tensor[[BATCH_CFG, MAX_SEQ_CFG], pl.FP32],
+            q_idx_full_i8_out: pl.Tensor[[INDEX_Q_ROWS_CFG, INDEX_HEAD_DIM_CFG], pl.INT8],
+            q_idx_scale_heads_out: pl.Tensor[[BATCH_CFG, INDEX_HEADS_CFG], pl.FP32],
+            weights_out: pl.Tensor[[BATCH_CFG, INDEX_HEADS_CFG], pl.FP32],
+        ) -> tuple[
+            pl.Tensor[[CACHE_ROWS_CFG, INDEX_HEAD_DIM_CFG], pl.INT8],
+            pl.Tensor[[BATCH_CFG, MAX_SEQ_CFG], pl.FP32],
+            pl.Tensor[[INDEX_Q_ROWS_CFG, INDEX_HEAD_DIM_CFG], pl.INT8],
+            pl.Tensor[[BATCH_CFG, INDEX_HEADS_CFG], pl.FP32],
+            pl.Tensor[[BATCH_CFG, INDEX_HEADS_CFG], pl.FP32],
+        ]:
             q_idx_full = pl.create_tensor([BATCH_CFG, INDEX_Q_OUT_CFG], dtype=pl.BF16)
             k_idx = pl.create_tensor([BATCH_CFG, INDEX_HEAD_DIM_CFG], dtype=pl.BF16)
+            q_idx_full_i8 = pl.create_tensor([INDEX_Q_ROWS_CFG, INDEX_HEAD_DIM_CFG], dtype=pl.INT8)
+            k_idx_i8 = pl.create_tensor([BATCH_CFG, INDEX_HEAD_DIM_CFG], dtype=pl.INT8)
+            k_idx_scale = pl.create_tensor([BATCH_CFG, INT8_SCALE_PACK], dtype=pl.FP32)
             weights = pl.create_tensor([BATCH_CFG, INDEX_HEADS_CFG], dtype=pl.FP32)
+            q_idx_scale_heads = pl.create_tensor([BATCH_CFG, INDEX_HEADS_CFG], dtype=pl.FP32)
 
             # Stage 0: q_idx_full = wq_b_idx(qr), shaped as [B, INDEX_HEADS, INDEX_HEAD_DIM].
             with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
@@ -195,19 +215,7 @@ def build_deepseek_v3_2_decode_front_indexer_program(
                         [b, QK_ROPE_HEAD_DIM_CFG // 2],
                     )
 
-            # Stage 4: rotate_activation placeholder, apply only the Hadamard scale.
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
-                for ob in pl.parallel(0, IDX_OUT_BLOCKS, 1, chunk=8):
-                    q0 = ob * IDX_OUT_CHUNK
-                    q_tile = pl.cast(pl.slice(q_idx_full, [BATCH_TILE, IDX_OUT_CHUNK], [0, q0]), target_type=pl.FP32)
-                    q_scaled = pl.mul(q_tile, HADAMARD_SCALE_CFG)
-                    q_idx_full = pl.assemble(q_idx_full, pl.cast(q_scaled, target_type=pl.BF16), [0, q0])
-
-                k_tile = pl.cast(pl.slice(k_idx, [BATCH_TILE, INDEX_HEAD_DIM_CFG], [0, 0]), target_type=pl.FP32)
-                k_scaled = pl.mul(k_tile, HADAMARD_SCALE_CFG)
-                k_idx = pl.assemble(k_idx, pl.cast(k_scaled, target_type=pl.BF16), [0, 0])
-
-            # Stage 5: weights = weights_proj(hidden_states) * n_heads^-0.5 * head_dim^-0.5.
+            # Stage 4: weights = weights_proj(hidden_states) * n_heads^-0.5 * head_dim^-0.5.
             with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                 for ob in pl.parallel(0, WEIGHTS_BLOCKS, 1, chunk=1):
                     w0 = ob * WEIGHTS_OUT_CHUNK
@@ -227,34 +235,95 @@ def build_deepseek_v3_2_decode_front_indexer_program(
                     w_scaled = pl.mul(w_acc, WEIGHT_SCALE)
                     weights = pl.assemble(weights, w_scaled, [0, w0])
 
-            # Stage 6: update k_cache_idx for the current decode token.
+            # Stage 5: Quantize indexer q/k tensors and keep INT8 outputs for scope3.
+            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
+                q_idx_grouped = pl.reshape(q_idx_full, [INDEX_Q_ROWS_CFG, INDEX_HEAD_DIM_CFG])
+                for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
+                    for h0 in pl.range(0, INDEX_HEADS_CFG, BATCH_TILE):
+                        r0 = b * INDEX_HEADS_CFG + h0
+                        q_block = pl.cast(
+                            pl.slice(q_idx_grouped, [BATCH_TILE, INDEX_HEAD_DIM_CFG], [r0, 0]),
+                            target_type=pl.FP32,
+                            mode="none",
+                        )
+                        q_abs = pl.maximum(q_block, pl.neg(q_block))
+                        q_amax_row = pl.reshape(pl.row_max(q_abs), [1, BATCH_TILE])
+                        q_amax_row = pl.maximum(
+                            q_amax_row,
+                            pl.full([1, BATCH_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS),
+                        )
+                        q_scale_quant_row = pl.div(
+                            pl.full([1, BATCH_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX),
+                            q_amax_row,
+                        )
+                        q_scale_dequant_row = pl.div(
+                            pl.full([1, BATCH_TILE], dtype=pl.FP32, value=1.0),
+                            q_scale_quant_row,
+                        )
+                        q_scale_quant = pl.reshape(q_scale_quant_row, [BATCH_TILE, 1])
+                        q_scaled = pl.row_expand_mul(q_block, q_scale_quant)
+                        q_i32 = pl.cast(q_scaled, target_type=pl.INT32, mode="round")
+                        q_half = pl.cast(q_i32, target_type=pl.FP16, mode="round")
+                        q_i8 = pl.cast(q_half, target_type=pl.INT8, mode="trunc")
+                        q_idx_full_i8 = pl.assemble(q_idx_full_i8, q_i8, [r0, 0])
+                        q_idx_scale_heads = pl.assemble(q_idx_scale_heads, q_scale_dequant_row, [b, h0])
+
+                for r0 in pl.parallel(0, BATCH_CFG, BATCH_TILE, chunk=1):
+                    k_block = pl.cast(
+                        pl.slice(k_idx, [BATCH_TILE, INDEX_HEAD_DIM_CFG], [r0, 0]),
+                        target_type=pl.FP32,
+                        mode="none",
+                    )
+                    k_abs = pl.maximum(k_block, pl.neg(k_block))
+                    k_amax_row = pl.reshape(pl.row_max(k_abs), [1, BATCH_TILE])
+                    k_amax_row = pl.maximum(
+                        k_amax_row,
+                        pl.full([1, BATCH_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS),
+                    )
+                    k_scale_quant_row = pl.div(
+                        pl.full([1, BATCH_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX),
+                        k_amax_row,
+                    )
+                    k_scale_dequant_row = pl.div(
+                        pl.full([1, BATCH_TILE], dtype=pl.FP32, value=1.0),
+                        k_scale_quant_row,
+                    )
+                    k_scale_quant = pl.reshape(k_scale_quant_row, [BATCH_TILE, 1])
+                    k_scale_dequant = pl.reshape(k_scale_dequant_row, [BATCH_TILE, 1])
+                    k_scale_pack_target = pl.full([BATCH_TILE, INT8_SCALE_PACK], dtype=pl.FP32, value=0.0)
+                    k_scale_pack = pl.row_expand(k_scale_pack_target, k_scale_dequant)
+                    k_scaled = pl.row_expand_mul(k_block, k_scale_quant)
+                    k_i32 = pl.cast(k_scaled, target_type=pl.INT32, mode="round")
+                    k_half = pl.cast(k_i32, target_type=pl.FP16, mode="round")
+                    k_i8 = pl.cast(k_half, target_type=pl.INT8, mode="trunc")
+                    k_idx_i8 = pl.assemble(k_idx_i8, k_i8, [r0, 0])
+                    k_idx_scale = pl.assemble(k_idx_scale, k_scale_pack, [r0, 0])
+
+            # Stage 6: update k_cache_idx_i8 and k_cache_idx_scale for the current decode token.
+            k_idx_scale_flat = pl.reshape(k_idx_scale, [BATCH_CFG * INT8_SCALE_PACK])
+            k_cache_idx_scale_flat = pl.reshape(k_cache_idx_scale, [BATCH_CFG * MAX_SEQ_CFG])
             with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                 for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
                     pos = pl.tensor.read(seq_lens, [b]) - 1
                     cache_row = b * MAX_SEQ_CFG + pos
-                    k_row = pl.slice(k_idx, [1, INDEX_HEAD_DIM_CFG], [b, 0])
-                    k_cache_idx = pl.assemble(k_cache_idx, k_row, [cache_row, 0])
+                    k_row_i8 = pl.slice(k_idx_i8, [1, INDEX_HEAD_DIM_CFG], [b, 0])
+                    k_row_scale = pl.tensor.read(k_idx_scale_flat, [b * INT8_SCALE_PACK])
+                    k_cache_idx_i8 = pl.assemble(k_cache_idx_i8, k_row_i8, [cache_row, 0])
+                    pl.tensor.write(k_cache_idx_scale_flat, [b * MAX_SEQ_CFG + pos], k_row_scale)
 
-            # Stage 7: reduce [B, H, D] q_idx_full into [B, D] q_idx for scope3.
+            # Stage 7: export q scales, q INT8 rows, and weights for scope3.
             with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
-                weights_t = pl.transpose(weights, axis1=0, axis2=1)
-                for b0 in pl.parallel(0, BATCH_CFG, BATCH_TILE, chunk=1):
-                    q_idx_acc = pl.full([BATCH_TILE, INDEX_HEAD_DIM_CFG], dtype=pl.FP32, value=0.0)
-                    for h in pl.range(INDEX_HEADS_CFG):
-                        q_h = pl.cast(
-                            pl.slice(
-                                q_idx_full,
-                                [BATCH_TILE, INDEX_HEAD_DIM_CFG],
-                                [b0, h * INDEX_HEAD_DIM_CFG],
-                            ),
-                            target_type=pl.FP32,
-                        )
-                        w_h_t = pl.slice(weights_t, [1, BATCH_TILE], [h, b0])
-                        w_h = pl.reshape(w_h_t, [BATCH_TILE, 1])
-                        q_idx_acc = pl.add(q_idx_acc, pl.row_expand_mul(q_h, w_h))
-                    q_idx = pl.assemble(q_idx, pl.cast(q_idx_acc, target_type=pl.BF16), [b0, 0])
+                for r0 in pl.parallel(0, INDEX_Q_ROWS_CFG, BATCH_TILE, chunk=1):
+                    q_i8_tile = pl.slice(q_idx_full_i8, [BATCH_TILE, INDEX_HEAD_DIM_CFG], [r0, 0])
+                    q_idx_full_i8_out = pl.assemble(q_idx_full_i8_out, q_i8_tile, [r0, 0])
 
-            return q_idx
+                for b0 in pl.parallel(0, BATCH_CFG, BATCH_TILE, chunk=1):
+                    q_scale_tile = pl.slice(q_idx_scale_heads, [BATCH_TILE, INDEX_HEADS_CFG], [b0, 0])
+                    weights_tile = pl.slice(weights, [BATCH_TILE, INDEX_HEADS_CFG], [b0, 0])
+                    q_idx_scale_heads_out = pl.assemble(q_idx_scale_heads_out, q_scale_tile, [b0, 0])
+                    weights_out = pl.assemble(weights_out, weights_tile, [b0, 0])
+
+            return k_cache_idx_i8, k_cache_idx_scale, q_idx_full_i8_out, q_idx_scale_heads_out, weights_out
 
     return DeepSeekV32DecodeFrontIndexer
 
@@ -282,6 +351,17 @@ def build_deepseek_v3_2_decode_front_scope2_program(
 def golden_decode_front_indexer(tensors):
     import torch  # type: ignore[import]
 
+    def int8_quant_groups(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        rows = x.reshape(-1, INDEX_HEAD_DIM).float()
+        amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+        scale_quant = INT8_SCALE_MAX / amax
+        scaled = rows * scale_quant
+        out_i32 = scaled.round().to(torch.int32)
+        out_half = out_i32.to(torch.float16)
+        out_i8 = out_half.to(torch.int8)
+        scale_dequant = 1.0 / scale_quant
+        return out_i8.reshape_as(x), scale_dequant
+
     hidden_states = tensors["hidden_states"].float()
     qr = tensors["qr"].float()
     wq_b_idx = tensors["wq_b_idx"].float()
@@ -292,7 +372,8 @@ def golden_decode_front_indexer(tensors):
     seq_lens = tensors["seq_lens"]
     rope_cos = tensors["rope_cos"].float()
     rope_sin = tensors["rope_sin"].float()
-    k_cache_idx = tensors["k_cache_idx"]
+    k_cache_idx_i8 = tensors["k_cache_idx_i8"]
+    k_cache_idx_scale = tensors["k_cache_idx_scale"]
 
     q_idx_full = (qr @ wq_b_idx).to(torch.bfloat16).float()
     k_idx = (hidden_states @ wk_idx).to(torch.bfloat16).float()
@@ -323,19 +404,22 @@ def golden_decode_front_indexer(tensors):
         k_idx[b : b + 1, half:QK_ROPE_HEAD_DIM] = k_hi * cos_hi + k_lo * sin_hi
     q_idx_full = q_view.reshape(BATCH, INDEX_HEADS * INDEX_HEAD_DIM)
 
-    q_idx_full = (q_idx_full * HADAMARD_SCALE).to(torch.bfloat16).float()
-    k_idx = (k_idx * HADAMARD_SCALE).to(torch.bfloat16).float()
-
     weights = (hidden_states @ weights_proj.to(torch.bfloat16).float()) * (
         INDEX_HEADS ** -0.5 * INDEX_HEAD_DIM ** -0.5
     )
+    q_idx_full = q_idx_full.to(torch.bfloat16).float()
+    k_idx = k_idx.to(torch.bfloat16).float()
+    q_idx_i8_golden, q_idx_scale_golden = int8_quant_groups(q_idx_full)
+    k_idx_i8_golden, k_idx_scale_golden = int8_quant_groups(k_idx)
+
     for b in range(BATCH):
         pos = int(seq_lens[b].item()) - 1
-        k_cache_idx[b * MAX_SEQ + pos, :].copy_(k_idx[b].to(torch.bfloat16))
+        k_cache_idx_i8[b * MAX_SEQ + pos, :].copy_(k_idx_i8_golden[b])
+        k_cache_idx_scale[b, pos].copy_(k_idx_scale_golden[b, 0])
 
-    q_heads = q_idx_full.view(BATCH, INDEX_HEADS, INDEX_HEAD_DIM)
-    q_idx = torch.einsum("bhd,bh->bd", q_heads, weights)
-    tensors["q_idx"].copy_(q_idx.to(torch.bfloat16))
+    tensors["q_idx_full_i8_out"].copy_(q_idx_i8_golden.view(BATCH * INDEX_HEADS, INDEX_HEAD_DIM))
+    tensors["q_idx_scale_heads_out"].copy_(q_idx_scale_golden.view(BATCH, INDEX_HEADS))
+    tensors["weights_out"].copy_(weights)
 
 
 def build_tensor_specs(
@@ -378,8 +462,11 @@ def build_tensor_specs(
     def init_rope():
         return torch.rand(max_seq_len, qk_rope_head_dim) - 0.5
 
-    def init_k_cache_idx():
-        return torch.rand(cache_rows, index_head_dim) - 0.5
+    def init_k_cache_idx_i8():
+        return torch.randint(-8, 9, (cache_rows, index_head_dim), dtype=torch.int8)
+
+    def init_k_cache_idx_scale():
+        return torch.rand(batch, max_seq_len) * 0.1 + 0.001
 
     return [
         TensorSpec("hidden_states", [batch, hidden_size], torch.bfloat16, init_value=init_hidden_states),
@@ -393,13 +480,22 @@ def build_tensor_specs(
         TensorSpec("rope_cos", [max_seq_len, qk_rope_head_dim], torch.float32, init_value=init_rope),
         TensorSpec("rope_sin", [max_seq_len, qk_rope_head_dim], torch.float32, init_value=init_rope),
         TensorSpec(
-            "k_cache_idx",
+            "k_cache_idx_i8",
             [cache_rows, index_head_dim],
-            torch.bfloat16,
-            init_value=init_k_cache_idx,
+            torch.int8,
+            init_value=init_k_cache_idx_i8,
             is_output=True,
         ),
-        TensorSpec("q_idx", [batch, index_head_dim], torch.bfloat16, is_output=True),
+        TensorSpec(
+            "k_cache_idx_scale",
+            [batch, max_seq_len],
+            torch.float32,
+            init_value=init_k_cache_idx_scale,
+            is_output=True,
+        ),
+        TensorSpec("q_idx_full_i8_out", [batch * index_heads, index_head_dim], torch.int8, is_output=True),
+        TensorSpec("q_idx_scale_heads_out", [batch, index_heads], torch.float32, is_output=True),
+        TensorSpec("weights_out", [batch, index_heads], torch.float32, is_output=True),
     ]
 
 
@@ -420,7 +516,7 @@ if __name__ == "__main__":
         golden_fn=golden_decode_front_indexer,
         config=RunConfig(
             rtol=2e-3,
-            atol=2e-3,
+            atol=1.0,
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,
