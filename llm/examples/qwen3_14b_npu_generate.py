@@ -44,7 +44,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-id", default="qwen3-14b-local")
     parser.add_argument("--platform", default="a2a3", choices=["a2a3sim", "a2a3", "a5sim", "a5"])
     parser.add_argument("--device-id", type=int, default=0)
-    parser.add_argument("--pypto-root", default="/data/liuxu/pypto", help="Path to the local PyPTO repository.")
     parser.add_argument("--max-seq-len", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -64,7 +63,6 @@ def main() -> None:
     kv_cache_manager = KvCacheManager()
     executor = PyptoQwen14BExecutor(
         kv_cache_manager,
-        pypto_root=args.pypto_root,
         platform=args.platform,
         device_id=args.device_id,
         save_kernels_dir=args.save_kernels_dir,

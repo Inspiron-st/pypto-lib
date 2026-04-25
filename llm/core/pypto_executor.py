@@ -80,7 +80,7 @@ class _CompiledKernels:
     decode: object
     rope_cos: torch.Tensor
     rope_sin: torch.Tensor
-    batch: int
+    prefill_batch: int
 
 
 @dataclass
@@ -93,13 +93,12 @@ class _PaddedPrefillInputs:
 
 
 @dataclass
-class _PaddedDecodeInputs:
+class _DecodeInputs:
     actual_batch: int
     hidden: torch.Tensor
     seq_lens: torch.Tensor
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
-    pad_allocation: KvAllocation | None = None
 
 
 class PyptoQwen14BExecutor(ModelExecutor):
@@ -124,7 +123,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         compiled = self._compiled[model.config.model_id]
-        padded = self._pad_prefill_inputs(model, batch, compiled.batch)
+        padded = self._pad_prefill_inputs(model, batch, compiled.prefill_batch)
         hidden = padded.hidden
 
         for layer_idx, layer in enumerate(model.layers):
@@ -169,45 +168,41 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
         compiled = self._compiled[model.config.model_id]
-        padded = self._pad_decode_inputs(model, batch, compiled.batch)
-        hidden = padded.hidden
+        decode_inputs = self._prepare_decode_inputs(model, batch)
+        hidden = decode_inputs.hidden
 
-        try:
-            for layer_idx, layer in enumerate(model.layers):
-                k_cache, v_cache = self._kv_cache_manager.materialize_decode_cache(
-                    model.config.model_id,
-                    layer_idx,
-                )
-                out = torch.zeros_like(hidden)
-                compiled.decode(
-                    hidden,
-                    layer.input_rms_weight.view(1, -1).float().cpu(),
-                    self._kernel_weight(layer.wq),
-                    self._kernel_weight(layer.wk),
-                    self._kernel_weight(layer.wv),
-                    layer.q_norm_weight.view(1, -1).float().cpu(),
-                    layer.k_norm_weight.view(1, -1).float().cpu(),
-                    padded.seq_lens,
-                    padded.block_table,
-                    padded.slot_mapping,
-                    compiled.rope_cos,
-                    compiled.rope_sin,
-                    k_cache,
-                    v_cache,
-                    self._kernel_weight(layer.wo),
-                    layer.post_rms_weight.view(1, -1).float().cpu(),
-                    self._kernel_weight(layer.w_gate),
-                    self._kernel_weight(layer.w_up),
-                    self._kernel_weight(layer.w_down),
-                    out,
-                    config=self._run_config(codegen_only=False),
-                )
-                hidden = out
-        finally:
-            if padded.pad_allocation is not None:
-                self._kv_cache_manager.free(padded.pad_allocation)
+        for layer_idx, layer in enumerate(model.layers):
+            k_cache, v_cache = self._kv_cache_manager.materialize_decode_cache(
+                model.config.model_id,
+                layer_idx,
+            )
+            out = torch.zeros_like(hidden)
+            compiled.decode(
+                hidden,
+                layer.input_rms_weight.view(1, -1).float().cpu(),
+                self._kernel_weight(layer.wq),
+                self._kernel_weight(layer.wk),
+                self._kernel_weight(layer.wv),
+                layer.q_norm_weight.view(1, -1).float().cpu(),
+                layer.k_norm_weight.view(1, -1).float().cpu(),
+                decode_inputs.seq_lens,
+                decode_inputs.block_table,
+                decode_inputs.slot_mapping,
+                compiled.rope_cos,
+                compiled.rope_sin,
+                k_cache,
+                v_cache,
+                self._kernel_weight(layer.wo),
+                layer.post_rms_weight.view(1, -1).float().cpu(),
+                self._kernel_weight(layer.w_gate),
+                self._kernel_weight(layer.w_up),
+                self._kernel_weight(layer.w_down),
+                out,
+                config=self._run_config(codegen_only=False),
+            )
+            hidden = out
 
-        final_hidden = hidden[: padded.actual_batch].float()
+        final_hidden = hidden.float()
         logits = self._project_logits(model, final_hidden)
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
@@ -257,7 +252,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             decode=decode,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
-            batch=compile_batch,
+            prefill_batch=compile_batch,
         )
 
     def _pad_prefill_inputs(
@@ -298,20 +293,19 @@ class PyptoQwen14BExecutor(ModelExecutor):
             slot_mapping=slot_mapping,
         )
 
-    def _pad_decode_inputs(
+    def _prepare_decode_inputs(
         self,
         model: RuntimeModel,
         batch: DecodeBatch,
-        compile_batch: int,
-    ) -> _PaddedDecodeInputs:
-        actual_batch = self._validate_batch_size(model, len(batch.kv_allocations), compile_batch)
+    ) -> _DecodeInputs:
+        actual_batch = self._validate_batch_size(model, len(batch.kv_allocations))
         hidden_size = model.config.hidden_size
         max_blocks = self._max_blocks_per_seq(model)
 
-        hidden = torch.zeros((compile_batch, hidden_size), dtype=torch.bfloat16)
-        seq_lens = torch.ones((compile_batch,), dtype=torch.int32)
-        block_table = torch.full((compile_batch * max_blocks,), -1, dtype=torch.int32)
-        slot_mapping = torch.zeros((compile_batch,), dtype=torch.int32)
+        hidden = torch.zeros((actual_batch, hidden_size), dtype=torch.bfloat16)
+        seq_lens = torch.empty((actual_batch,), dtype=torch.int32)
+        block_table = torch.full((actual_batch * max_blocks,), -1, dtype=torch.int32)
+        slot_mapping = torch.empty((actual_batch,), dtype=torch.int32)
 
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             seq_len = int(batch.seq_lens[batch_idx].item())
@@ -326,25 +320,12 @@ class PyptoQwen14BExecutor(ModelExecutor):
             self._write_block_table_row(block_table, batch_idx, max_blocks, alloc)
             slot_mapping[batch_idx] = self._kv_cache_manager.slot_mapping_for_request(alloc)
 
-        pad_allocation = None
-        if actual_batch < compile_batch:
-            pad_allocation = self._kv_cache_manager.allocate_for_prompt(
-                model.config.model_id,
-                "__pypto_batch_pad__",
-                1,
-            )
-            pad_slot = self._kv_cache_manager.slot_mapping_for_request(pad_allocation, 0)
-            for batch_idx in range(actual_batch, compile_batch):
-                self._write_block_table_row(block_table, batch_idx, max_blocks, pad_allocation)
-                slot_mapping[batch_idx] = pad_slot
-
-        return _PaddedDecodeInputs(
+        return _DecodeInputs(
             actual_batch=actual_batch,
             hidden=hidden,
             seq_lens=seq_lens,
             block_table=block_table,
             slot_mapping=slot_mapping,
-            pad_allocation=pad_allocation,
         )
 
     @staticmethod
@@ -366,7 +347,11 @@ class PyptoQwen14BExecutor(ModelExecutor):
         return padded_batch_size(model.runtime.max_batch_size)
 
     @staticmethod
-    def _validate_batch_size(model: RuntimeModel, actual_batch: int, compile_batch: int) -> int:
+    def _validate_batch_size(
+        model: RuntimeModel,
+        actual_batch: int,
+        compile_batch: int | None = None,
+    ) -> int:
         if actual_batch <= 0:
             raise ValueError("batch must contain at least one request")
         if actual_batch > model.runtime.max_batch_size:
@@ -374,7 +359,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             raise ValueError(
                 f"batch has {actual_batch} requests, but runtime max_batch_size is {max_batch_size}"
             )
-        if actual_batch > compile_batch:
+        if compile_batch is not None and actual_batch > compile_batch:
             raise ValueError(
                 f"batch has {actual_batch} requests, but compiled kernel batch is {compile_batch}"
             )
