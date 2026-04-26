@@ -22,14 +22,7 @@ past ctx_len. Outputs (topk_vals_out, topk_idx_out) = top-INDEX_TOPK entries
 per batch; invalid tail idx = INT32_MIN (< 0), compatible with scope4's
 `topk_pos >= 0` filter.
 """
-
-
-import os
-
 import pypto.language as pl
-
-os.environ.setdefault("PTO2_RING_HEAP", str(1024 * 1024 * 1024))
-
 
 BATCH = 16
 MAX_SEQ = 4096
@@ -77,9 +70,9 @@ def build_deepseek_v3_2_decode_front_scope3_program():
             # Pad q_idx_full_i8 to Q_PAD rows per (batch, head) for INT8 qk validation.
             q_i8_padded = pl.create_tensor([BATCH * INDEX_HEADS * Q_PAD, INDEX_HEAD_DIM], dtype=pl.INT8)
             q_s_padded = pl.create_tensor([BATCH * Q_PAD, INDEX_HEADS], dtype=pl.FP32)
-            with pl.at(level=pl.Level.CORE_GROUP):
-                for b in pl.parallel(BATCH):
-                    for h in pl.parallel(INDEX_HEADS):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="init_q_pad"):
+                for b in pl.range(BATCH):
+                    for h in pl.range(INDEX_HEADS):
                         q_row0 = b * INDEX_HEADS + h
                         q_i8_valid = pl.slice(q_idx_full_i8, [1, INDEX_HEAD_DIM], [q_row0, 0])
                         q_i8_padded = pl.assemble(q_i8_padded, q_i8_valid, [q_row0 * Q_PAD, 0])
@@ -89,7 +82,7 @@ def build_deepseek_v3_2_decode_front_scope3_program():
                         )
                         q_i8_padded = pl.assemble(q_i8_padded, q_i8_zero_pad, [q_row0 * Q_PAD + Q_VALID, 0])
 
-                for b in pl.parallel(BATCH):
+                for b in pl.range(BATCH):
                     weights_row = pl.slice(weights, [1, INDEX_HEADS], [b, 0])
                     q_scales_row = pl.slice(q_idx_scale_heads, [1, INDEX_HEADS], [b, 0])
                     q_s_row = pl.mul(weights_row, q_scales_row)
@@ -100,12 +93,7 @@ def build_deepseek_v3_2_decode_front_scope3_program():
                         [b * Q_PAD + Q_VALID, 0],
                     )
 
-            # Transient GM buffers.
-            # scores is [BATCH, SORT_LEN]: Stage 0 fills the full row with -inf
-            # so the [MAX_SEQ, SORT_LEN) tail is always -inf for the sort.
-            scores = pl.create_tensor([BATCH, SORT_LEN], dtype=pl.FP32)
-            sorted_gm = pl.create_tensor([BATCH, 2 * SORT_LEN], dtype=pl.FP32)
-            raw_idx_gm = pl.create_tensor([BATCH, INDEX_TOPK], dtype=pl.INT32)
+            # Transient GM buffers (shared across batches).
             all_scores_i8 = pl.create_tensor(
                 [BATCH * MAX_SEQ_BLOCKS * INDEX_HEADS * Q_PAD, SEQ_TILE],
                 dtype=pl.INT32,
@@ -118,13 +106,14 @@ def build_deepseek_v3_2_decode_front_scope3_program():
                 ctx_len = pl.read(seq_lens, [b])
                 ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
 
-                # Stage 0: pre-fill scores[b, 0:SORT_LEN] with -inf.
-                with pl.at(level=pl.Level.CORE_GROUP):
+                # Stage 0: pre-fill scores[0, 0:SORT_LEN] with -inf.
+                scores = pl.create_tensor([1, SORT_LEN], dtype=pl.FP32)
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_neg_inf"):
                     neg_inf_row = pl.full([1, SORT_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
-                    scores = pl.assemble(scores, neg_inf_row, [b, 0])
+                    scores = pl.assemble(scores, neg_inf_row, [0, 0])
 
                 # Stage 1: Compute tiled INT8 qk logits between q_idx_full_i8 and k_cache_idx_i8.
-                with pl.at(level=pl.Level.CORE_GROUP):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="int8_qk_logits"):
                     for sb in pl.range(ctx_blocks):
                         s0 = sb * SEQ_TILE
                         cache_row0 = b * MAX_SEQ + s0
@@ -137,7 +126,7 @@ def build_deepseek_v3_2_decode_front_scope3_program():
                             all_scores_i8 = pl.assemble(all_scores_i8, logits_i32, [tile_row0, 0])
 
                 # Stage 2: Cast staged INT32 logits to FP32, then extract q row and apply ReLU.
-                with pl.at(level=pl.Level.CORE_GROUP):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="relu_logits"):
                     for sb in pl.range(ctx_blocks):
                         for h in pl.range(INDEX_HEADS):
                             tile_row0 = ((b * MAX_SEQ_BLOCKS + sb) * INDEX_HEADS + h) * Q_PAD
@@ -148,7 +137,7 @@ def build_deepseek_v3_2_decode_front_scope3_program():
                             relu_rows = pl.assemble(relu_rows, relu_logits, [relu_row0, 0])
 
                 # Stage 3: Reduce per-head ReLU logits with weights * q_scale.
-                with pl.at(level=pl.Level.CORE_GROUP):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="weighted_reduce"):
                     for sb in pl.range(ctx_blocks):
                         q_s_tile = pl.slice(q_s_padded, [Q_PAD, INDEX_HEADS], [b * Q_PAD, 0])
                         relu_row0 = (b * MAX_SEQ_BLOCKS + sb) * INDEX_HEADS
@@ -158,7 +147,7 @@ def build_deepseek_v3_2_decode_front_scope3_program():
                         weighted_scores = pl.assemble(weighted_scores, weighted_tile, [weighted_row0, 0])
 
                 # Stage 4: Apply k scale and write valid score tiles to scores.
-                with pl.at(level=pl.Level.CORE_GROUP):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="k_scale_score"):
                     for sb in pl.range(ctx_blocks):
                         s0 = sb * SEQ_TILE
                         valid_len = pl.min(SEQ_TILE, ctx_len - s0)
@@ -174,26 +163,21 @@ def build_deepseek_v3_2_decode_front_scope3_program():
                             [score_row0, 0],
                             valid_shape=[1, valid_len],
                         )
-                        scores = pl.assemble(scores, score_valid, [b, s0])
+                        scores = pl.assemble(scores, score_valid, [0, s0])
 
-                # Stage 5: sort32 + 4 mrgsort iterations (tensor-level). Operates
-                # directly on GM slices; result is [1, 2*SORT_LEN] interleaved
-                # (val, idx). Stored to sorted_gm for gather in Stage 6.
-                with pl.at(level=pl.Level.CORE_GROUP):
-                    score_row = pl.slice(scores, [1, SORT_LEN], [b, 0])
+                # Stage 5: sort32 + 4 mrgsort
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="sort_mrgsort"):
                     idx_init = pl.tensor.arange(0, [1, SORT_LEN], dtype=pl.UINT32)
-                    sorted_t = pl.tensor.sort32(score_row, idx_init)
+                    sorted_t = pl.tensor.sort32(scores, idx_init)
                     sorted_t = pl.tensor.mrgsort(sorted_t, block_len=64)
                     sorted_t = pl.tensor.mrgsort(sorted_t, block_len=256)
                     sorted_t = pl.tensor.mrgsort(sorted_t, block_len=1024)
-                    sorted_t = pl.tensor.mrgsort(sorted_t, block_len=4096)
-                    sorted_gm = pl.assemble(sorted_gm, sorted_t, [b, 0])
+                    sorted_gm = pl.tensor.mrgsort(sorted_t, block_len=4096)
 
-                # Stage 6+7: gather P0101/P1010 to split vals / idx, then
-                # valid_shape+fillpad to mark idx slots past ctx_len with
-                # PadValue.min (= INT32_MIN < 0).
-                with pl.at(level=pl.Level.CORE_GROUP):
-                    topk_pairs = pl.slice(sorted_gm, [1, 2 * INDEX_TOPK], [b, 0])
+                # Stage 6: extract topk vals and idx
+                raw_idx_gm = pl.create_tensor([1, INDEX_TOPK], dtype=pl.INT32)
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="gather_split_idx"):
+                    topk_pairs = pl.slice(sorted_gm, [1, 2 * INDEX_TOPK], [0, 0])
                     topk_v = pl.tensor.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
                     topk_i_raw = pl.tensor.gather(
                         topk_pairs,
@@ -201,12 +185,12 @@ def build_deepseek_v3_2_decode_front_scope3_program():
                         output_dtype=pl.INT32,
                     )
                     topk_vals_out = pl.assemble(topk_vals_out, topk_v, [b, 0])
-                    raw_idx_gm = pl.assemble(raw_idx_gm, topk_i_raw, [b, 0])
+                    raw_idx_gm = pl.assemble(raw_idx_gm, topk_i_raw, [0, 0])
                     valid_topk = pl.min(INDEX_TOPK, ctx_len)
                     idx_valid = pl.slice(
                         raw_idx_gm,
                         [1, INDEX_TOPK],
-                        [b, 0],
+                        [0, 0],
                         valid_shape=[1, valid_topk],
                     )
                     idx_padded = pl.fillpad(idx_valid, pad_value=pl.PadValue.min)

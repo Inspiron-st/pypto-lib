@@ -66,100 +66,72 @@ Q_PAD = 16
 SORT_LEN = 8192
 FP32_NEG_INF = -3.4028234663852886e38
 
+# Derived config
+INDEX_Q_OUT = INDEX_HEADS * INDEX_HEAD_DIM
+INDEX_Q_ROWS = BATCH * INDEX_HEADS
+INDEX_HEAD_DIM_INV = 1.0 / INDEX_HEAD_DIM
+WEIGHT_SCALE = (INDEX_HEADS ** -0.5) * (INDEX_HEAD_DIM ** -0.5)
 
-def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
-    batch: int = BATCH,
-    max_seq_len: int = MAX_SEQ,
-    hidden_size: int = HIDDEN,
-    num_heads: int = NUM_HEADS,
-    q_lora_rank: int = Q_LORA_RANK,
-    kv_lora_rank: int = KV_LORA_RANK,
-    qk_nope_head_dim: int = QK_NOPE_HEAD_DIM,
-    qk_rope_head_dim: int = QK_ROPE_HEAD_DIM,
-    v_head_dim: int = V_HEAD_DIM,
-    index_heads: int = INDEX_HEADS,
-    index_head_dim: int = INDEX_HEAD_DIM,
-):
-    del v_head_dim
+if INDEX_HEAD_DIM != INT8_GROUP_SIZE:
+    raise ValueError(
+        f"INT8 quant path expects INDEX_HEAD_DIM == {INT8_GROUP_SIZE}, "
+        f"got {INDEX_HEAD_DIM}"
+    )
 
-    BATCH_CFG = batch
-    MAX_SEQ_CFG = max_seq_len
-    HIDDEN_CFG = hidden_size
-    NUM_HEADS_CFG = num_heads
-    Q_LORA_RANK_CFG = q_lora_rank
-    KV_LORA_RANK_CFG = kv_lora_rank
-    QK_NOPE_HEAD_DIM_CFG = qk_nope_head_dim
-    QK_ROPE_HEAD_DIM_CFG = qk_rope_head_dim
-    QK_HEAD_DIM_CFG = qk_nope_head_dim + qk_rope_head_dim
-    KV_A_OUT_CFG = kv_lora_rank + qk_rope_head_dim
-    CACHE_ROWS_CFG = batch * max_seq_len
+RMSNORM_BLOCKS = (HIDDEN + RMSNORM_K - 1) // RMSNORM_K
+PROJ_BLOCKS = (HIDDEN + PROJ_K - 1) // PROJ_K
+QR_BLOCKS = (Q_LORA_RANK + LORA_CHUNK - 1) // LORA_CHUNK
+KV_A_BLOCKS = (KV_A_OUT + KV_OUT_CHUNK - 1) // KV_OUT_CHUNK
 
-    INDEX_HEADS_CFG = index_heads
-    INDEX_HEAD_DIM_CFG = index_head_dim
-    INDEX_Q_OUT_CFG = index_heads * index_head_dim
-    INDEX_HEAD_DIM_INV = 1.0 / index_head_dim
-    WEIGHT_SCALE = (index_heads ** -0.5) * (index_head_dim ** -0.5)
-    if INDEX_HEAD_DIM_CFG != INT8_GROUP_SIZE:
-        raise ValueError(
-            f"INT8 quant path expects index_head_dim == {INT8_GROUP_SIZE}, "
-            f"got {INDEX_HEAD_DIM_CFG}"
-        )
-    INDEX_Q_ROWS_CFG = batch * index_heads
+HIDDEN_BLOCKS = (HIDDEN + K_CHUNK - 1) // K_CHUNK
+IDX_OUT_BLOCKS = (INDEX_Q_OUT + IDX_OUT_CHUNK - 1) // IDX_OUT_CHUNK
+WK_OUT_BLOCKS = (INDEX_HEAD_DIM + IDX_OUT_CHUNK - 1) // IDX_OUT_CHUNK
+WEIGHTS_BLOCKS = (INDEX_HEADS + WEIGHTS_OUT_CHUNK - 1) // WEIGHTS_OUT_CHUNK
 
-    RMSNORM_BLOCKS = (HIDDEN_CFG + RMSNORM_K - 1) // RMSNORM_K
-    PROJ_BLOCKS = (HIDDEN_CFG + PROJ_K - 1) // PROJ_K
-    QR_BLOCKS = (Q_LORA_RANK_CFG + LORA_CHUNK - 1) // LORA_CHUNK
-    KV_A_BLOCKS = (KV_A_OUT_CFG + KV_OUT_CHUNK - 1) // KV_OUT_CHUNK
+Q_LORA_INV = 1.0 / Q_LORA_RANK
+Q_OUT_BLOCKS = (NUM_HEADS * QK_HEAD_DIM + Q_OUT_CHUNK - 1) // Q_OUT_CHUNK
 
-    HIDDEN_BLOCKS = (HIDDEN_CFG + K_CHUNK - 1) // K_CHUNK
-    IDX_OUT_BLOCKS = (INDEX_Q_OUT_CFG + IDX_OUT_CHUNK - 1) // IDX_OUT_CHUNK
-    WK_OUT_BLOCKS = (INDEX_HEAD_DIM_CFG + IDX_OUT_CHUNK - 1) // IDX_OUT_CHUNK
-    WEIGHTS_BLOCKS = (INDEX_HEADS_CFG + WEIGHTS_OUT_CHUNK - 1) // WEIGHTS_OUT_CHUNK
 
-    Q_LORA_INV_CFG = 1.0 / q_lora_rank
-
+def build_deepseek_v3_2_decode_front_scope123_int8_quant_program():
     @pl.program
     class DeepSeekV32DecodeFrontScope123Int8Quant:
         @pl.function(type=pl.FunctionType.Opaque)
         def deepseek_v3_2_decode_front_scope123(
             self,
-            hidden_states: pl.Tensor[[BATCH_CFG, HIDDEN_CFG], pl.BF16],
-            input_rms_weight: pl.Tensor[[1, HIDDEN_CFG], pl.FP32],
-            q_norm_weight: pl.Tensor[[1, Q_LORA_RANK_CFG], pl.FP32],
-            kv_norm_weight: pl.Tensor[[1, KV_LORA_RANK_CFG], pl.FP32],
-            wq_a: pl.Tensor[[HIDDEN_CFG, Q_LORA_RANK_CFG], pl.BF16],
-            wq_b: pl.Tensor[[Q_LORA_RANK_CFG, NUM_HEADS_CFG * QK_HEAD_DIM_CFG], pl.BF16],
-            wkv_a: pl.Tensor[[HIDDEN_CFG, KV_A_OUT_CFG], pl.BF16],
-            seq_lens: pl.Tensor[[BATCH_CFG], pl.INT32],
-            rope_cos: pl.Tensor[[MAX_SEQ_CFG, QK_ROPE_HEAD_DIM_CFG], pl.FP32],
-            rope_sin: pl.Tensor[[MAX_SEQ_CFG, QK_ROPE_HEAD_DIM_CFG], pl.FP32],
-            wq_b_idx: pl.Tensor[[Q_LORA_RANK_CFG, INDEX_Q_OUT_CFG], pl.BF16],
-            wk_idx: pl.Tensor[[HIDDEN_CFG, INDEX_HEAD_DIM_CFG], pl.BF16],
-            weights_proj: pl.Tensor[[HIDDEN_CFG, INDEX_HEADS_CFG], pl.FP32],
-            k_norm_weight: pl.Tensor[[1, INDEX_HEAD_DIM_CFG], pl.FP32],
-            k_norm_bias: pl.Tensor[[1, INDEX_HEAD_DIM_CFG], pl.FP32],
-            q_proj_out: pl.Tensor[[BATCH_CFG, NUM_HEADS_CFG * QK_HEAD_DIM_CFG], pl.BF16],
-            kv_cache: pl.Tensor[[CACHE_ROWS_CFG, KV_LORA_RANK_CFG], pl.BF16],
-            pe_cache: pl.Tensor[[CACHE_ROWS_CFG, QK_ROPE_HEAD_DIM_CFG], pl.BF16],
-            k_cache_idx_i8: pl.Tensor[[CACHE_ROWS_CFG, INDEX_HEAD_DIM_CFG], pl.INT8],
-            k_cache_idx_scale: pl.Tensor[[BATCH_CFG, MAX_SEQ_CFG], pl.FP32],
-            topk_idx_out: pl.Tensor[[BATCH_CFG, INDEX_TOPK], pl.INT32],
-        ) -> pl.Tensor[[BATCH_CFG, INDEX_TOPK], pl.INT32]:
+            hidden_states: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            input_rms_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+            q_norm_weight: pl.Tensor[[1, Q_LORA_RANK], pl.FP32],
+            kv_norm_weight: pl.Tensor[[1, KV_LORA_RANK], pl.FP32],
+            wq_a: pl.Tensor[[HIDDEN, Q_LORA_RANK], pl.BF16],
+            wq_b: pl.Tensor[[Q_LORA_RANK, NUM_HEADS * QK_HEAD_DIM], pl.BF16],
+            wkv_a: pl.Tensor[[HIDDEN, KV_A_OUT], pl.BF16],
+            seq_lens: pl.Tensor[[BATCH], pl.INT32],
+            rope_cos: pl.Tensor[[MAX_SEQ, QK_ROPE_HEAD_DIM], pl.FP32],
+            rope_sin: pl.Tensor[[MAX_SEQ, QK_ROPE_HEAD_DIM], pl.FP32],
+            wq_b_idx: pl.Tensor[[Q_LORA_RANK, INDEX_Q_OUT], pl.BF16],
+            wk_idx: pl.Tensor[[HIDDEN, INDEX_HEAD_DIM], pl.BF16],
+            weights_proj: pl.Tensor[[HIDDEN, INDEX_HEADS], pl.FP32],
+            k_norm_weight: pl.Tensor[[1, INDEX_HEAD_DIM], pl.FP32],
+            k_norm_bias: pl.Tensor[[1, INDEX_HEAD_DIM], pl.FP32],
+            q_proj_out: pl.Tensor[[BATCH, NUM_HEADS * QK_HEAD_DIM], pl.BF16],
+            kv_cache: pl.Tensor[[CACHE_ROWS, KV_LORA_RANK], pl.BF16],
+            pe_cache: pl.Tensor[[CACHE_ROWS, QK_ROPE_HEAD_DIM], pl.BF16],
+            k_cache_idx_i8: pl.Tensor[[CACHE_ROWS, INDEX_HEAD_DIM], pl.INT8],
+            k_cache_idx_scale: pl.Tensor[[BATCH, MAX_SEQ], pl.FP32],
+            topk_idx_out: pl.Tensor[[BATCH, INDEX_TOPK], pl.INT32],
+        ) -> pl.Tensor[[BATCH, INDEX_TOPK], pl.INT32]:
             # ===== scope1: MLA front path (RMSNorm + Q/KV projection + RoPE + cache writeback) =====
             # Intermediates:
             # - qr_out: q_lora latent
-            # - q_nope_out/q_pe_out: split Q head outputs (no-pe / pe parts)
             # - kv_a_out: KV latent output (includes rope part)
-            qr_out = pl.create_tensor([BATCH_CFG, Q_LORA_RANK_CFG], dtype=pl.BF16)
-            q_nope_out = pl.create_tensor([BATCH_CFG, NUM_HEADS_CFG * QK_NOPE_HEAD_DIM_CFG], dtype=pl.BF16)
-            q_pe_out = pl.create_tensor([BATCH_CFG, NUM_HEADS_CFG * QK_ROPE_HEAD_DIM_CFG], dtype=pl.BF16)
-            kv_a_out = pl.create_tensor([BATCH_CFG, KV_A_OUT_CFG], dtype=pl.BF16)
-            for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
-                normed_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.BF16)
-                qr_fp32_tile = pl.create_tensor([BATCH_TILE, Q_LORA_RANK_CFG], dtype=pl.FP32)
-                kv_a_fp32_tile = pl.create_tensor([BATCH_TILE, KV_A_OUT_CFG], dtype=pl.FP32)
+            qr_out = pl.create_tensor([BATCH, Q_LORA_RANK], dtype=pl.BF16)
+            kv_a_out = pl.create_tensor([BATCH, KV_A_OUT], dtype=pl.BF16)
+            for b0 in pl.range(0, BATCH, BATCH_TILE):
+                normed_tile = pl.create_tensor([BATCH_TILE, HIDDEN], dtype=pl.BF16)
+                qr_fp32_tile = pl.create_tensor([BATCH_TILE, Q_LORA_RANK], dtype=pl.FP32)
+                kv_a_fp32_tile = pl.create_tensor([BATCH_TILE, KV_A_OUT], dtype=pl.FP32)
 
-                # Stage 1.1: RMSNorm on hidden_states, then assemble blockwise into normed_tile.
+                # Stage 1.1: RMSNorm on hidden_states.
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="input_rmsnorm"):
                     partial_sq = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
                     for kb in pl.range(RMSNORM_BLOCKS):
@@ -188,7 +160,7 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
                             [0, k0],
                         )
 
-                # Stage 1.2: Project q_a into q_lora latent with FP32 accumulation.
+                # Stage 1.2: Project qr = normed @ wq_a.
                 with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="q_lora_proj"):
                     for ob in pl.parallel(0, QR_BLOCKS, 1, chunk=2):
                         q0 = ob * LORA_CHUNK
@@ -202,7 +174,7 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
                             q_acc = pl.matmul_acc(q_acc, q_tile_a_i, q_tile_b_i)
                         qr_fp32_tile = pl.assemble(qr_fp32_tile, q_acc, [0, q0])
 
-                # Stage 1.3: Apply q_norm on q_lora latent to produce qr_out.
+                # Stage 1.3: Apply q_norm on qr.
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_lora_rmsnorm"):
                     q_partial_sq = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
                     for kb in pl.range(QR_BLOCKS):
@@ -214,7 +186,7 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
                         )
 
                     q_variance = pl.reshape(
-                        pl.add(pl.mul(q_partial_sq, Q_LORA_INV_CFG), EPS),
+                        pl.add(pl.mul(q_partial_sq, Q_LORA_INV), EPS),
                         [BATCH_TILE, 1],
                     )
                     q_inv_rms = pl.recip(pl.sqrt(q_variance))
@@ -228,82 +200,21 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
                         qr_chunk_fp32 = pl.cast(qr_chunk_bf16, target_type=pl.FP32)
                         q_gamma = pl.slice(q_norm_weight, [1, LORA_CHUNK], [0, k0])
                         q_normed = pl.col_expand_mul(pl.row_expand_mul(qr_chunk_fp32, q_inv_rms), q_gamma)
-                        q_normed_bf16 = pl.cast(q_normed, target_type=pl.BF16)
-                        qr_out = pl.assemble(qr_out, q_normed_bf16, [b0, k0])
+                        qr_out = pl.assemble(qr_out, pl.cast(q_normed, target_type=pl.BF16), [b0, k0])
 
-                # Stage 1.4: Project qr_out -> q_nope (no-pe slice for each head).
-                for h in pl.parallel(0, NUM_HEADS_CFG, 1):
-                    for q_loop in pl.parallel(0, QK_NOPE_HEAD_DIM_CFG, Q_OUT_CHUNK):
-                        # Stage 1.4a: Accumulate one q_nope head chunk in an InCore matmul loop.
-                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_nope_proj"):
-                            q_base = h * QK_HEAD_DIM_CFG
-                            q0 = q_base + q_loop
-                            q_out_acc = pl.full([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-                            for kb in pl.range(QR_BLOCKS):
-                                k0 = kb * LORA_CHUNK
-                                q_chunk = pl.slice(qr_out, [BATCH_TILE, LORA_CHUNK], [b0, k0])
-                                wq_b_chunk = pl.slice(wq_b, [LORA_CHUNK, Q_OUT_CHUNK], [k0, q0])
-                                q_out_acc = pl.add(q_out_acc, pl.matmul(q_chunk, wq_b_chunk))
-                            q_nope_chunk = pl.cast(q_out_acc, target_type=pl.BF16)
-                        q_nope_out = pl.assemble(q_nope_out, q_nope_chunk, [b0, h * QK_NOPE_HEAD_DIM_CFG + q_loop])
-
-                # Stage 1.5: Project qr_out -> q_pe (pe slice for each head, before RoPE).
-                for h in pl.parallel(0, NUM_HEADS_CFG, 1):
-                    # Stage 1.5a: Accumulate one q_pe head chunk before RoPE.
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_pe_proj"):
-                        q_base = h * QK_HEAD_DIM_CFG
-                        q_pe_acc = pl.full([BATCH_TILE, QK_ROPE_HEAD_DIM_CFG], dtype=pl.FP32, value=0.0)
-                        q_pe_col = q_base + QK_NOPE_HEAD_DIM_CFG
+                # Stage 1.4: Project q_proj = qr @ wq_b.
+                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="q_head_proj"):
+                    for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=8):
+                        q0 = ob * Q_OUT_CHUNK
+                        q_out_acc = pl.full([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
                         for kb in pl.range(QR_BLOCKS):
                             k0 = kb * LORA_CHUNK
                             q_chunk = pl.slice(qr_out, [BATCH_TILE, LORA_CHUNK], [b0, k0])
-                            wq_b_chunk = pl.slice(wq_b, [LORA_CHUNK, QK_ROPE_HEAD_DIM_CFG], [k0, q_pe_col])
-                            q_pe_acc = pl.add(q_pe_acc, pl.matmul(q_chunk, wq_b_chunk))
-                        q_pe_raw = pl.cast(q_pe_acc, target_type=pl.BF16)
-                    q_pe_out = pl.assemble(q_pe_out, q_pe_raw, [b0, h * QK_ROPE_HEAD_DIM_CFG])
+                            wq_b_chunk = pl.slice(wq_b, [LORA_CHUNK, Q_OUT_CHUNK], [k0, q0])
+                            q_out_acc = pl.add(q_out_acc, pl.matmul(q_chunk, wq_b_chunk))
+                        q_proj_out = pl.assemble(q_proj_out, pl.cast(q_out_acc, target_type=pl.BF16), [b0, q0])
 
-                # Stage 1.6: Apply RoPE on q_pe using scope1's per-row update pattern.
-                for h in pl.parallel(0, NUM_HEADS_CFG, 1):
-                    # Stage 1.6a: Rotate one q_pe head across the batch tile.
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_pe_rope"):
-                        q_pe_col = h * QK_ROPE_HEAD_DIM_CFG
-                        for b in pl.range(BATCH_TILE):
-                            ctx_len = pl.read(seq_lens, [b0 + b])
-                            pos = ctx_len - 1
-                            cos_lo = pl.slice(rope_cos, [1, QK_ROPE_HEAD_DIM_CFG // 2], [pos, 0])
-                            cos_hi = pl.slice(
-                                rope_cos,
-                                [1, QK_ROPE_HEAD_DIM_CFG // 2],
-                                [pos, QK_ROPE_HEAD_DIM_CFG // 2],
-                            )
-                            sin_lo = pl.slice(rope_sin, [1, QK_ROPE_HEAD_DIM_CFG // 2], [pos, 0])
-                            sin_hi = pl.slice(
-                                rope_sin,
-                                [1, QK_ROPE_HEAD_DIM_CFG // 2],
-                                [pos, QK_ROPE_HEAD_DIM_CFG // 2],
-                            )
-                            q_lo = pl.cast(
-                                pl.slice(q_pe_out, [1, QK_ROPE_HEAD_DIM_CFG // 2], [b0 + b, q_pe_col]),
-                                target_type=pl.FP32,
-                            )
-                            q_hi = pl.cast(
-                                pl.slice(
-                                    q_pe_out,
-                                    [1, QK_ROPE_HEAD_DIM_CFG // 2],
-                                    [b0 + b, q_pe_col + QK_ROPE_HEAD_DIM_CFG // 2],
-                                ),
-                                target_type=pl.FP32,
-                            )
-                            q_rot_lo = pl.sub(pl.col_expand_mul(q_lo, cos_lo), pl.col_expand_mul(q_hi, sin_lo))
-                            q_rot_hi = pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi))
-                            q_pe_out = pl.assemble(q_pe_out, pl.cast(q_rot_lo, target_type=pl.BF16), [b0 + b, q_pe_col])
-                            q_pe_out = pl.assemble(
-                                q_pe_out,
-                                pl.cast(q_rot_hi, target_type=pl.BF16),
-                                [b0 + b, q_pe_col + QK_ROPE_HEAD_DIM_CFG // 2],
-                            )
-
-                # Stage 1.7: Project normed_tile -> kv_a_out (KV latent), FP32 accumulate then cast to BF16.
+                # Stage 1.5: Project kv_a = normed @ wkv_a.
                 with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="kv_a_proj"):
                     for ob in pl.parallel(0, KV_A_BLOCKS, 1, chunk=4):
                         kv0 = ob * KV_OUT_CHUNK
@@ -317,7 +228,7 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
                             kv_acc = pl.matmul_acc(kv_acc, kv_tile_a_i, kv_tile_b_i)
                         kv_a_fp32_tile = pl.assemble(kv_a_fp32_tile, kv_acc, [0, kv0])
 
-                # Stage 1.8: Blockwise cast/write for kv_a_out.
+                # Stage 1.6: Final KV output cast.
                 with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="kv_a_write"):
                     for ob in pl.parallel(0, KV_A_BLOCKS, 1, chunk=8):
                         kv0 = ob * KV_OUT_CHUNK
@@ -327,70 +238,81 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
                         )
                         kv_a_out = pl.assemble(kv_a_out, kv_chunk, [b0, kv0])
 
-            # Compose scope4-facing q projection from split q_nope/q_pe blocks.
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="q_proj_compose"):
-                for b0 in pl.parallel(0, BATCH_CFG, BATCH_TILE, chunk=1):
-                    for h in pl.range(NUM_HEADS_CFG):
-                        q_nope_row = pl.slice(
-                            q_nope_out,
-                            [BATCH_TILE, QK_NOPE_HEAD_DIM_CFG],
-                            [b0, h * QK_NOPE_HEAD_DIM_CFG],
+            # Stage 1.7: Apply RoPE on q_proj_out in-place.
+            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="q_rope"):
+                for b in pl.parallel(0, BATCH, 1, chunk=4):
+                    ctx_len = pl.read(seq_lens, [b])
+                    pos = ctx_len - 1
+                    cos_lo = pl.slice(rope_cos, [1, QK_ROPE_HEAD_DIM // 2], [pos, 0])
+                    cos_hi = pl.slice(rope_cos, [1, QK_ROPE_HEAD_DIM // 2], [pos, QK_ROPE_HEAD_DIM // 2])
+                    sin_lo = pl.slice(rope_sin, [1, QK_ROPE_HEAD_DIM // 2], [pos, 0])
+                    sin_hi = pl.slice(rope_sin, [1, QK_ROPE_HEAD_DIM // 2], [pos, QK_ROPE_HEAD_DIM // 2])
+
+                    for h in pl.range(NUM_HEADS):
+                        q_col = h * QK_HEAD_DIM + QK_NOPE_HEAD_DIM
+                        q_lo = pl.cast(
+                            pl.slice(q_proj_out, [1, QK_ROPE_HEAD_DIM // 2], [b, q_col]),
+                            target_type=pl.FP32,
                         )
-                        q_pe_row = pl.slice(
-                            q_pe_out,
-                            [BATCH_TILE, QK_ROPE_HEAD_DIM_CFG],
-                            [b0, h * QK_ROPE_HEAD_DIM_CFG],
+                        q_hi = pl.cast(
+                            pl.slice(
+                                q_proj_out,
+                                [1, QK_ROPE_HEAD_DIM // 2],
+                                [b, q_col + QK_ROPE_HEAD_DIM // 2],
+                            ),
+                            target_type=pl.FP32,
                         )
-                        q_proj_out = pl.assemble(q_proj_out, q_nope_row, [b0, h * QK_HEAD_DIM_CFG])
+                        q_rot_lo = pl.sub(pl.col_expand_mul(q_lo, cos_lo), pl.col_expand_mul(q_hi, sin_lo))
+                        q_rot_hi = pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi))
+                        q_proj_out = pl.assemble(q_proj_out, pl.cast(q_rot_lo, target_type=pl.BF16), [b, q_col])
                         q_proj_out = pl.assemble(
                             q_proj_out,
-                            q_pe_row,
-                            [b0, h * QK_HEAD_DIM_CFG + QK_NOPE_HEAD_DIM_CFG],
+                            pl.cast(q_rot_hi, target_type=pl.BF16),
+                            [b, q_col + QK_ROPE_HEAD_DIM // 2],
                         )
 
-            # Stage 1.9: Apply kv_norm on the first KV_LORA_RANK channels of KV latent.
-            kv_normed_out = pl.create_tensor([BATCH_CFG, KV_LORA_RANK_CFG], dtype=pl.BF16)
-            # Stage 1.9a: Normalize the KV latent rows with RMSNorm in one InCore block.
+            # Stage 1.8: Apply kv_norm on KV latent.
+            kv_normed_out = pl.create_tensor([BATCH, KV_LORA_RANK], dtype=pl.BF16)
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_rmsnorm"):
-                kv_rows = pl.cast(pl.slice(kv_a_out, [BATCH_CFG, KV_LORA_RANK_CFG], [0, 0]), target_type=pl.FP32)
-                kv_partial_sq = pl.reshape(pl.row_sum(pl.mul(kv_rows, kv_rows)), [1, BATCH_CFG])
+                kv_rows = pl.cast(pl.slice(kv_a_out, [BATCH, KV_LORA_RANK], [0, 0]), target_type=pl.FP32)
+                kv_partial_sq = pl.reshape(pl.row_sum(pl.mul(kv_rows, kv_rows)), [1, BATCH])
                 kv_variance = pl.reshape(
-                    pl.add(pl.mul(kv_partial_sq, 1.0 / KV_LORA_RANK_CFG), EPS),
-                    [BATCH_CFG, 1],
+                    pl.add(pl.mul(kv_partial_sq, 1.0 / KV_LORA_RANK), EPS),
+                    [BATCH, 1],
                 )
                 kv_inv_rms = pl.recip(pl.sqrt(kv_variance))
-                kv_gamma = pl.slice(kv_norm_weight, [1, KV_LORA_RANK_CFG], [0, 0])
+                kv_gamma = pl.slice(kv_norm_weight, [1, KV_LORA_RANK], [0, 0])
                 kv_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rows, kv_inv_rms), kv_gamma)
                 kv_normed_out = pl.assemble(kv_normed_out, pl.cast(kv_normed, target_type=pl.BF16), [0, 0])
 
-            # Stage 1.10: Write decode caches.
+            # Stage 1.9: Write decode caches.
             # - kv_cache: normalized KV latent
             # - pe_cache: rope component from kv_a_out after RoPE
             with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="decode_cache_write"):
-                for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
+                for b in pl.parallel(0, BATCH, 1, chunk=4):
                     ctx_len = pl.read(seq_lens, [b])
                     pos = ctx_len - 1
-                    cache_row = b * MAX_SEQ_CFG + pos
+                    cache_row = b * MAX_SEQ + pos
 
-                    cos_lo = pl.slice(rope_cos, [1, QK_ROPE_HEAD_DIM_CFG // 2], [pos, 0])
-                    cos_hi = pl.slice(rope_cos, [1, QK_ROPE_HEAD_DIM_CFG // 2], [pos, QK_ROPE_HEAD_DIM_CFG // 2])
-                    sin_lo = pl.slice(rope_sin, [1, QK_ROPE_HEAD_DIM_CFG // 2], [pos, 0])
+                    cos_lo = pl.slice(rope_cos, [1, QK_ROPE_HEAD_DIM // 2], [pos, 0])
+                    cos_hi = pl.slice(rope_cos, [1, QK_ROPE_HEAD_DIM // 2], [pos, QK_ROPE_HEAD_DIM // 2])
+                    sin_lo = pl.slice(rope_sin, [1, QK_ROPE_HEAD_DIM // 2], [pos, 0])
                     sin_hi = pl.slice(
                         rope_sin,
-                        [1, QK_ROPE_HEAD_DIM_CFG // 2],
-                        [pos, QK_ROPE_HEAD_DIM_CFG // 2],
+                        [1, QK_ROPE_HEAD_DIM // 2],
+                        [pos, QK_ROPE_HEAD_DIM // 2],
                     )
-                    kv_normed_row = pl.slice(kv_normed_out, [1, KV_LORA_RANK_CFG], [b, 0])
+                    kv_normed_row = pl.slice(kv_normed_out, [1, KV_LORA_RANK], [b, 0])
 
                     pe_lo = pl.cast(
-                        pl.slice(kv_a_out, [1, QK_ROPE_HEAD_DIM_CFG // 2], [b, KV_LORA_RANK_CFG]),
+                        pl.slice(kv_a_out, [1, QK_ROPE_HEAD_DIM // 2], [b, KV_LORA_RANK]),
                         target_type=pl.FP32,
                     )
                     pe_hi = pl.cast(
                         pl.slice(
                             kv_a_out,
-                            [1, QK_ROPE_HEAD_DIM_CFG // 2],
-                            [b, KV_LORA_RANK_CFG + QK_ROPE_HEAD_DIM_CFG // 2],
+                            [1, QK_ROPE_HEAD_DIM // 2],
+                            [b, KV_LORA_RANK + QK_ROPE_HEAD_DIM // 2],
                         ),
                         target_type=pl.FP32,
                     )
@@ -403,24 +325,24 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
                     pe_cache = pl.assemble(
                         pe_cache,
                         pl.cast(pe_rot_hi, target_type=pl.BF16),
-                        [cache_row, QK_ROPE_HEAD_DIM_CFG // 2],
+                        [cache_row, QK_ROPE_HEAD_DIM // 2],
                     )
 
             # ===== scope2: indexer path (prepare q_idx/k_cache_idx) =====
             # Outputs:
             # - k_cache_idx_i8: INT8 index key cache row for current decode token
-            q_idx_full = pl.create_tensor([BATCH_CFG, INDEX_Q_OUT_CFG], dtype=pl.BF16)
-            k_idx = pl.create_tensor([BATCH_CFG, INDEX_HEAD_DIM_CFG], dtype=pl.BF16)
-            q_idx_full_i8 = pl.create_tensor([INDEX_Q_ROWS_CFG, INDEX_HEAD_DIM_CFG], dtype=pl.INT8)
-            k_idx_i8 = pl.create_tensor([BATCH_CFG, INDEX_HEAD_DIM_CFG], dtype=pl.INT8)
-            k_idx_scale = pl.create_tensor([BATCH_CFG, INT8_SCALE_PACK], dtype=pl.FP32)
-            weights = pl.create_tensor([BATCH_CFG, INDEX_HEADS_CFG], dtype=pl.FP32)
-            q_idx_scale_heads = pl.create_tensor([BATCH_CFG, INDEX_HEADS_CFG], dtype=pl.FP32)
+            q_idx_full = pl.create_tensor([BATCH, INDEX_Q_OUT], dtype=pl.BF16)
+            k_idx = pl.create_tensor([BATCH, INDEX_HEAD_DIM], dtype=pl.BF16)
+            q_idx_full_i8 = pl.create_tensor([INDEX_Q_ROWS, INDEX_HEAD_DIM], dtype=pl.INT8)
+            k_idx_i8 = pl.create_tensor([BATCH, INDEX_HEAD_DIM], dtype=pl.INT8)
+            k_idx_scale = pl.create_tensor([BATCH, INT8_SCALE_PACK], dtype=pl.FP32)
+            weights = pl.create_tensor([BATCH, INDEX_HEADS], dtype=pl.FP32)
+            q_idx_scale_heads = pl.create_tensor([BATCH, INDEX_HEADS], dtype=pl.FP32)
 
             # Stage 2.1: q_idx_full = wq_b_idx(qr_out).
             with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="s2_q_idx_proj"):
-                for b0 in pl.parallel(0, BATCH_CFG, BATCH_TILE, chunk=1):
-                    for ob in pl.parallel(0, IDX_OUT_BLOCKS, 1, chunk=8):
+                for b0 in pl.parallel(0, BATCH, BATCH_TILE, chunk=1):
+                    for ob in pl.range(0, IDX_OUT_BLOCKS, 1):
                         q0 = ob * IDX_OUT_CHUNK
                         s2_q_acc = pl.full([BATCH_TILE, IDX_OUT_CHUNK], dtype=pl.FP32, value=0.0)
                         for kb in pl.range(QR_BLOCKS):
@@ -432,8 +354,8 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
 
             # Stage 2.2: k_idx = wk_idx(hidden_states).
             with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="s2_k_idx_proj"):
-                for b0 in pl.parallel(0, BATCH_CFG, BATCH_TILE, chunk=1):
-                    for ob in pl.parallel(0, WK_OUT_BLOCKS, 1, chunk=1):
+                for b0 in pl.parallel(0, BATCH, BATCH_TILE, chunk=1):
+                    for ob in pl.range(0, WK_OUT_BLOCKS, 1):
                         k1 = ob * IDX_OUT_CHUNK
                         s2_k_acc = pl.full([BATCH_TILE, IDX_OUT_CHUNK], dtype=pl.FP32, value=0.0)
                         for kb in pl.range(HIDDEN_BLOCKS):
@@ -445,9 +367,9 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
 
             # Stage 2.3: Apply LayerNorm on k_idx (gamma/beta from k_norm_affine).
             with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="s2_k_idx_layernorm"):
-                for b0 in pl.parallel(0, BATCH_CFG, BATCH_TILE, chunk=1):
+                for b0 in pl.parallel(0, BATCH, BATCH_TILE, chunk=1):
                     s2_k_tile = pl.cast(
-                        pl.slice(k_idx, [BATCH_TILE, INDEX_HEAD_DIM_CFG], [b0, 0]),
+                        pl.slice(k_idx, [BATCH_TILE, INDEX_HEAD_DIM], [b0, 0]),
                         target_type=pl.FP32,
                     )
                     s2_mean = pl.row_sum(pl.mul(s2_k_tile, INDEX_HEAD_DIM_INV))
@@ -456,8 +378,8 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
                     s2_std = pl.reshape(pl.sqrt(pl.reshape(s2_var_eps, [1, BATCH_TILE])), [BATCH_TILE, 1])
                     s2_inv_std = pl.recip(s2_std)
                     s2_normed = pl.row_expand_mul(s2_centered, s2_inv_std)
-                    s2_gamma = pl.slice(k_norm_weight, [1, INDEX_HEAD_DIM_CFG], [0, 0])
-                    s2_beta = pl.slice(k_norm_bias, [1, INDEX_HEAD_DIM_CFG], [0, 0])
+                    s2_gamma = pl.slice(k_norm_weight, [1, INDEX_HEAD_DIM], [0, 0])
+                    s2_beta = pl.slice(k_norm_bias, [1, INDEX_HEAD_DIM], [0, 0])
                     s2_scaled = pl.col_expand_mul(s2_normed, s2_gamma)
                     s2_ones = pl.add(pl.sub(s2_k_tile, s2_k_tile), 1.0)
                     s2_k_normed = pl.add(s2_scaled, pl.col_expand_mul(s2_ones, s2_beta))
@@ -465,28 +387,28 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
 
             # Stage 2.4: Apply RoPE on rope dimensions of q_idx_full and k_idx.
             with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="s2_idx_rope"):
-                for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
+                for b in pl.parallel(0, BATCH, 1, chunk=4):
                     pos = pl.read(seq_lens, [b]) - 1
-                    cos_lo = pl.slice(rope_cos, [1, QK_ROPE_HEAD_DIM_CFG // 2], [pos, 0])
-                    cos_hi = pl.slice(rope_cos, [1, QK_ROPE_HEAD_DIM_CFG // 2], [pos, QK_ROPE_HEAD_DIM_CFG // 2])
-                    sin_lo = pl.slice(rope_sin, [1, QK_ROPE_HEAD_DIM_CFG // 2], [pos, 0])
+                    cos_lo = pl.slice(rope_cos, [1, QK_ROPE_HEAD_DIM // 2], [pos, 0])
+                    cos_hi = pl.slice(rope_cos, [1, QK_ROPE_HEAD_DIM // 2], [pos, QK_ROPE_HEAD_DIM // 2])
+                    sin_lo = pl.slice(rope_sin, [1, QK_ROPE_HEAD_DIM // 2], [pos, 0])
                     sin_hi = pl.slice(
                         rope_sin,
-                        [1, QK_ROPE_HEAD_DIM_CFG // 2],
-                        [pos, QK_ROPE_HEAD_DIM_CFG // 2],
+                        [1, QK_ROPE_HEAD_DIM // 2],
+                        [pos, QK_ROPE_HEAD_DIM // 2],
                     )
 
-                    for h in pl.range(INDEX_HEADS_CFG):
-                        q_col = h * INDEX_HEAD_DIM_CFG
+                    for h in pl.range(INDEX_HEADS):
+                        q_col = h * INDEX_HEAD_DIM
                         s2_q_lo = pl.cast(
-                            pl.slice(q_idx_full, [1, QK_ROPE_HEAD_DIM_CFG // 2], [b, q_col]),
+                            pl.slice(q_idx_full, [1, QK_ROPE_HEAD_DIM // 2], [b, q_col]),
                             target_type=pl.FP32,
                         )
                         s2_q_hi = pl.cast(
                             pl.slice(
                                 q_idx_full,
-                                [1, QK_ROPE_HEAD_DIM_CFG // 2],
-                                [b, q_col + QK_ROPE_HEAD_DIM_CFG // 2],
+                                [1, QK_ROPE_HEAD_DIM // 2],
+                                [b, q_col + QK_ROPE_HEAD_DIM // 2],
                             ),
                             target_type=pl.FP32,
                         )
@@ -496,12 +418,12 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
                         q_idx_full = pl.assemble(
                             q_idx_full,
                             pl.cast(s2_q_rot_hi, target_type=pl.BF16),
-                            [b, q_col + QK_ROPE_HEAD_DIM_CFG // 2],
+                            [b, q_col + QK_ROPE_HEAD_DIM // 2],
                         )
 
-                    s2_k_lo = pl.cast(pl.slice(k_idx, [1, QK_ROPE_HEAD_DIM_CFG // 2], [b, 0]), target_type=pl.FP32)
+                    s2_k_lo = pl.cast(pl.slice(k_idx, [1, QK_ROPE_HEAD_DIM // 2], [b, 0]), target_type=pl.FP32)
                     s2_k_hi = pl.cast(
-                        pl.slice(k_idx, [1, QK_ROPE_HEAD_DIM_CFG // 2], [b, QK_ROPE_HEAD_DIM_CFG // 2]),
+                        pl.slice(k_idx, [1, QK_ROPE_HEAD_DIM // 2], [b, QK_ROPE_HEAD_DIM // 2]),
                         target_type=pl.FP32,
                     )
                     s2_k_rot_lo = pl.sub(pl.col_expand_mul(s2_k_lo, cos_lo), pl.col_expand_mul(s2_k_hi, sin_lo))
@@ -510,15 +432,15 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
                     k_idx = pl.assemble(
                         k_idx,
                         pl.cast(s2_k_rot_hi, target_type=pl.BF16),
-                        [b, QK_ROPE_HEAD_DIM_CFG // 2],
+                        [b, QK_ROPE_HEAD_DIM // 2],
                     )
 
             # Stage 2.5: TODO: Apply Hadamard transform.
 
             # Stage 2.5b: weights = weights_proj(hidden_states) * n_heads^-0.5 * head_dim^-0.5.
             with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="s2_weights_proj"):
-                for b0 in pl.parallel(0, BATCH_CFG, BATCH_TILE, chunk=1):
-                    for ob in pl.parallel(0, WEIGHTS_BLOCKS, 1, chunk=1):
+                for b0 in pl.parallel(0, BATCH, BATCH_TILE, chunk=1):
+                    for ob in pl.range(0, WEIGHTS_BLOCKS, 1):
                         w0 = ob * WEIGHTS_OUT_CHUNK
                         s2_w_acc = pl.full([BATCH_TILE, WEIGHTS_OUT_CHUNK], dtype=pl.FP32, value=0.0)
                         for kb in pl.range(HIDDEN_BLOCKS):
@@ -533,12 +455,12 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
 
             # Stage 2.6: Quantize indexer q/k tensors and keep INT8 outputs for later stages.
             with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="s2_int8_quant"):
-                q_idx_grouped = pl.reshape(q_idx_full, [INDEX_Q_ROWS_CFG, INDEX_HEAD_DIM_CFG])
-                for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
-                    for h0 in pl.range(0, INDEX_HEADS_CFG, BATCH_TILE):
-                        r0 = b * INDEX_HEADS_CFG + h0
+                q_idx_grouped = pl.reshape(q_idx_full, [INDEX_Q_ROWS, INDEX_HEAD_DIM])
+                for b in pl.parallel(0, BATCH, 1, chunk=4):
+                    for h0 in pl.range(0, INDEX_HEADS, BATCH_TILE):
+                        r0 = b * INDEX_HEADS + h0
                         s2_q_block = pl.cast(
-                            pl.slice(q_idx_grouped, [BATCH_TILE, INDEX_HEAD_DIM_CFG], [r0, 0]),
+                            pl.slice(q_idx_grouped, [BATCH_TILE, INDEX_HEAD_DIM], [r0, 0]),
                             target_type=pl.FP32,
                             mode="none",
                         )
@@ -564,9 +486,9 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
                         q_idx_full_i8 = pl.assemble(q_idx_full_i8, s2_q_i8, [r0, 0])
                         q_idx_scale_heads = pl.assemble(q_idx_scale_heads, s2_q_scale_dequant_row, [b, h0])
 
-                for r0 in pl.parallel(0, BATCH_CFG, BATCH_TILE, chunk=1):
+                for r0 in pl.parallel(0, BATCH, BATCH_TILE, chunk=1):
                     s2_k_block = pl.cast(
-                        pl.slice(k_idx, [BATCH_TILE, INDEX_HEAD_DIM_CFG], [r0, 0]),
+                        pl.slice(k_idx, [BATCH_TILE, INDEX_HEAD_DIM], [r0, 0]),
                         target_type=pl.FP32,
                         mode="none",
                     )
@@ -596,100 +518,88 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
                     k_idx_scale = pl.assemble(k_idx_scale, s2_k_scale_pack, [r0, 0])
 
             # Stage 2.8: Write current-token k_idx into INT8 cache form.
-            k_idx_scale_flat = pl.reshape(k_idx_scale, [BATCH_CFG * INT8_SCALE_PACK])
-            k_cache_idx_scale_flat = pl.reshape(k_cache_idx_scale, [BATCH_CFG * MAX_SEQ_CFG])
+            k_idx_scale_flat = pl.reshape(k_idx_scale, [BATCH * INT8_SCALE_PACK])
+            k_cache_idx_scale_flat = pl.reshape(k_cache_idx_scale, [BATCH * MAX_SEQ])
             with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="s2_k_idx_cache_write"):
-                for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
+                for b in pl.parallel(0, BATCH, 1, chunk=4):
                     pos = pl.read(seq_lens, [b]) - 1
-                    cache_row = b * MAX_SEQ_CFG + pos
-                    s2_k_row_i8 = pl.slice(k_idx_i8, [1, INDEX_HEAD_DIM_CFG], [b, 0])
+                    cache_row = b * MAX_SEQ + pos
+                    s2_k_row_i8 = pl.slice(k_idx_i8, [1, INDEX_HEAD_DIM], [b, 0])
                     s2_k_row_scale = pl.read(k_idx_scale_flat, [b * INT8_SCALE_PACK])
                     k_cache_idx_i8 = pl.assemble(k_cache_idx_i8, s2_k_row_i8, [cache_row, 0])
                     pl.write(
                         k_cache_idx_scale_flat,
-                        [b * MAX_SEQ_CFG + pos],
+                        [b * MAX_SEQ + pos],
                         s2_k_row_scale,
                     )
 
             # ===== scope3: index score + topk =====
             # Inputs: q_idx_full_i8, k_cache_idx_i8
             # Output: topk_idx_out (top-k positions per batch)
-            topk_vals_out = pl.create_tensor([BATCH_CFG, INDEX_TOPK], dtype=pl.FP32)
-            scores_out = pl.create_tensor([BATCH_CFG, SORT_LEN], dtype=pl.FP32)
-            s3_raw_idx_gm = pl.create_tensor([BATCH_CFG, INDEX_TOPK], dtype=pl.INT32)
-            s3_q_i8_padded = pl.create_tensor([BATCH_CFG * INDEX_HEADS_CFG * Q_PAD, INDEX_HEAD_DIM_CFG], dtype=pl.INT8)
-            s3_q_s_padded = pl.create_tensor([BATCH_CFG * Q_PAD, INDEX_HEADS_CFG], dtype=pl.FP32)
+            topk_vals_out = pl.create_tensor([BATCH, INDEX_TOPK], dtype=pl.FP32)
+            scores_out = pl.create_tensor([BATCH, SORT_LEN], dtype=pl.FP32)
+            s3_q_i8_padded = pl.create_tensor([BATCH * INDEX_HEADS * Q_PAD, INDEX_HEAD_DIM], dtype=pl.INT8)
+            s3_q_s_padded = pl.create_tensor([BATCH * Q_PAD, INDEX_HEADS], dtype=pl.FP32)
 
-            # Stage 3.0: Pad q_idx_full_i8 to Q_PAD rows per (batch, head) for INT8 qk validation.
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="s3_q_pad_init"):
-                for b in pl.parallel(BATCH_CFG):
-                    for h in pl.parallel(INDEX_HEADS_CFG):
-                        q_row0 = b * INDEX_HEADS_CFG + h
-                        s3_q_i8_valid = pl.slice(
-                            q_idx_full_i8,
-                            [1, INDEX_HEAD_DIM_CFG],
-                            [q_row0, 0],
-                        )
+            # Stage 3.0: Pad q_idx_full_i8 and pre-fill scores_out.
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="s3_init"):
+                for b in pl.range(BATCH):
+                    for h in pl.range(INDEX_HEADS):
+                        q_row0 = b * INDEX_HEADS + h
+                        s3_q_i8_valid = pl.slice(q_idx_full_i8, [1, INDEX_HEAD_DIM], [q_row0, 0])
                         s3_q_i8_padded = pl.assemble(s3_q_i8_padded, s3_q_i8_valid, [q_row0 * Q_PAD, 0])
                         s3_q_i8_zero_pad = pl.cast(
-                            pl.full([Q_PAD - Q_VALID, INDEX_HEAD_DIM_CFG], dtype=pl.INT16, value=0),
+                            pl.full([Q_PAD - Q_VALID, INDEX_HEAD_DIM], dtype=pl.INT16, value=0),
                             target_type=pl.INT8,
                         )
-                        s3_q_i8_padded = pl.assemble(
-                            s3_q_i8_padded,
-                            s3_q_i8_zero_pad,
-                            [q_row0 * Q_PAD + Q_VALID, 0],
-                        )
+                        s3_q_i8_padded = pl.assemble(s3_q_i8_padded, s3_q_i8_zero_pad, [q_row0 * Q_PAD + Q_VALID, 0])
 
-                for b in pl.parallel(BATCH_CFG):
                     s3_neg_inf_row = pl.full([1, SORT_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
                     scores_out = pl.assemble(scores_out, s3_neg_inf_row, [b, 0])
-                    s3_weights_row = pl.slice(weights, [1, INDEX_HEADS_CFG], [b, 0])
-                    s3_q_scales_row = pl.slice(q_idx_scale_heads, [1, INDEX_HEADS_CFG], [b, 0])
+                    s3_weights_row = pl.slice(weights, [1, INDEX_HEADS], [b, 0])
+                    s3_q_scales_row = pl.slice(q_idx_scale_heads, [1, INDEX_HEADS], [b, 0])
                     s3_q_s_row = pl.mul(s3_weights_row, s3_q_scales_row)
                     s3_q_s_padded = pl.assemble(s3_q_s_padded, s3_q_s_row, [b * Q_PAD, 0])
                     s3_q_s_padded = pl.assemble(
                         s3_q_s_padded,
-                        pl.full([Q_PAD - Q_VALID, INDEX_HEADS_CFG], dtype=pl.FP32, value=0.0),
+                        pl.full([Q_PAD - Q_VALID, INDEX_HEADS], dtype=pl.FP32, value=0.0),
                         [b * Q_PAD + Q_VALID, 0],
                     )
-            s3_sorted_gm = pl.create_tensor([BATCH_CFG, 2 * SORT_LEN], dtype=pl.FP32)
+
             s3_all_scores_i8 = pl.create_tensor(
-                [BATCH_CFG * MAX_SEQ_BLOCKS * INDEX_HEADS * Q_PAD, SEQ_TILE],
+                [BATCH * MAX_SEQ_BLOCKS * INDEX_HEADS * Q_PAD, SEQ_TILE],
                 dtype=pl.INT32,
             )
             s3_relu_rows = pl.create_tensor(
-                [BATCH_CFG * MAX_SEQ_BLOCKS * INDEX_HEADS, SEQ_TILE],
+                [BATCH * MAX_SEQ_BLOCKS * INDEX_HEADS, SEQ_TILE],
                 dtype=pl.FP32,
             )
             s3_weighted_scores = pl.create_tensor(
-                [BATCH_CFG * MAX_SEQ_BLOCKS * Q_PAD, SEQ_TILE],
+                [BATCH * MAX_SEQ_BLOCKS * Q_PAD, SEQ_TILE],
                 dtype=pl.FP32,
             )
-            s3_score_tiles = pl.create_tensor([BATCH_CFG * MAX_SEQ_BLOCKS, SEQ_TILE], dtype=pl.FP32)
+            s3_score_tiles = pl.create_tensor([BATCH * MAX_SEQ_BLOCKS, SEQ_TILE], dtype=pl.FP32)
 
-            # Stage 3.3i8: Compute tiled INT8 qk logits between q_idx_full_i8 and k_cache_idx_i8.
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="s3_int8_qk_matmul"):
-                for b in pl.parallel(0, BATCH_CFG, 1):
-                    s3_ctx_len = pl.read(seq_lens, [b])
-                    s3_ctx_blocks = (s3_ctx_len + SEQ_TILE - 1) // SEQ_TILE
-                    for sb in pl.parallel(s3_ctx_blocks, chunk=MAX_SEQ_BLOCKS):
+            for b in pl.parallel(0, BATCH, 1):
+                s3_ctx_len = pl.read(seq_lens, [b])
+                s3_ctx_blocks = (s3_ctx_len + SEQ_TILE - 1) // SEQ_TILE
+
+                # Stage 3.1: Compute tiled INT8 qk logits.
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="s3_int8_qk_matmul"):
+                    for sb in pl.range(s3_ctx_blocks):
                         s0 = sb * SEQ_TILE
-                        cache_row0 = b * MAX_SEQ_CFG + s0
-                        s3_k_tile_i8 = pl.slice(k_cache_idx_i8, [SEQ_TILE, INDEX_HEAD_DIM_CFG], [cache_row0, 0])
+                        cache_row0 = b * MAX_SEQ + s0
+                        s3_k_tile_i8 = pl.slice(k_cache_idx_i8, [SEQ_TILE, INDEX_HEAD_DIM], [cache_row0, 0])
                         for h in pl.range(INDEX_HEADS):
-                            q_row0 = (b * INDEX_HEADS_CFG + h) * Q_PAD
+                            q_row0 = (b * INDEX_HEADS + h) * Q_PAD
                             tile_row0 = ((b * MAX_SEQ_BLOCKS + sb) * INDEX_HEADS + h) * Q_PAD
-                            s3_q_tile_i8 = pl.slice(s3_q_i8_padded, [Q_PAD, INDEX_HEAD_DIM_CFG], [q_row0, 0])
+                            s3_q_tile_i8 = pl.slice(s3_q_i8_padded, [Q_PAD, INDEX_HEAD_DIM], [q_row0, 0])
                             s3_logits_i32 = pl.matmul(s3_q_tile_i8, s3_k_tile_i8, b_trans=True, out_dtype=pl.INT32)
                             s3_all_scores_i8 = pl.assemble(s3_all_scores_i8, s3_logits_i32, [tile_row0, 0])
 
-            # Stage 3.4/3.5i8: Cast staged INT32 logits to FP32, then extract q row and apply ReLU.
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="s3_logits_relu"):
-                for b in pl.parallel(0, BATCH_CFG, 1):
-                    s3_ctx_len = pl.read(seq_lens, [b])
-                    s3_ctx_blocks = (s3_ctx_len + SEQ_TILE - 1) // SEQ_TILE
-                    for sb in pl.parallel(s3_ctx_blocks, chunk=MAX_SEQ_BLOCKS):
+                # Stage 3.2: Cast to FP32 and apply ReLU.
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="s3_logits_relu"):
+                    for sb in pl.range(s3_ctx_blocks):
                         for h in pl.range(INDEX_HEADS):
                             tile_row0 = ((b * MAX_SEQ_BLOCKS + sb) * INDEX_HEADS + h) * Q_PAD
                             s3_logits_row_i32 = pl.slice(s3_all_scores_i8, [1, SEQ_TILE], [tile_row0, 0])
@@ -698,25 +608,19 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
                             relu_row0 = (b * MAX_SEQ_BLOCKS + sb) * INDEX_HEADS + h
                             s3_relu_rows = pl.assemble(s3_relu_rows, s3_relu_logits, [relu_row0, 0])
 
-            # Stage 3.6i8: Reduce per-head ReLU logits with q_s weights.
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="s3_head_reduce"):
-                for b in pl.parallel(0, BATCH_CFG, 1):
-                    s3_ctx_len = pl.read(seq_lens, [b])
-                    s3_ctx_blocks = (s3_ctx_len + SEQ_TILE - 1) // SEQ_TILE
-                    for sb in pl.parallel(s3_ctx_blocks, chunk=MAX_SEQ_BLOCKS):
-                        s3_q_s_tile = pl.slice(s3_q_s_padded, [Q_PAD, INDEX_HEADS_CFG], [b * Q_PAD, 0])
+                # Stage 3.3: Reduce per-head ReLU logits with q_s weights.
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="s3_head_reduce"):
+                    for sb in pl.range(s3_ctx_blocks):
+                        s3_q_s_tile = pl.slice(s3_q_s_padded, [Q_PAD, INDEX_HEADS], [b * Q_PAD, 0])
                         s3_relu_row0 = (b * MAX_SEQ_BLOCKS + sb) * INDEX_HEADS
                         s3_relu_tile = pl.slice(s3_relu_rows, [INDEX_HEADS, SEQ_TILE], [s3_relu_row0, 0])
                         s3_weighted_tile = pl.matmul(s3_q_s_tile, s3_relu_tile, out_dtype=pl.FP32)
                         weighted_row0 = (b * MAX_SEQ_BLOCKS + sb) * Q_PAD
                         s3_weighted_scores = pl.assemble(s3_weighted_scores, s3_weighted_tile, [weighted_row0, 0])
 
-            # Stage 3.7i8: Apply k scale and write valid score tiles to scores_out.
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="s3_score_write"):
-                for b in pl.parallel(0, BATCH_CFG, 1):
-                    s3_ctx_len = pl.read(seq_lens, [b])
-                    s3_ctx_blocks = (s3_ctx_len + SEQ_TILE - 1) // SEQ_TILE
-                    for sb in pl.parallel(s3_ctx_blocks, chunk=MAX_SEQ_BLOCKS):
+                # Stage 3.4: Apply k scale and write valid score tiles.
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="s3_score_write"):
+                    for sb in pl.range(s3_ctx_blocks):
                         s0 = sb * SEQ_TILE
                         s3_valid_len = pl.min(SEQ_TILE, s3_ctx_len - s0)
                         weighted_row0 = (b * MAX_SEQ_BLOCKS + sb) * Q_PAD
@@ -733,10 +637,8 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
                         )
                         scores_out = pl.assemble(scores_out, s3_score_valid, [b, s0])
 
-            for b in pl.range(0, BATCH_CFG, 1):
-                s3_ctx_len = pl.read(seq_lens, [b])
-
-                # Stage 3.8: Run sort32 + multi-pass merge sort to produce (score, idx) pairs.
+                s3_sorted_gm = pl.create_tensor([1, 2 * SORT_LEN], dtype=pl.FP32)
+                # Stage 3.5: Run sort32 + mrgsort.
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="s3_sort"):
                     s3_score_row = pl.slice(scores_out, [1, SORT_LEN], [b, 0])
                     idx_init = pl.tensor.arange(0, [1, SORT_LEN], dtype=pl.UINT32)
@@ -745,12 +647,12 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
                     s3_sorted_t = pl.tensor.mrgsort(s3_sorted_t, block_len=256)
                     s3_sorted_t = pl.tensor.mrgsort(s3_sorted_t, block_len=1024)
                     s3_sorted_t = pl.tensor.mrgsort(s3_sorted_t, block_len=4096)
-                    s3_sorted_gm = pl.assemble(s3_sorted_gm, s3_sorted_t, [b, 0])
+                    s3_sorted_gm = pl.assemble(s3_sorted_gm, s3_sorted_t, [0, 0])
 
-                # Stage 3.9: Split top-k values and raw indices from interleaved
-                # pairs, then mark top-k slots beyond ctx_len with PadValue.min.
+                # Stage 3.6: Split top-k values and raw indices.
+                s3_raw_idx_local = pl.create_tensor([1, INDEX_TOPK], dtype=pl.INT32)
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="s3_topk_extract"):
-                    s3_topk_pairs = pl.slice(s3_sorted_gm, [1, 2 * INDEX_TOPK], [b, 0])
+                    s3_topk_pairs = pl.slice(s3_sorted_gm, [1, 2 * INDEX_TOPK], [0, 0])
                     s3_topk_v = pl.tensor.gather(s3_topk_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
                     s3_topk_i_raw = pl.tensor.gather(
                         s3_topk_pairs,
@@ -758,9 +660,9 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
                         output_dtype=pl.INT32,
                     )
                     topk_vals_out = pl.assemble(topk_vals_out, s3_topk_v, [b, 0])
-                    s3_raw_idx_gm = pl.assemble(s3_raw_idx_gm, s3_topk_i_raw, [b, 0])
+                    s3_raw_idx_local = pl.assemble(s3_raw_idx_local, s3_topk_i_raw, [0, 0])
                     s3_valid_topk = pl.min(INDEX_TOPK, s3_ctx_len)
-                    s3_idx_valid = pl.slice(s3_raw_idx_gm, [1, INDEX_TOPK], [b, 0], valid_shape=[1, s3_valid_topk])
+                    s3_idx_valid = pl.slice(s3_raw_idx_local, [1, INDEX_TOPK], [0, 0], valid_shape=[1, s3_valid_topk])
                     s3_idx_padded = pl.fillpad(s3_idx_valid, pad_value=pl.PadValue.min)
                     topk_idx_out = pl.assemble(topk_idx_out, s3_idx_padded, [b, 0])
 
@@ -917,103 +819,90 @@ def golden_decode_front_scope123_int8_quant(tensors):
     tensors["topk_idx_out"].copy_(idx)
 
 
-def build_tensor_specs(
-    batch: int = BATCH,
-    max_seq_len: int = MAX_SEQ,
-    hidden_size: int = HIDDEN,
-    num_heads: int = NUM_HEADS,
-    q_lora_rank: int = Q_LORA_RANK,
-    kv_lora_rank: int = KV_LORA_RANK,
-    qk_nope_head_dim: int = QK_NOPE_HEAD_DIM,
-    qk_rope_head_dim: int = QK_ROPE_HEAD_DIM,
-    index_heads: int = INDEX_HEADS,
-    index_head_dim: int = INDEX_HEAD_DIM,
-):
+def build_tensor_specs():
     import torch  # type: ignore[import]
     from golden import TensorSpec
 
-    qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
-    kv_a_out = kv_lora_rank + qk_rope_head_dim
-    cache_rows = batch * max_seq_len
-    index_q_out = index_heads * index_head_dim
-    seq_lens_data = torch.randint(1, max_seq_len + 1, (batch,), dtype=torch.int32)
+    cache_rows = BATCH * MAX_SEQ
+    index_q_out = INDEX_HEADS * INDEX_HEAD_DIM
+    seq_lens_data = torch.randint(1, MAX_SEQ + 1, (BATCH,), dtype=torch.int32)
 
     def init_hidden_states():
-        return torch.rand(batch, hidden_size) - 0.5
+        return torch.rand(BATCH, HIDDEN) - 0.5
 
     def init_rms_weight():
-        return torch.rand(1, hidden_size) - 0.5
+        return torch.rand(1, HIDDEN) - 0.5
 
     def init_q_norm_weight():
-        return torch.rand(1, q_lora_rank) - 0.5
+        return torch.rand(1, Q_LORA_RANK) - 0.5
 
     def init_wq_a():
-        return (torch.rand(hidden_size, q_lora_rank) - 0.5) / hidden_size ** 0.5
+        return (torch.rand(HIDDEN, Q_LORA_RANK) - 0.5) / HIDDEN ** 0.5
 
     def init_wq_b():
-        return (torch.rand(q_lora_rank, num_heads * qk_head_dim) - 0.5) / q_lora_rank ** 0.5
+        return (torch.rand(Q_LORA_RANK, NUM_HEADS * QK_HEAD_DIM) - 0.5) / Q_LORA_RANK ** 0.5
 
     def init_wkv_a():
-        return (torch.rand(hidden_size, kv_a_out) - 0.5) / hidden_size ** 0.5
+        return (torch.rand(HIDDEN, KV_A_OUT) - 0.5) / HIDDEN ** 0.5
 
     def init_kv_norm_weight():
-        return torch.rand(1, kv_lora_rank) - 0.5
+        return torch.rand(1, KV_LORA_RANK) - 0.5
 
     def init_wq_b_idx():
-        return (torch.rand(q_lora_rank, index_q_out) - 0.5) / q_lora_rank ** 0.5
+        return (torch.rand(Q_LORA_RANK, index_q_out) - 0.5) / Q_LORA_RANK ** 0.5
 
     def init_wk_idx():
-        return (torch.rand(hidden_size, index_head_dim) - 0.5) / hidden_size ** 0.5
+        return (torch.rand(HIDDEN, INDEX_HEAD_DIM) - 0.5) / HIDDEN ** 0.5
 
     def init_weights_proj():
-        return (torch.rand(hidden_size, index_heads) - 0.5) / hidden_size ** 0.5
+        return (torch.rand(HIDDEN, INDEX_HEADS) - 0.5) / HIDDEN ** 0.5
 
     def init_k_norm_weight():
-        return torch.rand(1, index_head_dim) - 0.5
+        return torch.rand(1, INDEX_HEAD_DIM) - 0.5
 
     def init_k_norm_bias():
-        return torch.rand(1, index_head_dim) - 0.5
+        return torch.rand(1, INDEX_HEAD_DIM) - 0.5
 
     def init_rope():
-        return torch.rand(max_seq_len, qk_rope_head_dim) - 0.5
+        return torch.rand(MAX_SEQ, QK_ROPE_HEAD_DIM) - 0.5
 
     def init_cache_kv():
-        return torch.zeros(cache_rows, kv_lora_rank)
+        return torch.zeros(cache_rows, KV_LORA_RANK)
 
     def init_cache_pe():
-        return torch.zeros(cache_rows, qk_rope_head_dim)
+        return torch.zeros(cache_rows, QK_ROPE_HEAD_DIM)
 
     def init_k_cache_idx_i8():
-        return torch.randint(-128, 128, (cache_rows, index_head_dim), dtype=torch.int8)
+        return torch.randint(-128, 128, (cache_rows, INDEX_HEAD_DIM), dtype=torch.int8)
 
     def init_k_cache_idx_scale():
-        return torch.rand((batch, max_seq_len), dtype=torch.float32) / 127.0
+        return torch.rand((BATCH, MAX_SEQ), dtype=torch.float32) / 127.0
 
     def init_topk_idx_out():
-        return torch.zeros((batch, INDEX_TOPK), dtype=torch.int32)
+        return torch.zeros((BATCH, INDEX_TOPK), dtype=torch.int32)
 
     return [
-        TensorSpec("hidden_states", [batch, hidden_size], torch.bfloat16, init_value=init_hidden_states),
-        TensorSpec("input_rms_weight", [1, hidden_size], torch.float32, init_value=init_rms_weight),
-        TensorSpec("q_norm_weight", [1, q_lora_rank], torch.float32, init_value=init_q_norm_weight),
-        TensorSpec("kv_norm_weight", [1, kv_lora_rank], torch.float32, init_value=init_kv_norm_weight),
-        TensorSpec("wq_a", [hidden_size, q_lora_rank], torch.bfloat16, init_value=init_wq_a),
-        TensorSpec("wq_b", [q_lora_rank, num_heads * qk_head_dim], torch.bfloat16, init_value=init_wq_b),
-        TensorSpec("wkv_a", [hidden_size, kv_a_out], torch.bfloat16, init_value=init_wkv_a),
-        TensorSpec("seq_lens", [batch], torch.int32, init_value=seq_lens_data),
-        TensorSpec("rope_cos", [max_seq_len, qk_rope_head_dim], torch.float32, init_value=init_rope),
-        TensorSpec("rope_sin", [max_seq_len, qk_rope_head_dim], torch.float32, init_value=init_rope),
-        TensorSpec("wq_b_idx", [q_lora_rank, index_q_out], torch.bfloat16, init_value=init_wq_b_idx),
-        TensorSpec("wk_idx", [hidden_size, index_head_dim], torch.bfloat16, init_value=init_wk_idx),
-        TensorSpec("weights_proj", [hidden_size, index_heads], torch.float32, init_value=init_weights_proj),
-        TensorSpec("k_norm_weight", [1, index_head_dim], torch.float32, init_value=init_k_norm_weight),
-        TensorSpec("k_norm_bias", [1, index_head_dim], torch.float32, init_value=init_k_norm_bias),
-        TensorSpec("q_proj_out", [batch, num_heads * qk_head_dim], torch.bfloat16, is_output=True),
-        TensorSpec("kv_cache", [cache_rows, kv_lora_rank], torch.bfloat16, init_value=init_cache_kv, is_output=True),
-        TensorSpec("pe_cache", [cache_rows, qk_rope_head_dim], torch.bfloat16, init_value=init_cache_pe, is_output=True),
-        TensorSpec("k_cache_idx_i8", [cache_rows, index_head_dim], torch.int8, init_value=init_k_cache_idx_i8),
-        TensorSpec("k_cache_idx_scale", [batch, max_seq_len], torch.float32, init_value=init_k_cache_idx_scale),
-        TensorSpec("topk_idx_out", [batch, INDEX_TOPK], torch.int32, init_value=init_topk_idx_out, is_output=True),
+        TensorSpec("hidden_states", [BATCH, HIDDEN], torch.bfloat16, init_value=init_hidden_states),
+        TensorSpec("input_rms_weight", [1, HIDDEN], torch.float32, init_value=init_rms_weight),
+        TensorSpec("q_norm_weight", [1, Q_LORA_RANK], torch.float32, init_value=init_q_norm_weight),
+        TensorSpec("kv_norm_weight", [1, KV_LORA_RANK], torch.float32, init_value=init_kv_norm_weight),
+        TensorSpec("wq_a", [HIDDEN, Q_LORA_RANK], torch.bfloat16, init_value=init_wq_a),
+        TensorSpec("wq_b", [Q_LORA_RANK, NUM_HEADS * QK_HEAD_DIM], torch.bfloat16, init_value=init_wq_b),
+        TensorSpec("wkv_a", [HIDDEN, KV_A_OUT], torch.bfloat16, init_value=init_wkv_a),
+        TensorSpec("seq_lens", [BATCH], torch.int32, init_value=seq_lens_data),
+        TensorSpec("rope_cos", [MAX_SEQ, QK_ROPE_HEAD_DIM], torch.float32, init_value=init_rope),
+        TensorSpec("rope_sin", [MAX_SEQ, QK_ROPE_HEAD_DIM], torch.float32, init_value=init_rope),
+        TensorSpec("wq_b_idx", [Q_LORA_RANK, index_q_out], torch.bfloat16, init_value=init_wq_b_idx),
+        TensorSpec("wk_idx", [HIDDEN, INDEX_HEAD_DIM], torch.bfloat16, init_value=init_wk_idx),
+        TensorSpec("weights_proj", [HIDDEN, INDEX_HEADS], torch.float32, init_value=init_weights_proj),
+        TensorSpec("k_norm_weight", [1, INDEX_HEAD_DIM], torch.float32, init_value=init_k_norm_weight),
+        TensorSpec("k_norm_bias", [1, INDEX_HEAD_DIM], torch.float32, init_value=init_k_norm_bias),
+        TensorSpec("q_proj_out", [BATCH, NUM_HEADS * QK_HEAD_DIM], torch.bfloat16, is_output=True),
+        TensorSpec("kv_cache", [cache_rows, KV_LORA_RANK], torch.bfloat16, init_value=init_cache_kv, is_output=True),
+        TensorSpec("pe_cache", [cache_rows, QK_ROPE_HEAD_DIM], torch.bfloat16, init_value=init_cache_pe, is_output=True),
+        TensorSpec("k_cache_idx_i8", [cache_rows, INDEX_HEAD_DIM], torch.int8, init_value=init_k_cache_idx_i8),
+        TensorSpec("k_cache_idx_scale", [BATCH, MAX_SEQ], torch.float32, init_value=init_k_cache_idx_scale),
+        TensorSpec("topk_idx_out", [BATCH, INDEX_TOPK], torch.int32, init_value=init_topk_idx_out, is_output=True),
     ]
 
 
