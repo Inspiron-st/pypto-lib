@@ -6,39 +6,18 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""
-DeepSeek-V4 lightning indexer (decode).
-
-Corresponds to model.py Indexer.forward lines 402-433. The full Indexer pipeline
-is fused into a single program here:
-
-    q = wq_b(qr).unflatten(-1, (idx_n_heads, idx_head_dim))
-    apply_rotary_emb(q[..., -rope_dim:], freqs_cis)
-    q = rotate_activation(q)             # Hadamard
-    fp4_act_quant(q, ...)                # FP4 quant simulation
-    self.compressor(x, start_pos)        # writes idx_kv_cache (rotate=True path)
-    weights = weights_proj(x) * (softmax_scale * idx_n_heads ** -0.5)
-    score = einsum("bshd,btd->bsht", q, idx_kv_cache[:bsz, :end_pos // ratio])
-    score = (relu(score) * weights.unsqueeze(-1)).sum(dim=2)
-    topk_idxs = score.topk(min(idx_topk, end_pos // ratio), dim=-1)[1]
-    topk_idxs += offset
-
-The internal Compressor uses head_dim=128, rotate=True (model.py:398). For
-skeleton clarity, the inner-compressor state buffers are exposed as InOut
-inputs so this program is self-contained per call.
-
-Skeleton stage: kernel body is TODO; golden is a faithful torch port.
-"""
+"""DeepSeek-V4 lightning indexer (decode): fuses the inner compressor + dot-product scoring
++ topk to select compressed-KV slots for sparse attention."""
 
 
 import pypto.language as pl
 
 
-B            = 16
+B            = 16                 # demo 4
 S            = 1
 T            = B * S
-D            = 7168
-Q_LORA       = 1536
+D            = 4096               # v4-pro 7168
+Q_LORA       = 1024               # v4-pro 1536
 ROPE_DIM     = 64
 EPS          = 1e-6
 
@@ -46,7 +25,7 @@ EPS          = 1e-6
 IDX_HEADS    = 64
 IDX_HEAD_DIM = 128
 IDX_NOPE     = IDX_HEAD_DIM - ROPE_DIM
-IDX_TOPK     = 1024
+IDX_TOPK     = 512                # v4-pro 1024
 
 # Inner compressor (rotate=True, ratio=4, head_dim=IDX_HEAD_DIM)
 RATIO        = 4

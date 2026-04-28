@@ -6,36 +6,24 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""
-DeepSeek-V4 single-token decode MLA prolog.
-
-Corresponds to model.py Attention.forward lines 496-504:
-    qr = q_norm(wq_a(x))
-    q  = wq_b(qr).unflatten(-1, (n_local_heads, head_dim))
-    q *= rsqrt(q.square().mean(-1, keepdim=True) + eps)        # per-head RMSNorm
-    apply_rotary_emb(q[..., -rope_dim:], freqs_cis)
-    kv = wkv(x)
-    kv = kv_norm(kv)
-    apply_rotary_emb(kv[..., -rope_dim:], freqs_cis)
-
-Skeleton stage: kernel body is TODO; golden is a faithful torch port.
-"""
+"""DeepSeek-V4 single-token decode attn_norm + MLA prolog (fused): produces (q, kv, qr) for the
+attention body, with attn_norm fused at the front to save one GM round-trip."""
 
 
 import pypto.language as pl
 
 
 # Decode batch / seq
-B           = 16
+B           = 16               # demo 4
 S           = 1
 T           = B * S
 # Hidden / Attention
-D           = 7168
-H           = 128
+D           = 4096             # v4-pro 7168
+H           = 64               # v4-pro 128
 HEAD_DIM    = 512
 ROPE_DIM    = 64
 NOPE_DIM    = HEAD_DIM - ROPE_DIM
-Q_LORA      = 1536
+Q_LORA      = 1024             # v4-pro 1536
 EPS         = 1e-6
 
 
@@ -45,14 +33,15 @@ def build_deepseek_v4_decode_mla_program():
         @pl.function(type=pl.FunctionType.Opaque)
         def deepseek_v4_decode_mla(
             self,
-            token_x:   pl.Tensor[[T, D],                pl.BF16],
-            wq_a:      pl.Tensor[[D, Q_LORA],           pl.BF16],
+            x:         pl.Tensor[[B, S, D],              pl.BF16],
+            norm_w:    pl.Tensor[[D],                    pl.FP32],
+            wq_a:      pl.Tensor[[D, Q_LORA],            pl.BF16],
             wq_b:      pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.BF16],
-            wkv:       pl.Tensor[[D, HEAD_DIM],         pl.BF16],
-            rope_cos:  pl.Tensor[[T, ROPE_DIM],         pl.BF16],
-            rope_sin:  pl.Tensor[[T, ROPE_DIM],         pl.BF16],
-            gamma_cq:  pl.Tensor[[Q_LORA],              pl.BF16],
-            gamma_ckv: pl.Tensor[[HEAD_DIM],            pl.BF16],
+            wkv:       pl.Tensor[[D, HEAD_DIM],          pl.BF16],
+            rope_cos:  pl.Tensor[[T, ROPE_DIM],          pl.BF16],
+            rope_sin:  pl.Tensor[[T, ROPE_DIM],          pl.BF16],
+            gamma_cq:  pl.Tensor[[Q_LORA],               pl.BF16],
+            gamma_ckv: pl.Tensor[[HEAD_DIM],             pl.BF16],
             q:         pl.Out[pl.Tensor[[T, H, HEAD_DIM], pl.BF16]],
             kv:        pl.Out[pl.Tensor[[T, HEAD_DIM],    pl.BF16]],
             qr:        pl.Out[pl.Tensor[[T, Q_LORA],      pl.BF16]],
@@ -64,10 +53,11 @@ def build_deepseek_v4_decode_mla_program():
 
 
 def golden_deepseek_v4_decode_mla(tensors):
-    """Torch reference, direct port of model.py Attention.forward 496-504."""
+    """Torch reference: attn_norm fused, then MLA prolog (model.py 692, 496-504)."""
     import torch
 
-    token_x   = tensors["token_x"].float()
+    x         = tensors["x"].float()              # [B, S, D]
+    norm_w    = tensors["norm_w"].float()          # [D]
     wq_a      = tensors["wq_a"].float()
     wq_b      = tensors["wq_b"].float()
     wkv       = tensors["wkv"].float()
@@ -94,11 +84,14 @@ def golden_deepseek_v4_decode_mla(tensors):
         y1 = x0 * sin_ + x1 * cos_
         return torch.stack([y0, y1], dim=-1).flatten(-2)
 
+    # attn_norm fused (model.py:692)
+    token_x = rms_norm(x.view(T, D), norm_w)                        # [T, D]
+
     # Q path
     qr_out = rms_norm(token_x @ wq_a, gamma_cq)                     # [T, Q_LORA]
     q_full = (qr_out @ wq_b).view(T, H, HEAD_DIM)                   # [T, H, HEAD_DIM]
     inv = torch.rsqrt(q_full.square().mean(-1, keepdim=True) + EPS)
-    q_full = q_full * inv                                           # per-head RMSNorm (no gamma)
+    q_full = q_full * inv                                            # per-head RMSNorm (no gamma)
     q_nope = q_full[..., :NOPE_DIM]
     q_rope = apply_rope(q_full[..., NOPE_DIM:], rope_cos, rope_sin)
     q_out = torch.cat([q_nope, q_rope], dim=-1)
@@ -119,8 +112,10 @@ def build_tensor_specs():
     import torch
     from golden import TensorSpec
 
-    def init_token_x():
-        return torch.randn(T, D) * 0.02
+    def init_x():
+        return torch.randn(B, S, D) * 0.02
+    def init_norm_w():
+        return torch.ones(D)
     def init_wq_a():
         return torch.randn(D, Q_LORA) / (D ** 0.5)
     def init_wq_b():
@@ -137,17 +132,18 @@ def build_tensor_specs():
         return torch.ones(HEAD_DIM)
 
     return [
-        TensorSpec("token_x",   [T, D],                torch.bfloat16, init_value=init_token_x),
-        TensorSpec("wq_a",      [D, Q_LORA],           torch.bfloat16, init_value=init_wq_a),
+        TensorSpec("x",         [B, S, D],              torch.bfloat16, init_value=init_x),
+        TensorSpec("norm_w",    [D],                    torch.float32,  init_value=init_norm_w),
+        TensorSpec("wq_a",      [D, Q_LORA],            torch.bfloat16, init_value=init_wq_a),
         TensorSpec("wq_b",      [Q_LORA, H * HEAD_DIM], torch.bfloat16, init_value=init_wq_b),
-        TensorSpec("wkv",       [D, HEAD_DIM],         torch.bfloat16, init_value=init_wkv),
-        TensorSpec("rope_cos",  [T, ROPE_DIM],         torch.bfloat16, init_value=init_cos),
-        TensorSpec("rope_sin",  [T, ROPE_DIM],         torch.bfloat16, init_value=init_sin),
-        TensorSpec("gamma_cq",  [Q_LORA],              torch.bfloat16, init_value=init_gamma_cq),
-        TensorSpec("gamma_ckv", [HEAD_DIM],            torch.bfloat16, init_value=init_gamma_ckv),
-        TensorSpec("q",         [T, H, HEAD_DIM],      torch.bfloat16, is_output=True),
-        TensorSpec("kv",        [T, HEAD_DIM],         torch.bfloat16, is_output=True),
-        TensorSpec("qr",        [T, Q_LORA],           torch.bfloat16, is_output=True),
+        TensorSpec("wkv",       [D, HEAD_DIM],          torch.bfloat16, init_value=init_wkv),
+        TensorSpec("rope_cos",  [T, ROPE_DIM],          torch.bfloat16, init_value=init_cos),
+        TensorSpec("rope_sin",  [T, ROPE_DIM],          torch.bfloat16, init_value=init_sin),
+        TensorSpec("gamma_cq",  [Q_LORA],               torch.bfloat16, init_value=init_gamma_cq),
+        TensorSpec("gamma_ckv", [HEAD_DIM],             torch.bfloat16, init_value=init_gamma_ckv),
+        TensorSpec("q",         [T, H, HEAD_DIM],       torch.bfloat16, is_output=True),
+        TensorSpec("kv",        [T, HEAD_DIM],          torch.bfloat16, is_output=True),
+        TensorSpec("qr",        [T, Q_LORA],            torch.bfloat16, is_output=True),
     ]
 
 

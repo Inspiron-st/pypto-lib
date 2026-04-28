@@ -6,41 +6,23 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""
-DeepSeek-V4 compressed flash attention (decode, compress_ratio in {4, 128}).
-
-Corresponds to model.py Attention.forward decode branch lines 533-534
-together with the surrounding sparse_attn semantics from kernel.py:355:
-    o = sparse_attn(q, kv_cache, attn_sink, topk_idxs, softmax_scale)
-    apply_rotary_emb(o[..., -rope_dim:], freqs_cis, inverse=True)
-
-Inputs:
-- q                 : query tensor from MLA prolog (RoPE already applied)
-- ori_kv / cmp_kv   : paged sliding-window and paged compressed KV pools
-- cmp_sparse_indices: per-token absolute indices (window + compressed concat)
-                      computed by orchestrator (window topk + indexer topk)
-- attn_sink         : per-head sink term added inside softmax
-- inverse RoPE on rope dims of o is fused into this kernel's output
-
-Skeleton stage: kernel body is TODO; golden is a faithful torch port that
-materializes a dense merged-kv view via the block tables before running
-sparse softmax.
-"""
+"""DeepSeek-V4 compressed flash attention (decode, compress_ratio in {4, 128}): sparse softmax
+over window + compressed KV slots gathered through paged block tables, with fused inverse RoPE."""
 
 
 import pypto.language as pl
 
 
-B           = 16
+B           = 16                        # demo 4
 S           = 1
 T           = B * S
-H           = 128
+H           = 64                        # v4-pro 128
 HEAD_DIM    = 512
 ROPE_DIM    = 64
 NOPE_DIM    = HEAD_DIM - ROPE_DIM
 WIN         = 128
-IDX_TOPK    = 1024
-TOPK        = WIN + IDX_TOPK             # 1152
+IDX_TOPK    = 512                       # v4-pro 1024
+TOPK        = WIN + IDX_TOPK
 
 BLOCK_SIZE      = 128
 ORI_MAX_BLOCKS  = 1                      # WIN==BLOCK_SIZE => 1 block per batch (placeholder)

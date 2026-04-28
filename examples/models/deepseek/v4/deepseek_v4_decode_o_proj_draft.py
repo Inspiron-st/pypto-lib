@@ -6,31 +6,22 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""
-DeepSeek-V4 grouped output projection.
-
-Corresponds to model.py Attention.forward lines 537-542:
-    o = o.view(bsz, seqlen, n_local_groups, -1)
-    wo_a = self.wo_a.weight.view(n_local_groups, o_lora_rank, -1)
-    o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
-    x = self.wo_b(o.flatten(2))
-
-Skeleton stage: kernel body is TODO; golden is a faithful torch port.
-"""
+"""DeepSeek-V4 grouped output projection (decode): grouped wo_a low-rank reduction followed by
+wo_b expansion back to model dim."""
 
 
 import pypto.language as pl
 
 
-B          = 16
+B          = 16                 # demo 4
 S          = 1
 T          = B * S
-D          = 7168
-H          = 128
+D          = 4096               # v4-pro 7168
+H          = 64                 # v4-pro 128
 HEAD_DIM   = 512
 O_LORA     = 1024
-O_GROUPS   = 16
-O_GROUP_IN = H * HEAD_DIM // O_GROUPS    # 4096
+O_GROUPS   = 8                  # v4-pro 16
+O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 
 
 def build_deepseek_v4_decode_o_proj_program():

@@ -6,28 +6,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""
-DeepSeek-V4 Hyper-Connections pre-mix.
-
-Corresponds to model.py Block.hc_pre lines 674-682:
-    x = x.flatten(2).float()
-    rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + norm_eps)
-    mixes = F.linear(x, hc_fn) * rsqrt
-    pre, post, comb = hc_split_sinkhorn(mixes, hc_scale, hc_base,
-                                        hc_mult, sinkhorn_iters, hc_eps)
-    y = sum(pre.unsqueeze(-1) * x.view(B, S, hc, D), dim=2)
-
-Same program is used for both attn-pre and ffn-pre, with different weights.
-Skeleton stage: kernel body is TODO; golden is a faithful torch port.
-"""
+"""DeepSeek-V4 Hyper-Connections pre-mix (decode): mixes the hc-stack into a single sublayer input
+and produces the post/comb weights used by hc_post."""
 
 
 import pypto.language as pl
 
 
-B                = 16
+B                = 16               # demo 4
 S                = 1
-D                = 7168
+D                = 4096             # v4-pro 7168
 HC_MULT          = 4
 MIX_HC           = (2 + HC_MULT) * HC_MULT
 HC_DIM           = HC_MULT * D

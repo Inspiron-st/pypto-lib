@@ -6,59 +6,25 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""
-DeepSeek-V4 attention sublayer orchestration (decode).
-
-End-to-end wrapper for the attention half of model.py Block.forward
-lines 690-694, including the inner Attention.forward (model.py 484-543):
-
-    residual = x_hc                                                       # [B,S,hc,D]
-    x_mixed, post, comb = hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base)
-    x_norm = rms_norm(x_mixed, attn_norm_w)                               # model.py:692
-
-    # Inner Attention.forward
-    q, kv, qr = mla(x_norm, ...)                                          # model.py 496-504
-    scatter(ori_kv, ori_block_table, write_slot=start_pos % WIN, kv)      # model.py:530
-    if compress_ratio in {4, 128}:
-        cmp_out = compressor(x_norm, ..., should_compress, ratio)         # model.py:316-377
-        if should_compress: scatter(cmp_kv, cmp_block_table, cache_slot, cmp_out)
-        if compress_ratio == 4:
-            topk_idxs = indexer(x_norm, qr, ..., should_compress)         # model.py 402-433
-        else:
-            topk_idxs = static_compress_topk_idxs(...)
-        sparse_indices = cat(window_topk_idxs(...), topk_idxs)            # model.py 507-515
-        o = cfa(q, ori_kv, ..., cmp_kv, ..., sparse_indices, ...)         # model.py:528 / 533
-    else:  # compress_ratio == 0
-        o = win_attn(q, ori_kv, ..., window_topk_idxs(...), ...)
-    attn_out = o_proj(o, wo_a, wo_b)                                      # model.py 537-542
-
-    # hc_post (model.py 684-687, 694)
-    x_after_attn = post.unsqueeze(-1) * attn_out.unsqueeze(-2) \
-                 + (comb.unsqueeze(-1) * residual.unsqueeze(-2)).sum(dim=2)
-    return x_after_attn
-
-This program is `FunctionType.Orchestration`: it calls the kernel programs
-defined in the sibling files. Skeleton stage: orchestration body is TODO; the
-golden runs the full attention sublayer end-to-end in torch by composing
-each sibling's golden.
-"""
+"""DeepSeek-V4 attention sublayer orchestration (decode): chains hc_pre, mla, compressor,
+indexer, cfa/win_attn, o_proj, hc_post into the full attention half of Block.forward."""
 
 
 import pypto.language as pl
 
 
-B               = 16
+B               = 16                      # demo 4
 S               = 1
 T               = B * S
 # Hidden / Attention
-D               = 7168
-H               = 128
+D               = 4096                    # v4-pro 7168
+H               = 64                      # v4-pro 128
 HEAD_DIM        = 512
 ROPE_DIM        = 64
 NOPE_DIM        = HEAD_DIM - ROPE_DIM
-Q_LORA          = 1536
+Q_LORA          = 1024                    # v4-pro 1536
 O_LORA          = 1024
-O_GROUPS        = 16
+O_GROUPS        = 8                       # v4-pro 16
 O_GROUP_IN      = H * HEAD_DIM // O_GROUPS
 WIN             = 128
 EPS             = 1e-6
@@ -74,7 +40,7 @@ HC_EPS           = 1e-6
 IDX_HEADS    = 64
 IDX_HEAD_DIM = 128
 IDX_NOPE     = IDX_HEAD_DIM - ROPE_DIM
-IDX_TOPK     = 1024
+IDX_TOPK     = 512                        # v4-pro 1024
 
 # Compressor (main path defaults: ratio=4, head_dim=512, rotate=False)
 RATIO            = 4
@@ -109,7 +75,7 @@ def build_deepseek_v4_decode_attention_program():
             hc_attn_scale:      pl.Tensor[[3],                                       pl.FP32],
             hc_attn_base:       pl.Tensor[[MIX_HC],                                  pl.FP32],
             # attn_norm
-            attn_norm_w:        pl.Tensor[[D],                                       pl.FP32],
+            norm_w:             pl.Tensor[[D],                                       pl.FP32],
             # mla weights
             wq_a:               pl.Tensor[[D, Q_LORA],                               pl.BF16],
             wq_b:               pl.Tensor[[Q_LORA, H * HEAD_DIM],                    pl.BF16],
@@ -159,13 +125,13 @@ def build_deepseek_v4_decode_attention_program():
         ):
             # TODO: orchestration body. Pseudo-code:
             #   x_mixed, post, comb = self.hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base)
-            #   x_norm = rms_norm(x_mixed, attn_norm_w)
-            #   q, kv, qr = self.mla(x_norm, wq_a, wq_b, wkv, rope_cos, rope_sin, gamma_cq, gamma_ckv)
+            #   q, kv, qr = self.mla(x_mixed, norm_w, wq_a, wq_b, wkv, rope_cos, rope_sin,
+            #                        gamma_cq, gamma_ckv)   # attn_norm fused
             #   pl.scatter(ori_kv, ori_block_table, write_slot=start_pos % WIN, kv)
-            #   cmp_out = self.compressor(x_norm, cmp_kv_state, cmp_score_state, cmp_wkv, cmp_wgate,
+            #   cmp_out = self.compressor(x_mixed, cmp_kv_state, cmp_score_state, cmp_wkv, cmp_wgate,
             #                             cmp_ape, cmp_weight, cmp_cos, cmp_sin, start_pos, should_compress)
             #   pl.scatter(cmp_kv, cmp_block_table, cache_slot=start_pos // RATIO, cmp_out)
-            #   topk_idxs = self.indexer(x_norm, qr, idx_wq_b, weights_proj, rope_cos, rope_sin,
+            #   topk_idxs = self.indexer(x_mixed, qr, idx_wq_b, weights_proj, rope_cos, rope_sin,
             #                            hadamard_q, inner_*, inner_kv_state, inner_score_state,
             #                            idx_kv_cache, idx_block_table, seqused_kv,
             #                            start_pos, should_compress, offset)
@@ -173,8 +139,7 @@ def build_deepseek_v4_decode_attention_program():
             #   o = self.cfa(q, ori_kv, ori_block_table, cmp_kv, cmp_block_table,
             #                sparse_indices, attn_sink, seqused_kv, rope_cos, rope_sin)
             #   attn_out = self.o_proj(o, wo_a, wo_b)
-            #   x_out = post.unsqueeze(-1) * attn_out.unsqueeze(-2) \
-            #         + (comb.unsqueeze(-1) * x_hc.unsqueeze(-2)).sum(dim=2)
+            #   x_out = self.hc_post(attn_out, x_hc, post, comb)
             return x_out
 
     return DeepSeekV4DecodeAttention
@@ -194,7 +159,7 @@ def golden_deepseek_v4_decode_attention(tensors):
     hc_attn_fn     = tensors["hc_attn_fn"].float()
     hc_attn_scale  = tensors["hc_attn_scale"].float()
     hc_attn_base   = tensors["hc_attn_base"].float()
-    attn_norm_w    = tensors["attn_norm_w"].float()
+    norm_w         = tensors["norm_w"].float()
     wq_a           = tensors["wq_a"].float()
     wq_b           = tensors["wq_b"].float()
     wkv            = tensors["wkv"].float()
@@ -249,9 +214,9 @@ def golden_deepseek_v4_decode_attention(tensors):
         comb = comb / (comb.sum(-2, keepdim=True) + HC_EPS)
     x_mixed = (pre.unsqueeze(-1) * x_hc).sum(dim=2)                       # [B,S,D]
 
-    # ---- attn_norm (model.py 692) ----
+    # ---- attn_norm fused into mla (model.py 692) ----
     inv = torch.rsqrt(x_mixed.square().mean(-1, keepdim=True) + EPS)
-    x_norm = (x_mixed * inv * attn_norm_w).contiguous()                   # [B,S,D]
+    x_norm = (x_mixed * inv * norm_w).contiguous()                       # [B,S,D]
     x_norm_t = x_norm.view(T, D)
 
     def apply_rope(x_rope, cos, sin):
@@ -410,8 +375,10 @@ def golden_deepseek_v4_decode_attention(tensors):
     attn_out = (o_r.flatten(1) @ wo_b.T).view(B, S, D)                     # [B,S,D]
 
     # ---- hc_post (model.py 684-687) ----
-    x_after = post.unsqueeze(-1) * attn_out.unsqueeze(-2) \
-              + (comb.unsqueeze(-1) * x_hc.unsqueeze(-2)).sum(dim=2)       # [B,S,hc,D]
+    # Calls hc_post.py kernel: post * attn_out + sum(comb * residual)
+    term1 = post.unsqueeze(-1) * attn_out.unsqueeze(-2)
+    term2 = (comb.unsqueeze(-1) * x_hc.unsqueeze(-2)).sum(dim=2)
+    x_after = (term1 + term2)                                              # [B,S,hc,D]
 
     tensors["x_out"][:] = x_after.to(torch.bfloat16)
 
@@ -428,7 +395,7 @@ def build_tensor_specs():
         return torch.ones(3) * 0.5
     def init_hc_attn_base():
         return torch.zeros(MIX_HC)
-    def init_attn_norm_w():
+    def init_norm_w():
         return torch.ones(D)
     def init_wq_a():
         return torch.randn(D, Q_LORA) / D ** 0.5
@@ -528,7 +495,7 @@ def build_tensor_specs():
         TensorSpec("hc_attn_fn",        [MIX_HC, HC_DIM],                                torch.float32,  init_value=init_hc_attn_fn),
         TensorSpec("hc_attn_scale",     [3],                                             torch.float32,  init_value=init_hc_attn_scale),
         TensorSpec("hc_attn_base",      [MIX_HC],                                        torch.float32,  init_value=init_hc_attn_base),
-        TensorSpec("attn_norm_w",       [D],                                             torch.float32,  init_value=init_attn_norm_w),
+        TensorSpec("norm_w",            [D],                                             torch.float32,  init_value=init_norm_w),
         TensorSpec("wq_a",              [D, Q_LORA],                                     torch.bfloat16, init_value=init_wq_a),
         TensorSpec("wq_b",              [Q_LORA, H * HEAD_DIM],                          torch.bfloat16, init_value=init_wq_b),
         TensorSpec("wkv",               [D, HEAD_DIM],                                   torch.bfloat16, init_value=init_wkv),

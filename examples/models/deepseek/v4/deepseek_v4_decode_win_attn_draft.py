@@ -6,28 +6,17 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""
-DeepSeek-V4 sliding-window attention (decode, compress_ratio == 0).
-
-Corresponds to model.py Attention.forward decode branch lines 533-534 when
-compress_ratio == 0 (the last layer in V4): no compression, only sliding
-window attention. Same kernel.py:355 sparse_attn semantics, but topk_idxs
-covers only the WIN window slots and there is no cmp_kv pool.
-
-    o = sparse_attn(q, ori_kv_cache, attn_sink, window_topk_idxs, softmax_scale)
-    apply_rotary_emb(o[..., -rope_dim:], freqs_cis, inverse=True)
-
-Skeleton stage: kernel body is TODO; golden is a faithful torch port.
-"""
+"""DeepSeek-V4 sliding-window attention (decode, compress_ratio == 0): pure window sparse softmax
+with sink and fused inverse RoPE, used by layers without KV compression."""
 
 
 import pypto.language as pl
 
 
-B           = 16
+B           = 16               # demo 4
 S           = 1
 T           = B * S
-H           = 128
+H           = 64               # v4-pro 128
 HEAD_DIM    = 512
 ROPE_DIM    = 64
 NOPE_DIM    = HEAD_DIM - ROPE_DIM

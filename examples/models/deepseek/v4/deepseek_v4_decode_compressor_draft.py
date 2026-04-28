@@ -6,41 +6,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""
-DeepSeek-V4 KV Compressor (decode incremental).
-
-Corresponds to model.py Compressor.forward decode branch lines 343-377:
-    score += ape[start_pos % ratio]
-    if overlap:
-        kv_state[:, ratio + start_pos%ratio]    = kv
-        score_state[:, ratio + start_pos%ratio] = score
-        if should_compress:
-            kv_state_view, score_state_view = (overlap-aware halves of state)
-            kv = (kv_state_view * softmax(score_state_view, dim=1)).sum(dim=1)
-            shift state[:ratio] <- state[ratio:]
-    else:
-        kv_state[:, start_pos%ratio]    = kv
-        score_state[:, start_pos%ratio] = score
-        if should_compress:
-            kv = (kv_state * softmax(score_state, dim=1)).sum(dim=1)
-    if should_compress:
-        kv = norm(kv); apply_rope(kv[..., -rope_dim:], freqs_cis)
-        if rotate: kv = rotate_activation(kv); fp4_act_quant(kv, ...)
-        else:      act_quant(kv[..., :-rope_dim], 64, ...)
-
-This file targets the main attention-path Compressor at ratio=4, head_dim=512,
-rotate=False (overlap=True). The indexer-internal Compressor (ratio=4,
-head_dim=128, rotate=True) and the ratio=128 main path use the same algorithm
-with different shape constants; they will live in sibling files when needed.
-"""
+"""DeepSeek-V4 KV Compressor (decode incremental, main attention path: ratio=4, head_dim=512,
+rotate=False, overlap=True). Updates state buffers and emits one compressed KV every `ratio` steps."""
 
 
 import pypto.language as pl
 
 
-B           = 16
+B           = 16                      # demo 4
 S           = 1
-D           = 7168
+D           = 4096                    # v4-pro 7168
 HEAD_DIM    = 512
 ROPE_DIM    = 64
 NOPE_DIM    = HEAD_DIM - ROPE_DIM
