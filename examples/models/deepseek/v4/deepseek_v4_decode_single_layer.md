@@ -195,12 +195,14 @@ Corresponds to `Block.hc_pre` + `self.attn_norm` + `Attention.forward` +
 ║  o_proj.py  (grouped output LoRA)                                           ║
 ║  model.py:537-542                                                           ║
 ║                                                                             ║
-║  IN :  o    [T, H=128, HEAD_DIM=512]              bf16                      ║
-║        wo_a [O_GROUPS=16, O_LORA=1024, 4096]      bf16                      ║
-║        wo_b [D=7168, O_GROUPS*O_LORA=16384]        bf16                     ║
-║  OUT:  attn_out  [T, D=7168]  bf16                                          ║
+║  IN :  o    [T, H=128, HEAD_DIM=512]              bf16   (verbatim)         ║
+║        wo_a [O_GROUPS, O_LORA=1024, O_GROUP_IN]    bf16   (verbatim;        ║
+║             internally reshaped to [G*O_LORA, O_GROUP_IN] as a              ║
+║             workaround for hw-native-sys/pypto#1212)                        ║
+║        wo_b [D=7168, O_GROUPS*O_LORA=16384]       bf16                      ║
+║  OUT:  attn_out  [T, D=7168]  bf16   (view as [B, 1, D] for hc_post)         ║
 ╚═════════════════════════════════════════════════════════════════════════════╝
-              │ attn_out [T, D]
+              │ attn_out [T, D] → view [B, 1, D]
               │
               ▼
 ╔═════════════════════════════════════════════════════════════════════════════╗
