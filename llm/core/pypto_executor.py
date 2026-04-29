@@ -10,10 +10,13 @@
 from __future__ import annotations
 
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+
+_TIMING_ENABLED = True
 
 from .executor import ModelExecutor
 from .kv_cache import KvCacheManager
@@ -185,6 +188,13 @@ class PyptoQwen14BExecutor(ModelExecutor):
             )
             hidden = out
 
+        if _TIMING_ENABLED:
+            print(
+                f"[timing] prefill: {len(model.layers)} layers, "
+                f"{(time.perf_counter() - t_prefill_start) * 1000:.2f} ms",
+                flush=True,
+            )
+
         last_hidden_rows: list[torch.Tensor] = []
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             seq_len = int(batch.seq_lens[batch_idx].item())
@@ -230,7 +240,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             )
             hidden = out
 
-        final_hidden = hidden.float()
+        final_hidden = out.float()
         logits = self._project_logits(model, final_hidden)
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
@@ -271,6 +281,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             num_heads=model.config.num_attention_heads,
             num_kv_heads=model.config.num_key_value_heads,
             head_dim=model.config.head_dim,
+            num_layers=model.config.num_hidden_layers,
         )
         padded_vocab = _round_up(model.config.vocab_size, _VOCAB_PAD_MULTIPLE)
         final_rms_program = build_qwen3_final_rms_program(
@@ -309,6 +320,8 @@ class PyptoQwen14BExecutor(ModelExecutor):
             self._release_layer_weights(layer)
         final_norm_weight = model.final_norm_weight.view(1, -1).float().cpu()
 
+        decode_weights = self._stack_decode_weights(model)
+
         return _CompiledKernels(
             prefill=prefill,
             decode=decode,
@@ -321,6 +334,35 @@ class PyptoQwen14BExecutor(ModelExecutor):
             padded_lm_head_weight=padded_lm_head_weight,
             layers=layers,
         )
+
+    def _stack_decode_weights(self, model: RuntimeModel) -> dict[str, torch.Tensor]:
+        layers = model.layers
+
+        def stack_kernel_weight(attr: str) -> torch.Tensor:
+            return torch.cat(
+                [self._kernel_weight(getattr(layer, attr)) for layer in layers],
+                dim=0,
+            )
+
+        def stack_norm_weight(attr: str) -> torch.Tensor:
+            return torch.cat(
+                [getattr(layer, attr).view(1, -1).float().cpu() for layer in layers],
+                dim=0,
+            ).contiguous()
+
+        return {
+            "decode_input_rms_weight": stack_norm_weight("input_rms_weight"),
+            "decode_wq": stack_kernel_weight("wq"),
+            "decode_wk": stack_kernel_weight("wk"),
+            "decode_wv": stack_kernel_weight("wv"),
+            "decode_q_norm_weight": stack_norm_weight("q_norm_weight"),
+            "decode_k_norm_weight": stack_norm_weight("k_norm_weight"),
+            "decode_wo": stack_kernel_weight("wo"),
+            "decode_post_rms_weight": stack_norm_weight("post_rms_weight"),
+            "decode_w_gate": stack_kernel_weight("w_gate"),
+            "decode_w_up": stack_kernel_weight("w_up"),
+            "decode_w_down": stack_kernel_weight("w_down"),
+        }
 
     def _project_logits(self, model: RuntimeModel, hidden: torch.Tensor) -> torch.Tensor:
         compiled = self._compiled[model.config.model_id]
