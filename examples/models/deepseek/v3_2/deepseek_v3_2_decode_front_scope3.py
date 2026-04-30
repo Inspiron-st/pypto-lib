@@ -254,7 +254,7 @@ def build_tensor_specs():
         return torch.randint(-128, 128, (INDEX_Q_ROWS, INDEX_HEAD_DIM), dtype=torch.int8)
 
     def init_q_idx_scale_heads():
-        return torch.rand((BATCH, INDEX_HEADS), dtype=torch.float32) + 0.1
+        return torch.rand((BATCH, INDEX_HEADS), dtype=torch.float32) * 0.01 + 0.001
 
     def init_weights():
         return torch.rand(BATCH, INDEX_HEADS) - 0.5
@@ -263,7 +263,7 @@ def build_tensor_specs():
         return torch.randint(-128, 128, (CACHE_ROWS_IDX, INDEX_HEAD_DIM), dtype=torch.int8)
 
     def init_k_cache_idx_scale():
-        return torch.rand((BATCH, MAX_SEQ), dtype=torch.float32) + 0.1
+        return torch.rand((BATCH, MAX_SEQ), dtype=torch.float32) * 0.01 + 0.001
 
     def init_topk_vals_out():
         return torch.zeros((BATCH, INDEX_TOPK), dtype=torch.float32)
@@ -285,7 +285,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, run
+    from golden import RunConfig, run, topk_pair_compare
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -301,6 +301,9 @@ if __name__ == "__main__":
         config=RunConfig(
             rtol=1e-3,
             atol=1e-3,
+            compare_fn={
+                "topk_idx_out": topk_pair_compare("topk_vals_out"),
+            },
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,

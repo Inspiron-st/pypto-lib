@@ -38,6 +38,11 @@ class RunConfig:
             ``profiling``).
         runtime: Kwargs forwarded to :func:`pypto.runtime.execute_compiled`
             (e.g. ``platform``, ``device_id``, ``runtime_profiling``).
+        compare_fn: Per-output-name custom comparators that override
+            ``torch.allclose`` for those tensors. See
+            :func:`golden.validation.validate_golden` for the callable
+            signature, and :func:`golden.validation.topk_pair_compare` for
+            a built-in helper covering top-k index/value outputs.
     """
 
     rtol: float = 1e-5
@@ -45,6 +50,7 @@ class RunConfig:
     compile_only: bool = False
     compile: dict[str, Any] = field(default_factory=dict)
     runtime: dict[str, Any] = field(default_factory=dict)
+    compare_fn: dict[str, Callable] = field(default_factory=dict)
 
 
 @dataclass
@@ -293,7 +299,15 @@ def run(
     # Validate
     with _stage("validate"):
         try:
-            validate_golden(device_outputs, golden_outputs, rtol=config.rtol, atol=config.atol)
+            input_tensors = {spec.name: tensors[spec.name] for spec in tensor_specs if not spec.is_output}
+            validate_golden(
+                device_outputs,
+                golden_outputs,
+                rtol=config.rtol,
+                atol=config.atol,
+                compare_fn=config.compare_fn,
+                inputs=input_tensors,
+            )
         except AssertionError as e:
             return _fail(str(e))
 
