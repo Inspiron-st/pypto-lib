@@ -47,7 +47,7 @@ EPS = 1e-6
 HIDDEN_INV = 1.0 / HIDDEN
 
 # Scope 1 tiles
-SCOPE1_K_CHUNK = 512
+RMSNORM_K_CHUNK = 512
 Q_OUT_CHUNK = 256
 Q_PROJ_K_CHUNK = 128
 KV_OUT_CHUNK = 256
@@ -100,55 +100,49 @@ def build_qwen3_decode_program():
             normed_states = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm"):
                 partial_sq = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
-                for kb in pl.pipeline(HIDDEN // SCOPE1_K_CHUNK, stage=4):
-                    k0 = kb * SCOPE1_K_CHUNK
-                    x_chunk = pl.cast(hidden_states[:, k0 : k0 + SCOPE1_K_CHUNK], target_type=pl.FP32)
+                for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK, stage=4):
+                    k0 = kb * RMSNORM_K_CHUNK
+                    x_chunk = pl.cast(hidden_states[:, k0 : k0 + RMSNORM_K_CHUNK], target_type=pl.FP32)
                     partial_sq = pl.add(partial_sq, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, BATCH]))
                 variance = pl.reshape(pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS), [BATCH, 1])
                 inv_rms = pl.recip(pl.sqrt(variance))
-                for kb in pl.pipeline(HIDDEN // SCOPE1_K_CHUNK, stage=4):
-                    k0 = kb * SCOPE1_K_CHUNK
-                    x_chunk = pl.cast(hidden_states[:, k0 : k0 + SCOPE1_K_CHUNK], target_type=pl.FP32)
-                    gamma = input_rms_weight[:, k0 : k0 + SCOPE1_K_CHUNK]
+                for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK, stage=4):
+                    k0 = kb * RMSNORM_K_CHUNK
+                    x_chunk = pl.cast(hidden_states[:, k0 : k0 + RMSNORM_K_CHUNK], target_type=pl.FP32)
+                    gamma = input_rms_weight[:, k0 : k0 + RMSNORM_K_CHUNK]
                     normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms), gamma)
                     normed_states = pl.assemble(normed_states, pl.cast(normed, target_type=pl.BF16), [0, k0])
 
             # Q projection.
             for q0 in pl.parallel(0, HIDDEN, Q_OUT_CHUNK):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
-                    tile_a_0 = normed_states[:, 0 : Q_PROJ_K_CHUNK]
-                    tile_b_0 = wq[0 : Q_PROJ_K_CHUNK, q0 : q0 + Q_OUT_CHUNK]
-                    q_acc = pl.matmul(tile_a_0, tile_b_0, out_dtype=pl.FP32)
-                    tile_a_1 = normed_states[:, Q_PROJ_K_CHUNK : 2 * Q_PROJ_K_CHUNK]
-                    tile_b_1 = wq[Q_PROJ_K_CHUNK : 2 * Q_PROJ_K_CHUNK, q0 : q0 + Q_OUT_CHUNK]
-                    q_acc = pl.matmul_acc(q_acc, tile_a_1, tile_b_1)
-                    for kb in pl.pipeline(2, HIDDEN // Q_PROJ_K_CHUNK, stage=2):
+                    q_acc = pl.create_tensor([BATCH, Q_OUT_CHUNK], dtype=pl.FP32)
+                    for kb in pl.pipeline(0, HIDDEN // Q_PROJ_K_CHUNK, stage=2):
                         k0 = kb * Q_PROJ_K_CHUNK
                         tile_a_i = normed_states[:, k0 : k0 + Q_PROJ_K_CHUNK]
                         tile_b_i = wq[k0 : k0 + Q_PROJ_K_CHUNK, q0 : q0 + Q_OUT_CHUNK]
-                        q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
+                        if k0 == 0:
+                            q_acc = pl.matmul(tile_a_i, tile_b_i, out_dtype=pl.FP32)
+                        else:
+                            q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
                     q_proj = pl.assemble(q_proj, q_acc, [0, q0])
 
             # K/V projection.
             for kv0 in pl.parallel(0, KV_HIDDEN, KV_OUT_CHUNK):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj"):
-                    tile_a_0 = normed_states[:, 0 : KV_PROJ_K_CHUNK]
-                    tile_wk_0 = wk[0 : KV_PROJ_K_CHUNK, kv0 : kv0 + KV_OUT_CHUNK]
-                    tile_wv_0 = wv[0 : KV_PROJ_K_CHUNK, kv0 : kv0 + KV_OUT_CHUNK]
-                    k_acc = pl.matmul(tile_a_0, tile_wk_0, out_dtype=pl.FP32)
-                    v_acc = pl.matmul(tile_a_0, tile_wv_0, out_dtype=pl.FP32)
-                    tile_a_1 = normed_states[:, KV_PROJ_K_CHUNK : 2 * KV_PROJ_K_CHUNK]
-                    tile_wk_1 = wk[KV_PROJ_K_CHUNK : 2 * KV_PROJ_K_CHUNK, kv0 : kv0 + KV_OUT_CHUNK]
-                    tile_wv_1 = wv[KV_PROJ_K_CHUNK : 2 * KV_PROJ_K_CHUNK, kv0 : kv0 + KV_OUT_CHUNK]
-                    k_acc = pl.matmul_acc(k_acc, tile_a_1, tile_wk_1)
-                    v_acc = pl.matmul_acc(v_acc, tile_a_1, tile_wv_1)
-                    for kb in pl.pipeline(2, HIDDEN // KV_PROJ_K_CHUNK, stage=2):
+                    k_acc = pl.create_tensor([BATCH, KV_OUT_CHUNK], dtype=pl.FP32)
+                    v_acc = pl.create_tensor([BATCH, KV_OUT_CHUNK], dtype=pl.FP32)
+                    for kb in pl.pipeline(0, HIDDEN // KV_PROJ_K_CHUNK, stage=2):
                         k0 = kb * KV_PROJ_K_CHUNK
                         tile_a_i = normed_states[:, k0 : k0 + KV_PROJ_K_CHUNK]
                         tile_wk_i = wk[k0 : k0 + KV_PROJ_K_CHUNK, kv0 : kv0 + KV_OUT_CHUNK]
                         tile_wv_i = wv[k0 : k0 + KV_PROJ_K_CHUNK, kv0 : kv0 + KV_OUT_CHUNK]
-                        k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
-                        v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
+                        if k0 == 0:
+                            k_acc = pl.matmul(tile_a_i, tile_wk_i, out_dtype=pl.FP32)
+                            v_acc = pl.matmul(tile_a_i, tile_wv_i, out_dtype=pl.FP32)
+                        else:
+                            k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
+                            v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
                     k_proj = pl.assemble(k_proj, k_acc, [0, kv0])
                     v_proj = pl.assemble(v_proj, v_acc, [0, kv0])
 
@@ -324,18 +318,16 @@ def build_qwen3_decode_program():
                 with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)], name_hint="out_proj_residual"):
                     for oi in pl.range(ob, ob + 2):
                         o0 = oi * Q_OUT_CHUNK
-                        a_chunk_0 = attn_out[:, 0 : OUT_PROJ_K_CHUNK]
-                        w_chunk_0 = wo[0 : OUT_PROJ_K_CHUNK, o0 : o0 + Q_OUT_CHUNK]
                         hidden_chunk = hidden_states[:, o0 : o0 + Q_OUT_CHUNK]
-                        o_acc = pl.matmul(a_chunk_0, w_chunk_0, out_dtype=pl.FP32)
-                        a_chunk_1 = attn_out[:, OUT_PROJ_K_CHUNK : 2 * OUT_PROJ_K_CHUNK]
-                        w_chunk_1 = wo[OUT_PROJ_K_CHUNK : 2 * OUT_PROJ_K_CHUNK, o0 : o0 + Q_OUT_CHUNK]
-                        o_acc = pl.matmul_acc(o_acc, a_chunk_1, w_chunk_1)
-                        for kb in pl.pipeline(2, HIDDEN // OUT_PROJ_K_CHUNK, stage=2):
+                        o_acc = pl.create_tensor([BATCH, Q_OUT_CHUNK], dtype=pl.FP32)
+                        for kb in pl.pipeline(0, HIDDEN // OUT_PROJ_K_CHUNK, stage=2):
                             k0 = kb * OUT_PROJ_K_CHUNK
                             a_chunk = attn_out[:, k0 : k0 + OUT_PROJ_K_CHUNK]
                             w_chunk = wo[k0 : k0 + OUT_PROJ_K_CHUNK, o0 : o0 + Q_OUT_CHUNK]
-                            o_acc = pl.matmul_acc(o_acc, a_chunk, w_chunk)
+                            if k0 == 0:
+                                o_acc = pl.matmul(a_chunk, w_chunk, out_dtype=pl.FP32)
+                            else:
+                                o_acc = pl.matmul_acc(o_acc, a_chunk, w_chunk)
                         resid = pl.cast(hidden_chunk, target_type=pl.FP32)
                         resid_sum = pl.add(o_acc, resid)
                         resid1_tile = pl.assemble(resid1_tile, resid_sum, [0, o0])
@@ -360,29 +352,27 @@ def build_qwen3_decode_program():
             # Stage 4 & 5 & 6: MLP gate/up projections + SiLU.
             mlp_tile = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.BF16)
             for o0 in pl.parallel(0, INTERMEDIATE, MLP_OUT_CHUNK):
-                post_chunk_0 = post_norm_tile[:, 0 : K_CHUNK]
-                post_chunk_1 = post_norm_tile[:, K_CHUNK : 2 * K_CHUNK]
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_proj"):
-                    wg_0 = w_gate[0 : K_CHUNK, o0 : o0 + MLP_OUT_CHUNK]
-                    gate_acc = pl.matmul(post_chunk_0, wg_0, out_dtype=pl.FP32)
-                    wg_1 = w_gate[K_CHUNK : 2 * K_CHUNK, o0 : o0 + MLP_OUT_CHUNK]
-                    gate_acc = pl.matmul_acc(gate_acc, post_chunk_1, wg_1)
-                    for kb in pl.pipeline(2, HIDDEN // K_CHUNK, stage=2):
+                    gate_acc = pl.create_tensor([BATCH, MLP_OUT_CHUNK], dtype=pl.FP32)
+                    for kb in pl.pipeline(0, HIDDEN // K_CHUNK, stage=2):
                         k0 = kb * K_CHUNK
                         post_chunk = post_norm_tile[:, k0 : k0 + K_CHUNK]
                         wg = w_gate[k0 : k0 + K_CHUNK, o0 : o0 + MLP_OUT_CHUNK]
-                        gate_acc = pl.matmul_acc(gate_acc, post_chunk, wg)
+                        if k0 == 0:
+                            gate_acc = pl.matmul(post_chunk, wg, out_dtype=pl.FP32)
+                        else:
+                            gate_acc = pl.matmul_acc(gate_acc, post_chunk, wg)
 
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="up_proj"):
-                    wu_0 = w_up[0 : K_CHUNK, o0 : o0 + MLP_OUT_CHUNK]
-                    up_acc = pl.matmul(post_chunk_0, wu_0, out_dtype=pl.FP32)
-                    wu_1 = w_up[K_CHUNK : 2 * K_CHUNK, o0 : o0 + MLP_OUT_CHUNK]
-                    up_acc = pl.matmul_acc(up_acc, post_chunk_1, wu_1)
-                    for kb in pl.pipeline(2, HIDDEN // K_CHUNK, stage=2):
+                    up_acc = pl.create_tensor([BATCH, MLP_OUT_CHUNK], dtype=pl.FP32)
+                    for kb in pl.pipeline(0, HIDDEN // K_CHUNK, stage=2):
                         k0 = kb * K_CHUNK
                         post_chunk = post_norm_tile[:, k0 : k0 + K_CHUNK]
                         wu = w_up[k0 : k0 + K_CHUNK, o0 : o0 + MLP_OUT_CHUNK]
-                        up_acc = pl.matmul_acc(up_acc, post_chunk, wu)
+                        if k0 == 0:
+                            up_acc = pl.matmul(post_chunk, wu, out_dtype=pl.FP32)
+                        else:
+                            up_acc = pl.matmul_acc(up_acc, post_chunk, wu)
 
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="silu"):
                     sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
@@ -394,18 +384,16 @@ def build_qwen3_decode_program():
                 with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)], name_hint="down_proj_residual"):
                     for di in pl.range(db, db + 2):
                         d0 = di * DOWN_N_CHUNK
-                        mlp_chunk_0 = mlp_tile[:, 0 : DOWN_K_CHUNK]
-                        w_down_chunk_0 = w_down[0 : DOWN_K_CHUNK, d0 : d0 + DOWN_N_CHUNK]
                         resid1_tile_chunk = resid1_tile[:, d0 : d0 + DOWN_N_CHUNK]
-                        down_acc = pl.matmul(mlp_chunk_0, w_down_chunk_0, out_dtype=pl.FP32)
-                        mlp_chunk_1 = mlp_tile[:, DOWN_K_CHUNK : 2 * DOWN_K_CHUNK]
-                        w_down_chunk_1 = w_down[DOWN_K_CHUNK : 2 * DOWN_K_CHUNK, d0 : d0 + DOWN_N_CHUNK]
-                        down_acc = pl.matmul_acc(down_acc, mlp_chunk_1, w_down_chunk_1)
-                        for ob in pl.pipeline(2, INTERMEDIATE // DOWN_K_CHUNK, stage=2):
+                        down_acc = pl.create_tensor([BATCH, DOWN_N_CHUNK], dtype=pl.FP32)
+                        for ob in pl.pipeline(0, INTERMEDIATE // DOWN_K_CHUNK, stage=2):
                             o0 = ob * DOWN_K_CHUNK
                             down_mlp_chunk = mlp_tile[:, o0 : o0 + DOWN_K_CHUNK]
                             w_down_chunk = w_down[o0 : o0 + DOWN_K_CHUNK, d0 : d0 + DOWN_N_CHUNK]
-                            down_acc = pl.matmul_acc(down_acc, down_mlp_chunk, w_down_chunk)
+                            if o0 == 0:
+                                down_acc = pl.matmul(down_mlp_chunk, w_down_chunk, out_dtype=pl.FP32)
+                            else:
+                                down_acc = pl.matmul_acc(down_acc, down_mlp_chunk, w_down_chunk)
                         out_chunk = pl.add(down_acc, resid1_tile_chunk)
                         out = pl.assemble(out, pl.cast(out_chunk, target_type=pl.BF16), [0, d0])
 
