@@ -9,6 +9,8 @@
 
 """Golden output validation."""
 
+from collections.abc import Callable
+
 import torch
 
 
@@ -17,20 +19,64 @@ def validate_golden(
     golden: dict[str, torch.Tensor],
     rtol: float = 1e-5,
     atol: float = 1e-5,
+    compare_fn: dict[str, Callable] | None = None,
+    inputs: dict[str, torch.Tensor] | None = None,
 ) -> None:
-    """Compare actual outputs against golden reference using ``torch.allclose``.
+    """Compare actual outputs against golden reference.
 
-    Reports the per-tensor result for every output (pass or fail), then raises
-    if any tensor failed. This makes mismatches in later tensors visible even
-    when an earlier one already failed.
+    By default uses ``torch.allclose``. ``compare_fn`` overrides the default
+    for specific output names — useful for tensors where exact equality is
+    not the right notion of correctness (e.g. top-k index outputs where
+    near-tie scores can produce legal index swaps).
+
+    Each callable in ``compare_fn`` receives:
+
+        cmp(actual, expected, *,
+            actual_outputs, expected_outputs, inputs, rtol, atol)
+            -> tuple[bool, str]
+
+    where the second tuple element is a diagnostic message used on failure.
+
+    Args:
+        outputs: Kernel output tensors keyed by name.
+        golden: Golden reference tensors keyed by name.
+        rtol: Default relative tolerance.
+        atol: Default absolute tolerance.
+        compare_fn: Per-name custom comparators, applied instead of allclose.
+        inputs: Input tensors of the run, exposed to custom comparators.
 
     Raises:
-        AssertionError: If any output tensor does not match within tolerances.
+        AssertionError: If any output tensor does not match.
     """
+    compare_fn = compare_fn or {}
+    inputs = inputs or {}
     failures: dict[str, str] = {}
     for name, actual_tensor in outputs.items():
         actual = actual_tensor.cpu()
         expected = golden[name].cpu()
+
+        if name in compare_fn:
+            fn = compare_fn[name]
+            label = getattr(fn, "__name__", "custom")
+            ok, detail = fn(
+                actual,
+                expected,
+                actual_outputs=outputs,
+                expected_outputs=golden,
+                inputs=inputs,
+                rtol=rtol,
+                atol=atol,
+            )
+            if ok:
+                print(f"[RUN]   '{name}' PASS  shape={tuple(actual.shape)} dtype={actual.dtype} ({label})")
+                continue
+            msg = (
+                f"  '{name}' FAIL ({label})  shape={tuple(actual.shape)} dtype={actual.dtype}\n"
+                f"{detail}"
+            )
+            print(f"[RUN]   '{name}' FAIL  shape={tuple(actual.shape)} dtype={actual.dtype} ({label})")
+            failures[name] = msg
+            continue
 
         ok = torch.allclose(actual, expected, rtol=rtol, atol=atol)
         if ok:
@@ -60,3 +106,65 @@ def validate_golden(
         raise AssertionError(
             f"Output(s) does not match golden: {list(failures)}\n{detail}"
         )
+
+
+def topk_pair_compare(vals_name: str) -> Callable:
+    """Return a comparator for top-k outputs that is robust to score ties.
+
+    For a top-k operation that emits both an index tensor and a paired value
+    tensor, kernel-vs-golden index mismatches are legal whenever the picked
+    score sets are equivalent — e.g. when INT8 quantization collapses several
+    candidates onto the same score.
+
+    The returned comparator looks up the paired value tensors (kernel and
+    golden) by ``vals_name`` and checks that, per row, the values are equal
+    after sorting. This passes legal tie-break swaps and fails real misses
+    (where one side picked a strictly lower-scoring candidate).
+
+    Use it for the index tensor; the value tensor itself can stay on the
+    default ``allclose`` path because top-k outputs are conventionally
+    emitted in descending score order, so equivalent score sets line up
+    positionally.
+
+        compare_fn = {
+            "topk_idx_out": topk_pair_compare("topk_vals_out"),
+        }
+    """
+    def cmp(
+        actual: torch.Tensor,
+        expected: torch.Tensor,
+        *,
+        actual_outputs: dict[str, torch.Tensor],
+        expected_outputs: dict[str, torch.Tensor],
+        inputs: dict[str, torch.Tensor],
+        rtol: float,
+        atol: float,
+    ) -> tuple[bool, str]:
+        if vals_name not in actual_outputs or vals_name not in expected_outputs:
+            return False, (
+                f"    compare_fn misconfigured: vals_name='{vals_name}' not found "
+                f"(outputs={list(actual_outputs)}, golden={list(expected_outputs)})"
+            )
+        a_vals = actual_outputs[vals_name].cpu().to(torch.float32)
+        e_vals = expected_outputs[vals_name].cpu().to(torch.float32)
+        if a_vals.shape != e_vals.shape:
+            return False, f"    vals shape mismatch: {tuple(a_vals.shape)} vs {tuple(e_vals.shape)}"
+        a_sorted = torch.sort(a_vals, dim=-1, descending=True).values
+        e_sorted = torch.sort(e_vals, dim=-1, descending=True).values
+        ok = torch.allclose(a_sorted, e_sorted, rtol=rtol, atol=atol)
+        if ok:
+            return True, ""
+        diff = (a_sorted - e_sorted).abs()
+        flat_diff = diff.reshape(-1, diff.shape[-1])
+        b_worst = int(flat_diff.amax(dim=-1).argmax().item())
+        a_row = a_sorted.reshape(-1, a_sorted.shape[-1])[b_worst]
+        e_row = e_sorted.reshape(-1, e_sorted.shape[-1])[b_worst]
+        worst_diff = float((a_row - e_row).abs().max().item())
+        return False, (
+            f"    top-k pair mismatch via '{vals_name}' "
+            f"(rtol={rtol} atol={atol}): worst row={b_worst} max_diff={worst_diff:.6g}\n"
+            f"      actual_sorted  = {a_row.tolist()}\n"
+            f"      expected_sorted= {e_row.tolist()}"
+        )
+    cmp.__name__ = "topk_pair_compare"
+    return cmp

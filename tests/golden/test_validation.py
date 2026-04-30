@@ -12,7 +12,7 @@
 import pytest
 
 import torch
-from golden.validation import validate_golden
+from golden.validation import topk_pair_compare, validate_golden
 
 
 class TestValidateGolden:
@@ -109,6 +109,221 @@ class TestValidateGolden:
         expected = torch.tensor([1.1])
         with pytest.raises(AssertionError, match="does not match golden"):
             validate_golden({"out": actual}, {"out": expected})
+
+
+class TestCompareFnDispatch:
+    """Tests for the compare_fn override path in validate_golden."""
+
+    def test_custom_pass_skips_default(self):
+        """A compare_fn returning True bypasses the default allclose check."""
+        actual = torch.tensor([1.0, 2.0])
+        expected = torch.tensor([100.0, 200.0])  # would fail under allclose
+
+        def always_pass(a, e, *, actual_outputs, expected_outputs, inputs, rtol, atol):
+            return True, ""
+
+        validate_golden(
+            {"out": actual}, {"out": expected},
+            compare_fn={"out": always_pass},
+        )
+
+    def test_custom_fail_raises_with_detail(self):
+        """A compare_fn returning False raises AssertionError carrying the detail."""
+        t = torch.tensor([1.0])
+
+        def always_fail(a, e, *, actual_outputs, expected_outputs, inputs, rtol, atol):
+            return False, "    custom-detail-marker"
+
+        with pytest.raises(AssertionError, match="custom-detail-marker"):
+            validate_golden(
+                {"out": t}, {"out": t.clone()},
+                compare_fn={"out": always_fail},
+            )
+
+    def test_custom_receives_full_context(self):
+        """The compare_fn receives all outputs, golden, inputs, and tolerances."""
+        captured = {}
+
+        def capture(a, e, *, actual_outputs, expected_outputs, inputs, rtol, atol):
+            captured["actual_outputs"] = set(actual_outputs)
+            captured["expected_outputs"] = set(expected_outputs)
+            captured["inputs"] = set(inputs)
+            captured["rtol"] = rtol
+            captured["atol"] = atol
+            return True, ""
+
+        validate_golden(
+            {"a": torch.tensor([1.0]), "b": torch.tensor([2.0])},
+            {"a": torch.tensor([1.0]), "b": torch.tensor([2.0])},
+            rtol=1e-2, atol=1e-3,
+            compare_fn={"a": capture},
+            inputs={"x": torch.tensor([0.0])},
+        )
+        assert captured["actual_outputs"] == {"a", "b"}
+        assert captured["expected_outputs"] == {"a", "b"}
+        assert captured["inputs"] == {"x"}
+        assert captured["rtol"] == 1e-2
+        assert captured["atol"] == 1e-3
+
+    def test_partial_override_other_uses_default(self):
+        """Names not in compare_fn still go through the default allclose path."""
+        ok = torch.tensor([1.0])
+        bad_actual = torch.tensor([1.0])
+        bad_expected = torch.tensor([5.0])
+
+        def always_pass(a, e, *, actual_outputs, expected_outputs, inputs, rtol, atol):
+            return True, ""
+
+        # 'a' overridden to pass, 'b' uses default and fails -> overall fail.
+        with pytest.raises(AssertionError, match="'b'"):
+            validate_golden(
+                {"a": bad_actual, "b": bad_actual},
+                {"a": bad_expected, "b": bad_expected},
+                compare_fn={"a": always_pass},
+            )
+        # Sanity: with both overridden it passes.
+        validate_golden(
+            {"a": bad_actual, "b": bad_actual},
+            {"a": bad_expected, "b": bad_expected},
+            compare_fn={"a": always_pass, "b": always_pass},
+        )
+        # Sanity: defaults pass when tensors match.
+        validate_golden({"a": ok}, {"a": ok.clone()})
+
+
+class TestTopkPairCompare:
+    """Tests for the topk_pair_compare helper."""
+
+    def test_legal_tie_break_passes(self):
+        """Same picked-score set with different idx ordering passes."""
+        idx_actual = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+        idx_expected = torch.tensor([[2, 1, 0]], dtype=torch.int32)
+        # Both sides report the same set of picked vals (sorted desc).
+        vals = torch.tensor([[3.0, 2.0, 1.0]])
+
+        cmp = topk_pair_compare("vals")
+        ok, _ = cmp(
+            idx_actual, idx_expected,
+            actual_outputs={"vals": vals},
+            expected_outputs={"vals": vals.clone()},
+            inputs={},
+            rtol=1e-3, atol=1e-3,
+        )
+        assert ok
+
+    def test_real_miss_fails(self):
+        """If one side picked a strictly lower-scoring candidate, fail."""
+        idx_actual = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+        idx_expected = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+        vals_actual = torch.tensor([[3.0, 2.0, 0.5]])    # picked a 0.5
+        vals_expected = torch.tensor([[3.0, 2.0, 1.0]])  # had a 1.0 there
+
+        cmp = topk_pair_compare("vals")
+        ok, detail = cmp(
+            idx_actual, idx_expected,
+            actual_outputs={"vals": vals_actual},
+            expected_outputs={"vals": vals_expected},
+            inputs={},
+            rtol=1e-3, atol=1e-3,
+        )
+        assert not ok
+        assert "top-k pair mismatch" in detail
+        assert "0.5" in detail and "1.0" in detail
+
+    def test_within_tolerance_passes(self):
+        """Score sets within rtol/atol pass even if not bit-exact."""
+        idx = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+        vals_a = torch.tensor([[3.0, 2.0, 1.0]])
+        vals_b = torch.tensor([[3.0005, 2.0005, 1.0005]])
+
+        cmp = topk_pair_compare("vals")
+        ok, _ = cmp(
+            idx, idx,
+            actual_outputs={"vals": vals_a},
+            expected_outputs={"vals": vals_b},
+            inputs={},
+            rtol=1e-3, atol=1e-3,
+        )
+        assert ok
+
+    def test_multi_batch_isolated(self):
+        """Per-batch sort: a swap inside one batch should not contaminate another."""
+        idx_actual = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32)
+        idx_expected = torch.tensor([[1, 0], [0, 1]], dtype=torch.int32)
+        vals = torch.tensor([[5.0, 5.0], [2.0, 1.0]])  # batch 0 has a tie
+
+        cmp = topk_pair_compare("vals")
+        ok, _ = cmp(
+            idx_actual, idx_expected,
+            actual_outputs={"vals": vals},
+            expected_outputs={"vals": vals.clone()},
+            inputs={},
+            rtol=1e-5, atol=1e-5,
+        )
+        assert ok
+
+    def test_function_name_for_logging(self):
+        """The returned cmp exposes __name__ for log labelling."""
+        cmp = topk_pair_compare("vals")
+        assert cmp.__name__ == "topk_pair_compare"
+
+    def test_integrated_with_validate_golden(self):
+        """End-to-end: validate_golden uses the helper via compare_fn."""
+        idx_actual = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+        idx_expected = torch.tensor([[2, 1, 0]], dtype=torch.int32)
+        vals = torch.tensor([[3.0, 2.0, 1.0]])
+        validate_golden(
+            {"idx": idx_actual, "vals": vals},
+            {"idx": idx_expected, "vals": vals.clone()},
+            rtol=1e-3, atol=1e-3,
+            compare_fn={"idx": topk_pair_compare("vals")},
+        )
+
+    def test_misconfigured_vals_name_returns_friendly_error(self):
+        """A typo in vals_name should yield a clear failure, not a KeyError."""
+        idx = torch.tensor([[0, 1]], dtype=torch.int32)
+        vals = torch.tensor([[2.0, 1.0]])
+        cmp = topk_pair_compare("typo_vals")
+        ok, detail = cmp(
+            idx, idx,
+            actual_outputs={"vals": vals},
+            expected_outputs={"vals": vals.clone()},
+            inputs={},
+            rtol=1e-3, atol=1e-3,
+        )
+        assert not ok
+        assert "misconfigured" in detail
+        assert "typo_vals" in detail
+
+    def test_ndim_greater_than_two(self):
+        """Helper handles vals with leading rank > 1 (e.g. [B, H, K])."""
+        idx = torch.zeros((2, 3, 4), dtype=torch.int32)
+        vals_a = torch.arange(24.0).reshape(2, 3, 4)
+        # Permute the last dim per row — same set, different order, must pass.
+        vals_b = vals_a.flip(dims=[-1]).contiguous()
+        cmp = topk_pair_compare("vals")
+        ok, _ = cmp(
+            idx, idx,
+            actual_outputs={"vals": vals_a},
+            expected_outputs={"vals": vals_b},
+            inputs={},
+            rtol=1e-5, atol=1e-5,
+        )
+        assert ok
+
+    def test_bfloat16_vals(self):
+        """BF16 vals work — helper promotes to float32 internally."""
+        idx = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+        vals = torch.tensor([[3.0, 2.0, 1.0]], dtype=torch.bfloat16)
+        cmp = topk_pair_compare("vals")
+        ok, _ = cmp(
+            idx, idx,
+            actual_outputs={"vals": vals},
+            expected_outputs={"vals": vals.clone()},
+            inputs={},
+            rtol=1e-3, atol=1e-3,
+        )
+        assert ok
 
 
 if __name__ == "__main__":

@@ -724,7 +724,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, run
+    from golden import RunConfig, run, topk_pair_compare
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -739,6 +739,9 @@ if __name__ == "__main__":
         config=RunConfig(
             rtol=3e-3,
             atol=3e-3,
+            compare_fn={
+                "topk_idx_out": topk_pair_compare("topk_vals_out"),
+            },
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,
