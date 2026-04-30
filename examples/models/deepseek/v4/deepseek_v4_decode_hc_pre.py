@@ -284,8 +284,23 @@ def golden_deepseek_v4_decode_hc_pre(tensors):
 
     shape = x.size()
     x_flat = x.flatten(2)                                  # [B, S, hc*D]
-    rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + NORM_EPS)
-    mixes = (x_flat @ hc_fn.T) * rsqrt                     # [B, S, mix_hc]
+    x_flat_2d = x_flat.reshape(T, HC_DIM)
+
+    sq_sum = torch.zeros(T, 1, dtype=torch.float32)
+    for k0 in range(0, HC_DIM, K_CHUNK):
+        x_chunk = x_flat_2d[:, k0:k0 + K_CHUNK]
+        sq_sum += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
+    rsqrt = torch.rsqrt(sq_sum * HC_DIM_INV + NORM_EPS)
+
+    mix_cols = []
+    for m in range(MIX_HC):
+        mix_col = torch.zeros(T, 1, dtype=torch.float32)
+        for k0 in range(0, HC_DIM, K_CHUNK):
+            x_chunk = x_flat_2d[:, k0:k0 + K_CHUNK]
+            w_chunk = hc_fn[m:m + 1, k0:k0 + K_CHUNK]
+            mix_col += (x_chunk * w_chunk).sum(dim=1, keepdim=True)
+        mix_cols.append(mix_col * rsqrt)
+    mixes = torch.cat(mix_cols, dim=1).reshape(B, S, MIX_HC)  # [B, S, mix_hc]
 
     # hc_split_sinkhorn (port of kernel.py 372-427)
     pre = torch.sigmoid(mixes[..., :HC_MULT] * hc_scale[0] + hc_base[:HC_MULT]) + HC_EPS
@@ -302,9 +317,15 @@ def golden_deepseek_v4_decode_hc_pre(tensors):
         comb_t = comb_t / (comb_t.sum(-1, keepdim=True) + HC_EPS)
         comb_t = comb_t / (comb_t.sum(-2, keepdim=True) + HC_EPS)
 
-    y = (pre.unsqueeze(-1) * x.view(shape)).sum(dim=2)     # [B, S, D]
+    y = torch.zeros(B, S, D, dtype=torch.float32)
+    for h in range(HC_MULT):
+        y += x[:, :, h, :] * pre[:, :, h:h + 1]
 
-    tensors["x_mixed"][:] = y.to(torch.bfloat16)
+    def _to_device_bf16(value):
+        rounded = (value.contiguous().view(torch.int32) + 0x8000) & -0x10000
+        return rounded.view(torch.float32).to(torch.bfloat16)
+
+    tensors["x_mixed"][:] = _to_device_bf16(y)
     tensors["post"][:]    = post_t
     tensors["comb"][:]    = comb_t
 
@@ -316,7 +337,7 @@ def build_tensor_specs():
     def init_x():
         return torch.rand(B, S, HC_MULT, D) - 0.5
     def init_hc_fn():
-        return torch.randn(MIX_HC, HC_DIM) / (HC_DIM ** 0.5)
+        return (torch.randn(MIX_HC, HC_DIM) - 0.5) / (HC_DIM ** 0.5)
     def init_hc_scale():
         return torch.ones(3) * 0.5
     def init_hc_base():
@@ -349,8 +370,8 @@ if __name__ == "__main__":
         specs=build_tensor_specs(),
         golden_fn=golden_deepseek_v4_decode_hc_pre,
         config=RunConfig(
-            rtol=4e-3,
-            atol=4e-3,
+            rtol=1e-3,
+            atol=1e-3,
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,
