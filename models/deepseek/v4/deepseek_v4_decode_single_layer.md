@@ -31,16 +31,27 @@ Legend:
               ╔═══════════════════════════════════════════╗
               ║  moe_router.py                            ║
               ║  model.py:697-698, 564-584                ║
-              ║  (hc_pre ffn + ffn_norm fused + gate)     ║
+              ║  (hc_pre ffn + ffn_norm + gate)           ║
+              ║  hc_pre reuses hc_pre.py with hc_ffn_*    ║
               ║                                           ║
-              ║  IN : x [B,1,4,D]  bf16                   ║
-              ║  OUT: indices [T, TOPK=6]  int32          ║
-              ║       weights [T, TOPK=6]  fp32           ║
+              ║  IN : x_hc [B,1,HC=4,D]  bf16             ║
+              ║       hc_ffn_fn/scale/base                ║
+              ║       norm_w, gate_w, gate_bias           ║
+              ║       tid2eid, input_ids   (hash mode)    ║
+              ║  OUT: x_norm   [T, D]            bf16     ║
+              ║         → dispatch recv_x source          ║
+              ║         → moe_expert x_local (shared)     ║
+              ║       indices  [T, TOPK=6]       int32    ║
+              ║       weights  [T, TOPK=6]       fp32     ║
+              ║       post_ffn [B, 1, 4]         fp32     ║
+              ║       comb_ffn [B, 1, 4, 4]      fp32     ║
+              ║         → hc_post (ffn) post/comb         ║
               ╚═══════════════════════════════════════════╝
                               │
                               ▼
               ┌───────────────────────────────────────────┐
               │  [EP-orch]  dispatch                      │
+              │  inputs : x_norm, indices, weights        │
               │  pack tokens by dest expert rank          │
               │  AllToAllv → recv_x, recv_expert_id,      │
               │              recv_weights                 │
@@ -54,7 +65,7 @@ Legend:
               ║                                           ║
               ║  IN : recv_x  [RECV_TOTAL, D]             ║
               ║       recv_expert_id, recv_weights        ║
-              ║       x_local [T, D]  (for shared only)   ║
+              ║       x_local [T, D]  (= x_norm; shared)  ║
               ║       expert_w1/w2/w3 [N_LOCAL_EXPERTS,…] ║
               ║       shared_w1/w2/w3                     ║
               ║  OUT: recv_y [RECV_TOTAL, D]  bf16        ║
@@ -80,6 +91,7 @@ Legend:
               ║  model.py:700                             ║
               ║                                           ║
               ║  IN : ffn_out [B,1,D], residual [B,1,4,D] ║
+              ║       (residual = moe_router input x_hc)  ║
               ║       post_ffn [B,1,4], comb_ffn [B,1,4,4]║
               ║  OUT: x_next [B, 1, HC=4, D]  bf16        ║
               ╚═══════════════════════════════════════════╝
@@ -306,7 +318,7 @@ inline in the orch and are NOT separate kernels.
 | sparse_attn (+ inverse RoPE fused) | 533-534 | `sparse_attn.py` | skeleton |
 | o_proj | 537-542 | `o_proj.py` | skeleton |
 | hc_post (attn) | 694 | `hc_post.py` | skeleton |
-| moe_router (hc_pre ffn + ffn_norm + gate) | 697-698, 564-584 | `moe_router.py` | skeleton |
+| moe_router (hc_pre ffn + ffn_norm + gate) | 697-698, 564-584 | `moe_router.py` (reuses `hc_pre.py` with hc_ffn_*) | skeleton |
 | EP dispatch | — | [EP-orch] HCCL AllToAllv | — |
 | moe_expert | 636-644 | `moe_expert.py` | skeleton |
 | EP combine | — | [EP-orch] HCCL AllToAllv | — |
@@ -324,11 +336,14 @@ inline in the orch and are NOT separate kernels.
 ## EP topology notes
 
 - **moe_router**: runs on every card with replicated `gate_w`; indices cover
-  global expert space `[0, N_EXPERTS=384)`.
+  global expert space `[0, N_EXPERTS=384)`. Also produces `x_norm` (post
+  ffn_norm hidden state) which is the source for both dispatch's `recv_x`
+  and moe_expert's `x_local`.
 - **moe_expert**: each card holds `N_LOCAL_EXPERTS = N_EXPERTS / EP_WORLD_SIZE`
   routed expert weights. `recv_x` is the post-dispatch token set (source:
-  all cards); `x_local` is the original pre-dispatch local token set (shared
-  expert only). The two inputs are distinct token populations.
+  all cards' x_norm, repacked by destination expert); `x_local` is this
+  card's slice of x_norm (shared expert only). The two inputs are distinct
+  token populations from the same global x_norm.
 - **shared expert**: computed locally on `x_local` with no communication;
   result `sh` stays on the card and is added after combine.
 - **hc_post** (both attn and ffn): same draft file, called twice per Block
