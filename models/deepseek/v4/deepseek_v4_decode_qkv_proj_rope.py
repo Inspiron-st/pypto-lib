@@ -28,6 +28,12 @@ Q_LORA      = 1024             # v4-pro 1536
 HEAD_CHUNK  = 64
 Q_LORA_TILE = 32
 EPS         = 1e-6
+# Derived constants for multi-function type annotations
+Q_BLOCKS      = Q_LORA // Q_LORA_TILE
+HEAD_GROUP    = 8
+assert (H * HEAD_DIM) % (HEAD_CHUNK * HEAD_GROUP) == 0, \
+    "HEAD_BLOCKS must be divisible by HEAD_GROUP"
+HEAD_GROUP_BLOCKS = (H * HEAD_DIM) // (HEAD_CHUNK * HEAD_GROUP)
 
 
 def build_deepseek_v4_decode_qkv_proj_rope_program():
@@ -53,15 +59,11 @@ def build_deepseek_v4_decode_qkv_proj_rope_program():
             Q_LORA_CHUNK = Q_LORA_TILE
             KV_CHUNK = 32
             D_BLOCKS = D // D_CHUNK
-            Q_BLOCKS = Q_LORA // Q_LORA_CHUNK
-            HEAD_BLOCKS = (H * HEAD_DIM) // HEAD_CHUNK
-            HEAD_GROUP = 8
-            HEAD_GROUP_BLOCKS = HEAD_BLOCKS // HEAD_GROUP
             KV_BLOCKS = HEAD_DIM // KV_CHUNK
 
             x_flat = pl.reshape(x, [T, D])
 
-            # Stage 0: fused attn_norm -> token_x_fp32
+            # Stage 0.1: fused attn_norm -> token_x_fp32
             token_x_fp32 = pl.create_tensor([T, D], dtype=pl.FP32)
             with pl.at(level=pl.Level.CORE_GROUP):
                 x_sq_sum = pl.full([1, T], dtype=pl.FP32, value=0.0)
@@ -80,20 +82,26 @@ def build_deepseek_v4_decode_qkv_proj_rope_program():
                     x_normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, x_inv_rms_t), norm_w_chunk)
                     token_x_fp32 = pl.assemble(token_x_fp32, x_normed, [0, d0])
 
-            # Stage 1/2: qr = rms_norm(token_x @ wq_a, gamma_cq)
+            # Stage 0.2: pre-cast token_x for split AIV->AIC flow.
+            token_x_bf16 = pl.create_tensor([T, D], dtype=pl.BF16)
+            for db in pl.parallel(0, D_BLOCKS, 1):
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    d0 = db * D_CHUNK
+                    x_chunk_fp32 = pl.slice(token_x_fp32, [T, D_CHUNK], [0, d0])
+                    token_x_bf16 = pl.assemble(token_x_bf16, pl.cast(x_chunk_fp32, target_type=pl.BF16), [0, d0])
+
+            # Stage 1/2.1: qr = rms_norm(token_x @ wq_a, gamma_cq)
             qr_fp32 = pl.create_tensor([T, Q_LORA], dtype=pl.FP32)
             for qb in pl.parallel(0, Q_BLOCKS, 1):
                 with pl.at(level=pl.Level.CORE_GROUP):
                     q0 = qb * Q_LORA_CHUNK
                     d0_0 = 0
-                    x_chunk_fp32_0 = pl.slice(token_x_fp32, [T, D_CHUNK], [0, d0_0])
-                    x_chunk_bf16_0 = pl.cast(x_chunk_fp32_0, target_type=pl.BF16)
+                    x_chunk_bf16_0 = pl.slice(token_x_bf16, [T, D_CHUNK], [0, d0_0])
                     w_chunk_0 = pl.slice(wq_a, [D_CHUNK, Q_LORA_CHUNK], [d0_0, q0])
                     q_acc = pl.matmul(x_chunk_bf16_0, w_chunk_0, out_dtype=pl.FP32)
                     for db in pl.range(1, D_BLOCKS):
                         d0 = db * D_CHUNK
-                        x_chunk_fp32 = pl.slice(token_x_fp32, [T, D_CHUNK], [0, d0])
-                        x_chunk_bf16 = pl.cast(x_chunk_fp32, target_type=pl.BF16)
+                        x_chunk_bf16 = pl.slice(token_x_bf16, [T, D_CHUNK], [0, d0])
                         w_chunk = pl.slice(wq_a, [D_CHUNK, Q_LORA_CHUNK], [d0, q0])
                         q_acc = pl.matmul_acc(q_acc, x_chunk_bf16, w_chunk)
                     qr_fp32 = pl.assemble(qr_fp32, q_acc, [0, q0])
@@ -117,7 +125,16 @@ def build_deepseek_v4_decode_qkv_proj_rope_program():
                     )
                     qr_normed = pl.col_expand_mul(pl.row_expand_mul(qr_chunk, qr_inv_rms_t), gamma_chunk)
                     qr_fp32 = pl.assemble(qr_fp32, qr_normed, [0, q0])
-                    qr = pl.assemble(qr, pl.cast(qr_normed, target_type=pl.BF16), [0, q0])
+
+            # NOTE: Stage 2.2 must follow normalization, because qr_fp32 now stores
+            # normalized values (after the pl.assemble above). Reordering these
+            # blocks would cast un-normalized accumulators and corrupt q_proj.
+            # Stage 2.2: pre-cast qr for split AIV->AIC flow.
+            for qb in pl.parallel(0, Q_BLOCKS, 1):
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    q0 = qb * Q_LORA_CHUNK
+                    qr_chunk_fp32 = pl.slice(qr_fp32, [T, Q_LORA_CHUNK], [0, q0])
+                    qr = pl.assemble(qr, pl.cast(qr_chunk_fp32, target_type=pl.BF16), [0, q0])
 
             # Stage 3: q_proj = qr @ wq_b (matmul + matmul_acc)
             q_proj_fp32 = pl.create_tensor([T, H * HEAD_DIM], dtype=pl.FP32)
@@ -127,14 +144,14 @@ def build_deepseek_v4_decode_qkv_proj_rope_program():
                         hb = hgb * HEAD_GROUP + hi
                         h0 = hb * HEAD_CHUNK
                         q0_0 = 0
-                        qr_bf_0 = pl.cast(pl.slice(qr_fp32, [T, Q_LORA_CHUNK], [0, q0_0]), target_type=pl.BF16)
+                        qr_bf_0 = pl.slice(qr, [T, Q_LORA_CHUNK], [0, q0_0])
                         wq_0 = pl.slice(wq_b, [Q_LORA_CHUNK, HEAD_CHUNK], [q0_0, h0])
                         col_acc = pl.matmul(qr_bf_0, wq_0, out_dtype=pl.FP32)
                         for qb in pl.range(1, Q_BLOCKS):
                             q0 = qb * Q_LORA_CHUNK
-                            qr_bf16 = pl.cast(pl.slice(qr_fp32, [T, Q_LORA_CHUNK], [0, q0]), target_type=pl.BF16)
+                            qr_bf16_chunk = pl.slice(qr, [T, Q_LORA_CHUNK], [0, q0])
                             wq_chunk = pl.slice(wq_b, [Q_LORA_CHUNK, HEAD_CHUNK], [q0, h0])
-                            col_acc = pl.matmul_acc(col_acc, qr_bf16, wq_chunk)
+                            col_acc = pl.matmul_acc(col_acc, qr_bf16_chunk, wq_chunk)
                         q_proj_fp32 = pl.assemble(q_proj_fp32, col_acc, [0, h0])
 
             # Stage 4: per-head RMSNorm + RoPE on q
@@ -177,14 +194,12 @@ def build_deepseek_v4_decode_qkv_proj_rope_program():
                 with pl.at(level=pl.Level.CORE_GROUP):
                     k0 = kb * KV_CHUNK
                     d0_0 = 0
-                    x_chunk_fp32_0 = pl.slice(token_x_fp32, [T, D_CHUNK], [0, d0_0])
-                    x_chunk_bf16_0 = pl.cast(x_chunk_fp32_0, target_type=pl.BF16)
+                    x_chunk_bf16_0 = pl.slice(token_x_bf16, [T, D_CHUNK], [0, d0_0])
                     wkv_chunk_0 = pl.slice(wkv, [D_CHUNK, KV_CHUNK], [d0_0, k0])
                     kv_acc = pl.matmul(x_chunk_bf16_0, wkv_chunk_0, out_dtype=pl.FP32)
                     for db in pl.range(1, D_BLOCKS):
                         d0 = db * D_CHUNK
-                        x_chunk_fp32 = pl.slice(token_x_fp32, [T, D_CHUNK], [0, d0])
-                        x_chunk_bf16 = pl.cast(x_chunk_fp32, target_type=pl.BF16)
+                        x_chunk_bf16 = pl.slice(token_x_bf16, [T, D_CHUNK], [0, d0])
                         wkv_chunk = pl.slice(wkv, [D_CHUNK, KV_CHUNK], [d0, k0])
                         kv_acc = pl.matmul_acc(kv_acc, x_chunk_bf16, wkv_chunk)
                     kv_fp32 = pl.assemble(kv_fp32, kv_acc, [0, k0])
