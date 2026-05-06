@@ -24,7 +24,7 @@ NUM_HEADS = 64
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
 
-# Tiling constants (aligned to qwen3_32b_decode_tilelet).
+# Tiling constants.
 Q_HEAD_BATCH = 8        # Q heads batched per attention group
 Q_HEAD_PAD = 16         # padded Q rows for cube fractal alignment
 SEQ_TILE = 64           # sequence tile for attention loop

@@ -57,7 +57,7 @@ Typical absolute paths:
 5. Determine the run command. Typical pattern:
    ```bash
    source run.sh  # or manually export env vars
-   python examples/models/qwen3/<script>.py -p a2a3 -d <device>
+   python models/qwen3/<script>.py -p a2a3 -d <device>
    ```
 
 ### Phase 1: Triage — Compiler vs Runtime (Optional Quick Check)
@@ -293,4 +293,4 @@ At any point, if information is missing:
 | Known-good pypto commit | "What is the last pypto commit where precision was passing?" |
 | Which build_output is good | "Which build_output timestamp was from a passing run?" |
 | Platform / device | "Which platform and device ID should I use? (e.g., `-p a2a3 -d 5`)" |
-| Script to run | "Which example script is failing? (e.g., `qwen3_32b_prefill_scope2.py`)" |
+| Script to run | "Which example script is failing? (e.g., `qwen3_14b_prefill.py`)" |

@@ -138,7 +138,7 @@ git show HEAD --stat    # Verify staged files
 ## Checklist
 
 - [ ] Only relevant files staged (no build artifacts)
-- [ ] Code follows `docs/pypto-frontend-coding-style.md` conventions
+- [ ] Code follows `docs/pypto-coding-style.md` conventions
 - [ ] No hardcoded paths or private information
 - [ ] Message format: `Type: description` (under 72 chars, imperative, no period)
 - [ ] Body included for multi-file changes (what + why)
