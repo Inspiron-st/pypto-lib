@@ -13,9 +13,11 @@ from core.engine import LLMEngine
 from core.executor import ModelExecutor
 from core.kv_cache import KvCacheManager
 from core.pypto_executor import PyptoQwen14BExecutor
+from core.pypto_executor import _CompiledKernels
 from core.types import (
     DecodeBatch,
     GenerateConfig,
+    LayerWeights,
     ModelConfig,
     ModelRecord,
     PrefillBatch,
@@ -178,3 +180,86 @@ def test_engine_generate_batch_uses_batched_executor_results():
 
     assert [result.token_ids for result in results] == [[0], [0]]
     assert [result.finish_reason for result in results] == ["eos", "eos"]
+
+
+def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatch):
+    model = _model(max_batch_size=1, page_size=256)
+    model.layers = [_layer(model.config.hidden_size, model.config.intermediate_size, model.config.head_dim)]
+    manager = KvCacheManager()
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    executor = PyptoQwen14BExecutor(manager)
+    cached_layer = executor._kernel_layer_weights(model.layers[0])
+    fake_kernel = _CopyKernel()
+    executor._compiled[model.config.model_id] = _CompiledKernels(
+        prefill=fake_kernel,
+        decode=fake_kernel,
+        final_rms=_NoopKernel(),
+        lm_head=_NoopKernel(),
+        final_norm_weight=torch.ones(1, model.config.hidden_size),
+        rope_cos=torch.zeros(model.runtime.max_seq_len, model.config.head_dim),
+        rope_sin=torch.zeros(model.runtime.max_seq_len, model.config.head_dim),
+        padded_vocab=model.config.vocab_size,
+        padded_lm_head_weight=torch.zeros(model.config.vocab_size, model.config.hidden_size),
+        layers=[cached_layer],
+    )
+    monkeypatch.setattr(
+        PyptoQwen14BExecutor,
+        "_kernel_weight",
+        staticmethod(lambda weight: (_ for _ in ()).throw(AssertionError("_kernel_weight should be cached"))),
+    )
+
+    prefill_alloc = manager.allocate_for_prompt(model.config.model_id, "prefill", 1)
+    executor.run_prefill(
+        model,
+        PrefillBatch(
+            request_ids=["prefill"],
+            token_ids=torch.zeros(1, 1, dtype=torch.long),
+            input_embeddings=torch.ones(1, 1, model.config.hidden_size),
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            kv_allocations=[prefill_alloc],
+        ),
+    )
+    manager.free(prefill_alloc)
+
+    decode_alloc = manager.allocate_for_prompt(model.config.model_id, "decode", 1)
+    executor.run_decode(
+        model,
+        DecodeBatch(
+            request_ids=["decode"],
+            token_ids=torch.zeros(1, 1, dtype=torch.long),
+            hidden_states=torch.ones(1, model.config.hidden_size),
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            kv_allocations=[decode_alloc],
+            block_table=manager.block_table_for_batch([decode_alloc]),
+            slot_mapping=manager.slot_mapping_for_batch([decode_alloc]),
+        ),
+    )
+    manager.free(decode_alloc)
+
+
+def _layer(hidden_size: int, intermediate_size: int, head_dim: int) -> LayerWeights:
+    kv_hidden = head_dim
+    return LayerWeights(
+        input_rms_weight=torch.ones(hidden_size),
+        wq=torch.zeros(hidden_size, hidden_size),
+        wk=torch.zeros(kv_hidden, hidden_size),
+        wv=torch.zeros(kv_hidden, hidden_size),
+        q_norm_weight=torch.ones(head_dim),
+        k_norm_weight=torch.ones(head_dim),
+        wo=torch.zeros(hidden_size, hidden_size),
+        post_rms_weight=torch.ones(hidden_size),
+        w_gate=torch.zeros(intermediate_size, hidden_size),
+        w_up=torch.zeros(intermediate_size, hidden_size),
+        w_down=torch.zeros(hidden_size, intermediate_size),
+    )
+
+
+class _CopyKernel:
+    def __call__(self, hidden, *args, config=None):
+        out = args[-1]
+        out.copy_(hidden)
+
+
+class _NoopKernel:
+    def __call__(self, *args, config=None):
+        return None

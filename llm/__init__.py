@@ -7,6 +7,12 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-from .core import LLMEngine
-
 __all__ = ["LLMEngine"]
+
+
+def __getattr__(name: str):
+    if name == "LLMEngine":
+        from .core import LLMEngine
+
+        return LLMEngine
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
