@@ -15,8 +15,8 @@ jobs:
         platform: [a2a3sim, a5sim]
     env:
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
-      PTOAS_VERSION: v0.35
-      PTOAS_SHA256: 1d310d4050f6a49e4ee865fa790b1a960c833817d984cd56173d289bde08315f
+      PTOAS_VERSION: v0.36
+      PTOAS_SHA256: 07bfedea5a9ba70266925ead70d87d129fc143f4e9ea280651d28cb2942a1055
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
       PTO_ISA_COMMIT: 2c607938
 
@@ -91,7 +91,7 @@ jobs:
         run: |
           : > results.tsv
           failed=""
-          for f in $(find examples/models -name '*.py' ! -name '*draft*' | sort); do
+          for f in $(find models -name '*.py' ! -name '*draft*' | sort); do
             echo "::group::$f"
             if ! timeout --kill-after=10s 300s python "$f" -p ${{ matrix.platform }}; then
               failed="$failed $f"
@@ -105,7 +105,7 @@ jobs:
           # Extra dynamic-batch coverage for qwen3-14b-decode (default loop above
           # already exercises batch=16; re-run with batch=1 and batch=20 to make
           # sure a single compiled program serves arbitrary user_batch values).
-          QWEN3_14B="examples/models/qwen3/14b/qwen3_14b_decode.py"
+          QWEN3_14B="models/qwen3/14b/qwen3_14b_decode.py"
           for B in 1 20; do
             case_name="${QWEN3_14B}[batch=${B}]"
             echo "::group::${case_name}"
@@ -138,8 +138,8 @@ jobs:
     env:
       ASCEND_HOME_PATH: /usr/local/Ascend/cann-8.5.0
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
-      PTOAS_VERSION: v0.35
-      PTOAS_SHA256: 19e0be5c3e53be331ee2921750118748574d4ac1bb5ea95399ef39bcac1846d1
+      PTOAS_VERSION: v0.36
+      PTOAS_SHA256: 698f753b67ca4387e2e4ef96dfdbb35d71295e94f9f5b20a545b34647f548efc
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
       PTO_ISA_COMMIT: 2c607938
     container:
@@ -208,7 +208,7 @@ jobs:
         run: |
           : > results.tsv
           failed=""
-          for f in $(find examples/models -name '*.py' ! -name '*draft*' | sort); do
+          for f in $(find models -name '*.py' ! -name '*draft*' | sort); do
             echo "::group::$f"
             if ! timeout --kill-after=10s 300s python "$f" -p a2a3 -d $DEVICE_ID; then
               failed="$failed $f"
@@ -222,7 +222,7 @@ jobs:
           # Extra dynamic-batch coverage for qwen3-14b-decode (default loop above
           # already exercises batch=16; re-run with batch=1 and batch=20 to make
           # sure a single compiled program serves arbitrary user_batch values).
-          QWEN3_14B="examples/models/qwen3/14b/qwen3_14b_decode.py"
+          QWEN3_14B="models/qwen3/14b/qwen3_14b_decode.py"
           for B in 1 20; do
             case_name="${QWEN3_14B}[batch=${B}]"
             echo "::group::${case_name}"

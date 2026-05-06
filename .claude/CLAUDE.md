@@ -2,61 +2,60 @@
 
 ## Project Overview
 
-PyPTO-Lib is a **primitive tensor function library** built on the pypto programming framework. It defines tensor-level operations (analogous to PyTorch ATen) that the compiler tiles and lowers to PTO-ISA instructions. The library does not fix incore/orchestration boundaries — that is decided by the backend and runtime.
+PyPTO-Lib hosts tensor-level kernels and end-to-end LLM model
+implementations built on the **pypto** programming framework, targeting
+Ascend NPUs (910B/C, 950). It also ships a small inference engine
+(`llm/`) and a golden-validation test harness (`golden/`).
 
-## Directory Structure
+## Repository Layout
 
-- `examples/` — Examples organized by difficulty level
-  - `beginner/` — Basic operations (hello_world, matmul)
-  - `intermediate/` — Multi-step algorithms (softmax, rms_norm, layer_norm, rope)
-  - `models/` — Full LLM model kernels (Qwen3-32B, DeepSeek V3.2)
-- `docs/` — Reference documentation (coding style, runtime design, parallel loops)
-- `tests/` — Lint checks and tests
-- `build_output/` — Generated compilation artifacts (gitignored)
+- `examples/{beginner,intermediate}/` — self-contained kernels for learning the DSL
+- `models/{qwen3,deepseek,kimi,milm}/` — end-to-end LLM kernels by family
+- `llm/` — minimal inference engine (engine, scheduler, kv-cache, sampler)
+- `golden/` — test harness: compile, run on device, validate against torch
+- `tests/` — lint checks and golden-fn unit tests
+- `docs/` — coding-style and workflow reference
+- `build_output/` — generated compilation artifacts (gitignored)
+
+Files ending in `_draft.py` are works-in-progress and excluded from CI.
 
 ## Key Documentation
 
-- `README.md` — Library architecture: tensor vs tile, tiling, fusion, incore scope, primitive set
-- `docs/pypto-frontend-coding-style.md` — PyPTO frontend syntax and coding conventions
-- `docs/pto2_rt.md` — PTO2 runtime (simpler) design principles
-- `docs/para_for.md` — Parallel loop constructs
+- `README.md` — project intro, quick start, dependencies
+- `docs/pypto-coding-style.md` — **canonical** coding style: `pl.at` scopes, four loop constructs (`pl.range`/`pl.parallel`/`pl.pipeline`/`pl.spmd`), vector / cube / mte ops
+- `docs/compile-runtime-workflow.md` — what `python <kernel>.py -p <platform>` does end-to-end (compile passes/codegen → runtime → golden → validate)
 
 ## External Dependencies
 
-| Dependency | Purpose | Repository |
-|------------|---------|------------|
-| **pypto** | Compiler framework (IR, codegen, passes) | `hw-native-sys/pypto` |
-| **ptoas** | PTO assembler & optimizer toolchain | `hw-native-sys/PTOAS` |
-| **simpler** | Runtime (pto-rt2) | `hw-native-sys/simpler` |
+| Repo | Role |
+|------|------|
+| **pypto** | Tile-based programming framework — multi-level IR + codegen |
+| **simpler** | PTO runtime — task graph build/execute on AICPU + AICore (submodule of pypto) |
+| **ptoas** | LLVM/MLIR PTO Bytecode assembler/optimizer |
+| **pto-isa** | PTO Tile Library — virtual tile-ISA implementations |
+
+Pinned versions live in [.github/workflows/ci.yml](../.github/workflows/ci.yml).
 
 ## Environment Setup
 
-Use the `/setup_env` skill to set up the development environment, or refer to `.claude/skills/setup_env/SKILL.md` for manual steps.
+Use the `/setup_env` skill, or refer to `.claude/skills/setup_env/SKILL.md`.
 
 ## Common Commands
 
-### Run an example (requires pypto + ptoas installed)
 ```bash
-python examples/beginner/hello_world.py
+# Run an example on the simulator
+python examples/beginner/hello_world.py -p a2a3sim
+
+# Run a model on real NPU device 0
+python models/qwen3/14b/qwen3_14b_decode.py -p a2a3 -d 0
 ```
 
-### Check codegen output
-```bash
-ls build_output/
-```
-
-## Coding Conventions
-
-1. **Follow `docs/pypto-frontend-coding-style.md`** for all pypto frontend code
-2. Use `import pypto.language as pl` as the standard module prefix
-3. Define tensor functions as **opaque functions** (no incore/orchestration boundary specified)
-4. Use `pl.Tensor`, `pl.Tile`, `pl.Scalar` types with explicit shapes and dtypes
-5. Use `pl.Out[type]` / `pl.InOut[type]` for output/inout parameters
+Every script accepts `-p {a2a3, a2a3sim, a5, a5sim}` and `-d <device_id>`.
 
 ## Important Rules
 
-1. **Read relevant documentation first** — consult `README.md` and `docs/pypto-frontend-coding-style.md` before writing new tensor functions or models
-2. **Consult `.claude/rules/`** for coding conventions (when available)
-3. **Consult `.claude/skills/`** for task-specific workflows (e.g., `setup_env/` for environment setup)
-4. **Avoid including private information** such as usernames, absolute paths with usernames, or other personally identifiable information in documentation or code
-5. **All code comments and documentation should be in English** unless the user explicitly requests otherwise
+1. **Read `docs/pypto-coding-style.md` first** before writing or modifying any kernel — it is the authoritative coding-style reference.
+2. **`docs/compile-runtime-workflow.md`** explains the harness flow; consult it when debugging compile/runtime/validation failures.
+3. **Consult `.claude/skills/`** for task-specific workflows (e.g. `setup_env/`, `bisect-precision/`).
+4. **No private information** (usernames, absolute paths with usernames, etc.) in code or docs.
+5. **All code comments and documentation in English** unless the user explicitly requests otherwise.
