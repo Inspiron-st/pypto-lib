@@ -6,28 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+"""Registered comparison cases.
 
-from __future__ import annotations
-
-import importlib.util
-from pathlib import Path
-
-
-_KERNEL_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "examples"
-    / "models"
-    / "qwen3"
-    / "14b"
-    / "qwen3_14b_decode_full.py"
-)
-_SPEC = importlib.util.spec_from_file_location("_qwen3_14b_decode_kernel", _KERNEL_PATH)
-if _SPEC is None or _SPEC.loader is None:
-    raise ImportError(f"Unable to load Qwen3-14B decode kernel from {_KERNEL_PATH}")
-
-_KERNEL = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(_KERNEL)
-
-build_qwen3_decode_program = _KERNEL.build_qwen3_decode_program
-
-__all__ = ["build_qwen3_decode_program"]
+Every module in this package is auto-imported by the CLI so that each
+``@register_case("...")`` decorator runs at import time.
+"""
