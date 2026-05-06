@@ -6,8 +6,11 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 MoE FFN norm + router (decode): RMSNorm then sqrt-softplus gate score, with a hash
-branch (tid2eid lookup) for the first n_hash_layers. Outputs per-token expert indices + weights."""
+"""DeepSeek-V4 MoE FFN router decode orchestration.
+Composes Block.hc_pre (ffn) + ffn_norm + Gate.forward (model.py:697-698, 564-584). Outputs the
+post-norm hidden state `x_norm` for downstream EP dispatch / shared-expert input, the per-token
+top-k expert indices+weights, and the post/comb tensors required by hc_post (ffn).
+Companion file: deepseek_v4_decode_hc_pre.py (reused via the same Compute, weights swapped to hc_ffn_*)."""
 
 
 import pypto.language as pl
@@ -24,75 +27,116 @@ TOPK        = 2                # v4-pro 6
 ROUTE_SCALE = 1.0              # v4-pro 2.5
 VOCAB       = 129280
 
-# "score" for most layers (learned gate scores + bias + topk).
-# "hash" for the first n_hash_layers (tid2eid lookup, no topk).
-MODE        = "score"
+# Per-layer routing mode is fixed at build time: layers with LAYER_ID < N_HASH_LAYERS
+# do tid2eid lookup (no scores, no bias, no topk); the rest do learned-score + bias + topk.
+# Mirrors `Gate.hash = layer_id < args.n_hash_layers` (model.py:556).
+LAYER_ID      = 1               # this layer's index in the Transformer stack
+N_HASH_LAYERS = 0               # v4-pro ModelArgs default; raise to make the first few layers hash-routed
+
+# hc_pre (ffn)
+HC_MULT          = 4
+MIX_HC           = (2 + HC_MULT) * HC_MULT
+HC_DIM           = HC_MULT * D
 
 
 def build_deepseek_v4_decode_moe_router_program():
     @pl.program
     class DeepSeekV4DecodeMoERouter:
-        @pl.function(type=pl.FunctionType.Opaque)
+        @pl.function(type=pl.FunctionType.Orchestration)
         def deepseek_v4_decode_moe_router(
             self,
-            x:         pl.Tensor[[B, S, D],            pl.BF16],
-            norm_w:    pl.Tensor[[D],                  pl.FP32],
-            gate_w:    pl.Tensor[[N_EXPERTS, D],       pl.FP32],
-            gate_bias: pl.Tensor[[N_EXPERTS],          pl.FP32],
-            tid2eid:   pl.Tensor[[VOCAB, TOPK],        pl.INT32],
-            input_ids: pl.Tensor[[B, S],               pl.INT64],
-            indices:   pl.Out[pl.Tensor[[T, TOPK],     pl.INT32]],
-            weights:   pl.Out[pl.Tensor[[T, TOPK],     pl.FP32]],
+            x_hc:         pl.Tensor[[B, S, HC_MULT, D],            pl.BF16],
+            # hc_pre (ffn) weights
+            hc_ffn_fn:    pl.Tensor[[MIX_HC, HC_DIM],              pl.FP32],
+            hc_ffn_scale: pl.Tensor[[3],                           pl.FP32],
+            hc_ffn_base:  pl.Tensor[[MIX_HC],                      pl.FP32],
+            # ffn_norm + gate weights
+            norm_w:       pl.Tensor[[D],                           pl.FP32],
+            gate_w:       pl.Tensor[[N_EXPERTS, D],                pl.FP32],
+            gate_bias:    pl.Tensor[[N_EXPERTS],                   pl.FP32],
+            tid2eid:      pl.Tensor[[VOCAB, TOPK],                 pl.INT32],
+            input_ids:    pl.Tensor[[B, S],                        pl.INT64],
+            x_norm:       pl.Out[pl.Tensor[[T, D],                 pl.BF16]],
+            indices:      pl.Out[pl.Tensor[[T, TOPK],              pl.INT32]],
+            weights:      pl.Out[pl.Tensor[[T, TOPK],              pl.FP32]],
+            post_ffn:     pl.Out[pl.Tensor[[B, S, HC_MULT],        pl.FP32]],
+            comb_ffn:     pl.Out[pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32]],
         ):
-            # TODO: kernel implementation
-            return indices, weights
+            # TODO: orchestration body (dispatches the per-step kernels)
+            return x_norm, indices, weights, post_ffn, comb_ffn
 
     return DeepSeekV4DecodeMoERouter
 
 
 def golden_deepseek_v4_decode_moe_router(tensors):
-    """Torch reference: RMSNorm then Gate.forward (model.py 191-196, 564-584)."""
+    """End-to-end orchestration: Block.hc_pre (ffn) + ffn_norm + Gate.forward.
+    Mirrors model.py:697-698 (Block.forward ffn half) + 191-196 (RMSNorm) + 564-584 (Gate.forward)."""
     import torch
     import torch.nn.functional as F
 
-    x         = tensors["x"].float()              # [B, S, D]
-    norm_w    = tensors["norm_w"].float()          # [D]
-    gate_w    = tensors["gate_w"].float()          # [N_EXPERTS, D]
-    gate_bias = tensors["gate_bias"].float()       # [N_EXPERTS]
-    tid2eid   = tensors["tid2eid"]                 # [VOCAB, TOPK]
-    input_ids = tensors["input_ids"]               # [B, S]
+    from deepseek_v4_decode_hc_pre import golden_deepseek_v4_decode_hc_pre
 
-    # ffn_norm: RMSNorm (model.py 191-196)
-    var = x.square().mean(-1, keepdim=True)
-    x_norm = x * torch.rsqrt(var + NORM_EPS)
-    x_norm = (norm_w * x_norm).to(torch.float32)  # [B, S, D]
+    # ---- Block.hc_pre (model.py:697); reuses attn-side hc_pre kernel with hc_ffn_* weights. ----
+    x_mixed = torch.zeros(B, S, D, dtype=torch.bfloat16)
+    post_t = torch.zeros(B, S, HC_MULT)
+    comb_t = torch.zeros(B, S, HC_MULT, HC_MULT)
+    golden_deepseek_v4_decode_hc_pre({
+        "x": tensors["x_hc"],
+        "hc_fn": tensors["hc_ffn_fn"],
+        "hc_scale": tensors["hc_ffn_scale"],
+        "hc_base": tensors["hc_ffn_base"],
+        "x_mixed": x_mixed,
+        "post": post_t,
+        "comb": comb_t,
+    })
 
-    x_flat = x_norm.view(T, D)                     # [T, D]
+    # ---- ffn_norm (RMSNorm, model.py:191-196 fused into Block at line 698) ----
+    norm_w = tensors["norm_w"].float()
+    x_f = x_mixed.float()
+    var = x_f.square().mean(-1, keepdim=True)
+    x_n = x_f * torch.rsqrt(var + NORM_EPS)
+    # RMSNorm returns the original dtype (bf16); preserves the cast that downstream gate/expert see.
+    x_normalized = (norm_w * x_n).to(torch.bfloat16)         # [B, S, D]
 
-    # Gate.forward (model.py 564-584)
-    scores = F.softplus(x_flat @ gate_w.T).sqrt()  # [T, N_EXPERTS]
+    x_flat = x_normalized.view(T, D)                          # [T, D] bf16
+
+    # ---- Gate.forward (model.py:564-584); sqrtsoftplus path. ----
+    gate_w = tensors["gate_w"].float()
+    gate_bias = tensors["gate_bias"].float()
+    scores = F.softplus(x_flat.float() @ gate_w.T).sqrt()    # [T, N_EXPERTS]
     original_scores = scores
 
-    if MODE == "score":
-        biased  = scores + gate_bias
-        indices = biased.topk(TOPK, dim=-1).indices                   # [T, TOPK]
-    else:  # "hash"
-        indices = tid2eid[input_ids.flatten().long()]                 # [T, TOPK]
+    if LAYER_ID >= N_HASH_LAYERS:
+        biased = scores + gate_bias
+        indices = biased.topk(TOPK, dim=-1).indices           # [T, TOPK]
+    else:                                                     # hash-routed layer
+        tid2eid = tensors["tid2eid"]
+        input_ids = tensors["input_ids"]
+        indices = tid2eid[input_ids.flatten().long()]         # [T, TOPK]
 
-    weights = original_scores.gather(1, indices.long())               # [T, TOPK]
+    weights = original_scores.gather(1, indices.long())       # [T, TOPK]
     weights = weights / weights.sum(dim=-1, keepdim=True)
     weights = weights * ROUTE_SCALE
 
-    tensors["indices"][:] = indices.to(torch.int32)
-    tensors["weights"][:] = weights.to(torch.float32)
+    tensors["x_norm"][:]   = x_flat
+    tensors["indices"][:]  = indices.to(torch.int32)
+    tensors["weights"][:]  = weights.to(torch.float32)
+    tensors["post_ffn"][:] = post_t
+    tensors["comb_ffn"][:] = comb_t
 
 
 def build_tensor_specs():
     import torch
     from golden import TensorSpec
 
-    def init_x():
-        return torch.randn(B, S, D) * 0.1
+    def init_x_hc():
+        return torch.randn(B, S, HC_MULT, D) * 0.1
+    def init_hc_ffn_fn():
+        return torch.randn(MIX_HC, HC_DIM) / HC_DIM ** 0.5
+    def init_hc_ffn_scale():
+        return torch.ones(3) * 0.5
+    def init_hc_ffn_base():
+        return torch.zeros(MIX_HC)
     def init_norm_w():
         return torch.ones(D)
     def init_gate_w():
@@ -105,14 +149,20 @@ def build_tensor_specs():
         return torch.randint(0, VOCAB, (B, S), dtype=torch.int64)
 
     return [
-        TensorSpec("x",         [B, S, D],         torch.bfloat16, init_value=init_x),
-        TensorSpec("norm_w",    [D],                torch.float32,  init_value=init_norm_w),
-        TensorSpec("gate_w",    [N_EXPERTS, D],     torch.float32,  init_value=init_gate_w),
-        TensorSpec("gate_bias", [N_EXPERTS],        torch.float32,  init_value=init_gate_bias),
-        TensorSpec("tid2eid",   [VOCAB, TOPK],      torch.int32,    init_value=init_tid2eid),
-        TensorSpec("input_ids", [B, S],             torch.int64,    init_value=init_input_ids),
-        TensorSpec("indices",   [T, TOPK],          torch.int32,    is_output=True),
-        TensorSpec("weights",   [T, TOPK],          torch.float32,  is_output=True),
+        TensorSpec("x_hc",         [B, S, HC_MULT, D],         torch.bfloat16, init_value=init_x_hc),
+        TensorSpec("hc_ffn_fn",    [MIX_HC, HC_DIM],           torch.float32,  init_value=init_hc_ffn_fn),
+        TensorSpec("hc_ffn_scale", [3],                        torch.float32,  init_value=init_hc_ffn_scale),
+        TensorSpec("hc_ffn_base",  [MIX_HC],                   torch.float32,  init_value=init_hc_ffn_base),
+        TensorSpec("norm_w",       [D],                        torch.float32,  init_value=init_norm_w),
+        TensorSpec("gate_w",       [N_EXPERTS, D],             torch.float32,  init_value=init_gate_w),
+        TensorSpec("gate_bias",    [N_EXPERTS],                torch.float32,  init_value=init_gate_bias),
+        TensorSpec("tid2eid",      [VOCAB, TOPK],              torch.int32,    init_value=init_tid2eid),
+        TensorSpec("input_ids",    [B, S],                     torch.int64,    init_value=init_input_ids),
+        TensorSpec("x_norm",       [T, D],                     torch.bfloat16, is_output=True),
+        TensorSpec("indices",      [T, TOPK],                  torch.int32,    is_output=True),
+        TensorSpec("weights",      [T, TOPK],                  torch.float32,  is_output=True),
+        TensorSpec("post_ffn",     [B, S, HC_MULT],            torch.float32,  is_output=True),
+        TensorSpec("comb_ffn",     [B, S, HC_MULT, HC_MULT],   torch.float32,  is_output=True),
     ]
 
 
