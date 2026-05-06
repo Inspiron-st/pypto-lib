@@ -15,7 +15,6 @@ from pathlib import Path
 
 _KERNEL_PATH = (
     Path(__file__).resolve().parents[2]
-    / "examples"
     / "models"
     / "qwen3"
     / "14b"

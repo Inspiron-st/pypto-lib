@@ -7,26 +7,8 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-from __future__ import annotations
-
-import importlib.util
-from pathlib import Path
+from .main import main
 
 
-_KERNEL_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "models"
-    / "qwen3"
-    / "14b"
-    / "qwen3_14b_prefill.py"
-)
-_SPEC = importlib.util.spec_from_file_location("_qwen3_14b_prefill_kernel", _KERNEL_PATH)
-if _SPEC is None or _SPEC.loader is None:
-    raise ImportError(f"Unable to load Qwen3-14B prefill kernel from {_KERNEL_PATH}")
-
-_KERNEL = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(_KERNEL)
-
-build_qwen3_14b_prefill_program = _KERNEL.build_qwen3_14b_prefill_program
-
-__all__ = ["build_qwen3_14b_prefill_program"]
+if __name__ == "__main__":
+    raise SystemExit(main())

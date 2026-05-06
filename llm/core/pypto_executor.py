@@ -83,15 +83,32 @@ def _round_up(value: int, multiple: int) -> int:
 
 
 @dataclass
+class _KernelLayerWeights:
+    input_rms_weight: torch.Tensor
+    wq: torch.Tensor
+    wk: torch.Tensor
+    wv: torch.Tensor
+    q_norm_weight: torch.Tensor
+    k_norm_weight: torch.Tensor
+    wo: torch.Tensor
+    post_rms_weight: torch.Tensor
+    w_gate: torch.Tensor
+    w_up: torch.Tensor
+    w_down: torch.Tensor
+
+
+@dataclass
 class _CompiledKernels:
     prefill: object
     decode: object
     final_rms: object
     lm_head: object
+    final_norm_weight: torch.Tensor
     rope_cos: torch.Tensor
     rope_sin: torch.Tensor
     padded_vocab: int
     padded_lm_head_weight: torch.Tensor
+    layers: list[_KernelLayerWeights]
 
 
 @dataclass
@@ -137,7 +154,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
         prefill_inputs = self._prepare_prefill_inputs(model, batch)
         hidden = prefill_inputs.hidden
 
-        for layer_idx, layer in enumerate(model.layers):
+        for layer_idx, layer in enumerate(compiled.layers):
             k_cache, v_cache = self._kv_cache_manager.materialize_decode_cache(
                 model.config.model_id,
                 layer_idx,
@@ -146,23 +163,23 @@ class PyptoQwen14BExecutor(ModelExecutor):
             compiled.prefill(
                 hidden,
                 prefill_inputs.seq_lens,
-                layer.input_rms_weight.view(1, -1).float().cpu(),
-                self._kernel_weight(layer.wq),
-                self._kernel_weight(layer.wk),
-                self._kernel_weight(layer.wv),
-                layer.q_norm_weight.view(1, -1).float().cpu(),
-                layer.k_norm_weight.view(1, -1).float().cpu(),
+                layer.input_rms_weight,
+                layer.wq,
+                layer.wk,
+                layer.wv,
+                layer.q_norm_weight,
+                layer.k_norm_weight,
                 compiled.rope_cos,
                 compiled.rope_sin,
                 prefill_inputs.block_table,
                 prefill_inputs.slot_mapping,
                 k_cache,
                 v_cache,
-                self._kernel_weight(layer.wo),
-                layer.post_rms_weight.view(1, -1).float().cpu(),
-                self._kernel_weight(layer.w_gate),
-                self._kernel_weight(layer.w_up),
-                self._kernel_weight(layer.w_down),
+                layer.wo,
+                layer.post_rms_weight,
+                layer.w_gate,
+                layer.w_up,
+                layer.w_down,
                 out,
                 config=self._run_config(codegen_only=False),
             )
@@ -182,7 +199,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
         decode_inputs = self._prepare_decode_inputs(model, batch)
         hidden = decode_inputs.hidden
 
-        for layer_idx, layer in enumerate(model.layers):
+        for layer_idx, layer in enumerate(compiled.layers):
             k_cache, v_cache = self._kv_cache_manager.materialize_decode_cache(
                 model.config.model_id,
                 layer_idx,
@@ -190,12 +207,12 @@ class PyptoQwen14BExecutor(ModelExecutor):
             out = torch.zeros_like(hidden)
             compiled.decode(
                 hidden,
-                layer.input_rms_weight.view(1, -1).float().cpu(),
-                self._kernel_weight(layer.wq),
-                self._kernel_weight(layer.wk),
-                self._kernel_weight(layer.wv),
-                layer.q_norm_weight.view(1, -1).float().cpu(),
-                layer.k_norm_weight.view(1, -1).float().cpu(),
+                layer.input_rms_weight,
+                layer.wq,
+                layer.wk,
+                layer.wv,
+                layer.q_norm_weight,
+                layer.k_norm_weight,
                 decode_inputs.seq_lens,
                 decode_inputs.block_table,
                 decode_inputs.slot_mapping,
@@ -203,11 +220,11 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 compiled.rope_sin,
                 k_cache,
                 v_cache,
-                self._kernel_weight(layer.wo),
-                layer.post_rms_weight.view(1, -1).float().cpu(),
-                self._kernel_weight(layer.w_gate),
-                self._kernel_weight(layer.w_up),
-                self._kernel_weight(layer.w_down),
+                layer.wo,
+                layer.post_rms_weight,
+                layer.w_gate,
+                layer.w_up,
+                layer.w_down,
                 out,
                 config=self._run_config(codegen_only=False),
             )
@@ -286,16 +303,23 @@ class PyptoQwen14BExecutor(ModelExecutor):
             )
             lm_head_weight = torch.cat([lm_head_weight, padding], dim=0)
         padded_lm_head_weight = lm_head_weight.to(torch.bfloat16).contiguous().cpu()
+        layers = []
+        for layer in model.layers:
+            layers.append(self._kernel_layer_weights(layer))
+            self._release_layer_weights(layer)
+        final_norm_weight = model.final_norm_weight.view(1, -1).float().cpu()
 
         return _CompiledKernels(
             prefill=prefill,
             decode=decode,
             final_rms=final_rms,
             lm_head=lm_head,
+            final_norm_weight=final_norm_weight,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
             padded_vocab=padded_vocab,
             padded_lm_head_weight=padded_lm_head_weight,
+            layers=layers,
         )
 
     def _project_logits(self, model: RuntimeModel, hidden: torch.Tensor) -> torch.Tensor:
@@ -312,11 +336,10 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
         x = torch.zeros((_LOGITS_BATCH_TILE, hidden_size), dtype=torch.bfloat16)
         x[:actual_batch] = hidden.to(torch.bfloat16).cpu()
-        gamma = model.final_norm_weight.view(1, hidden_size).float().cpu()
         normed = torch.zeros((_LOGITS_BATCH_TILE, hidden_size), dtype=torch.bfloat16)
         compiled.final_rms(
             x,
-            gamma,
+            compiled.final_norm_weight,
             normed,
             config=self._run_config(codegen_only=False),
         )
@@ -464,6 +487,37 @@ class PyptoQwen14BExecutor(ModelExecutor):
     @staticmethod
     def _kernel_weight(weight: torch.Tensor) -> torch.Tensor:
         return weight.transpose(0, 1).to(torch.bfloat16).contiguous().cpu()
+
+    @classmethod
+    def _kernel_layer_weights(cls, layer) -> _KernelLayerWeights:
+        return _KernelLayerWeights(
+            input_rms_weight=layer.input_rms_weight.view(1, -1).float().cpu(),
+            wq=cls._kernel_weight(layer.wq),
+            wk=cls._kernel_weight(layer.wk),
+            wv=cls._kernel_weight(layer.wv),
+            q_norm_weight=layer.q_norm_weight.view(1, -1).float().cpu(),
+            k_norm_weight=layer.k_norm_weight.view(1, -1).float().cpu(),
+            wo=cls._kernel_weight(layer.wo),
+            post_rms_weight=layer.post_rms_weight.view(1, -1).float().cpu(),
+            w_gate=cls._kernel_weight(layer.w_gate),
+            w_up=cls._kernel_weight(layer.w_up),
+            w_down=cls._kernel_weight(layer.w_down),
+        )
+
+    @staticmethod
+    def _release_layer_weights(layer) -> None:
+        empty = torch.empty(0)
+        layer.input_rms_weight = empty
+        layer.wq = empty
+        layer.wk = empty
+        layer.wv = empty
+        layer.q_norm_weight = empty
+        layer.k_norm_weight = empty
+        layer.wo = empty
+        layer.post_rms_weight = empty
+        layer.w_gate = empty
+        layer.w_up = empty
+        layer.w_down = empty
 
     @staticmethod
     def _validate_supported_shape(model: RuntimeModel) -> None:
