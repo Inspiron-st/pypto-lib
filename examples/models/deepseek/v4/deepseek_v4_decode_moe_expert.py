@@ -39,14 +39,39 @@ RECV_Y_INIT_CHUNK = 512
 def build_deepseek_v4_decode_moe_expert_program():
     @pl.program
     class DeepSeekV4DecodeMoEExpert:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute_scale_col(
+            self,
+            recv_expert_id: pl.Tensor[[RECV_TOTAL_MAX, 1], pl.INT32],
+            recv_weights: pl.Tensor[[RECV_TOTAL_MAX, 1], pl.FP32],
+            local_i: pl.Scalar[pl.INDEX],
+            scale_col: pl.Out[pl.Tensor[[RECV_TOTAL_MAX, 1], pl.FP32]],
+        ) -> pl.Tensor[[RECV_TOTAL_MAX, 1], pl.FP32]:
+            # Use [1, RECV_TOTAL_MAX] form: tile.cmps mask packs into the trailing
+            # dim, and layout resolution rejects column-1 sel inputs.
+            local_i_i32: pl.Scalar[pl.INT32] = pl.cast(local_i, pl.INT32)
+            expert_id_col: pl.Tile[[RECV_TOTAL_MAX, 1], pl.INT32] = pl.load(recv_expert_id, [0, 0], [RECV_TOTAL_MAX, 1])
+            weights_col: pl.Tile[[RECV_TOTAL_MAX, 1], pl.FP32] = pl.load(recv_weights, [0, 0], [RECV_TOTAL_MAX, 1])
+            expert_id_row: pl.Tile[[1, RECV_TOTAL_MAX], pl.INT32] = pl.reshape(expert_id_col, [1, RECV_TOTAL_MAX])
+            weights_row: pl.Tile[[1, RECV_TOTAL_MAX], pl.FP32] = pl.reshape(weights_col, [1, RECV_TOTAL_MAX])
+            one_tile: pl.Tile[[1, RECV_TOTAL_MAX], pl.FP32] = pl.tile.full([1, RECV_TOTAL_MAX], dtype=pl.FP32, value=1.0)
+            zero_tile: pl.Tile[[1, RECV_TOTAL_MAX], pl.FP32] = pl.tile.full([1, RECV_TOTAL_MAX], dtype=pl.FP32, value=0.0)
+            tmp: pl.Tile[[1, 32], pl.UINT8] = pl.tile.create([1, 32], dtype=pl.UINT8)
+            eq_mask: pl.Tile[[1, 32], pl.UINT8] = pl.tile.cmps(expert_id_row, local_i_i32, cmp_type=0)
+            mask_fp32: pl.Tile[[1, RECV_TOTAL_MAX], pl.FP32] = pl.tile.sel(eq_mask, one_tile, zero_tile, tmp)
+            scaled_row: pl.Tile[[1, RECV_TOTAL_MAX], pl.FP32] = pl.mul(weights_row, mask_fp32)
+            scaled_col: pl.Tile[[RECV_TOTAL_MAX, 1], pl.FP32] = pl.reshape(scaled_row, [RECV_TOTAL_MAX, 1])
+            scale_col = pl.store(scaled_col, [0, 0], scale_col)
+            return scale_col
+
         @pl.function(type=pl.FunctionType.Opaque)
         def deepseek_v4_decode_moe_expert(
             self,
             recv_x: pl.Tensor[[RECV_TOTAL_MAX, D], pl.BF16],
             # Global expert id per row; padding rows must carry an id outside
             # [EXPERTS_START_IDX, EXPERTS_START_IDX + N_LOCAL_EXPERTS) (e.g. -1).
-            recv_expert_id: pl.Tensor[[RECV_TOTAL_MAX], pl.INT32],
-            recv_weights: pl.Tensor[[RECV_TOTAL_MAX], pl.FP32],
+            recv_expert_id: pl.Tensor[[RECV_TOTAL_MAX, 1], pl.INT32],
+            recv_weights: pl.Tensor[[RECV_TOTAL_MAX, 1], pl.FP32],
             x_local: pl.Tensor[[T, D], pl.BF16],
             expert_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.BF16],
             expert_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.BF16],
@@ -70,9 +95,8 @@ def build_deepseek_v4_decode_moe_expert_program():
             #     rows and cross-expert `recv_y +=` reduces to scatter-by-mask.
             for local_i in pl.range(EXPERTS_START_IDX, EXPERTS_START_IDX + N_LOCAL_EXPERTS):
                 local_offset = local_i - EXPERTS_START_IDX
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_mask"):
-                    mask_fp32 = pl.cast(pl.cmps(recv_expert_id, local_i, 0), target_type=pl.FP32)
-                    scale_col = pl.reshape(pl.mul(recv_weights, mask_fp32), [RECV_TOTAL_MAX, 1])
+                scale_col = pl.create_tensor([RECV_TOTAL_MAX, 1], dtype=pl.FP32)
+                scale_col = self.compute_scale_col(recv_expert_id, recv_weights, local_i, scale_col)
 
                 h_tile = pl.create_tensor([RECV_TOTAL_MAX, MOE_INTER], dtype=pl.BF16)
 
@@ -89,14 +113,21 @@ def build_deepseek_v4_decode_moe_expert_program():
                             w3_k = expert_w3[local_offset, n0 : n0 + INTER_CHUNK, k0 : k0 + K_CHUNK]
                             gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True)
                             up_acc = pl.matmul_acc(up_acc, x_k, w3_k, b_trans=True)
+                        # Scalar-indexed expert_w* keeps a leading size-1 dim; matmul promotes
+                        # that to a 3D batched output. Drop it so downstream stays 2D.
+                        gate_2d = pl.reshape(gate_acc, [RECV_TOTAL_MAX, INTER_CHUNK])
+                        up_2d = pl.reshape(up_acc, [RECV_TOTAL_MAX, INTER_CHUNK])
 
                     with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_swiglu"):
-                        if SWIGLU_LIMIT > 0:
-                            gate_acc = pl.mins(gate_acc, SWIGLU_LIMIT)
-                            up_acc = pl.maxs(pl.mins(up_acc, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-                        sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
-                        silu = pl.mul(gate_acc, sigmoid)
-                        gated = pl.mul(silu, up_acc)
+                        # TODO: re-enable once pl.mins/maxs accept TensorType (currently
+                        # tile-only). Demo config has SWIGLU_LIMIT=0.0 so this is a no-op,
+                        # but v4-pro config (SWIGLU_LIMIT=10.0) needs the clamp.
+                        # if SWIGLU_LIMIT > 0.0:
+                        #     gate_2d = pl.mins(gate_2d, SWIGLU_LIMIT)
+                        #     up_2d = pl.maxs(pl.mins(up_2d, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+                        sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_2d)), 1.0))
+                        silu = pl.mul(gate_2d, sigmoid)
+                        gated = pl.mul(silu, up_2d)
                         h_chunk = pl.row_expand_mul(gated, scale_col)
                         h_tile[:, n0 : n0 + INTER_CHUNK] = pl.cast(h_chunk, target_type=pl.BF16)
 
@@ -109,10 +140,11 @@ def build_deepseek_v4_decode_moe_expert_program():
                             h_k = h_tile[:, k0 : k0 + INTER_K]
                             w2_k = expert_w2[local_offset, d0 : d0 + D_OUT_CHUNK, k0 : k0 + INTER_K]
                             y_acc = pl.matmul_acc(y_acc, h_k, w2_k, b_trans=True)
+                        y_2d = pl.reshape(y_acc, [RECV_TOTAL_MAX, D_OUT_CHUNK])
 
                     with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_recv_y_accum"):
                         existing = pl.cast(recv_y[:, d0 : d0 + D_OUT_CHUNK], target_type=pl.FP32)
-                        summed = pl.add(existing, y_acc)
+                        summed = pl.add(existing, y_2d)
                         recv_y[:, d0 : d0 + D_OUT_CHUNK] = pl.cast(summed, target_type=pl.BF16)
 
             # Stage 2: shared expert
@@ -163,8 +195,8 @@ def golden_deepseek_v4_decode_moe_expert(tensors):
     import torch.nn.functional as F
 
     recv_x = tensors["recv_x"].float()
-    recv_expert_id = tensors["recv_expert_id"]
-    recv_weights = tensors["recv_weights"].float()
+    recv_expert_id = tensors["recv_expert_id"][:, 0]
+    recv_weights = tensors["recv_weights"][:, 0].float()
     x_local = tensors["x_local"].float()
     w1 = tensors["expert_w1"].float()
     w3 = tensors["expert_w3"].float()
@@ -210,11 +242,11 @@ def build_tensor_specs():
     def init_recv_expert_id():
         # Global expert ids in [EXPERTS_START_IDX, EXPERTS_START_IDX + N_LOCAL_EXPERTS).
         ids = torch.arange(RECV_TOTAL_MAX, dtype=torch.int32) % N_LOCAL_EXPERTS + EXPERTS_START_IDX
-        return ids[torch.randperm(RECV_TOTAL_MAX)]
+        return ids[torch.randperm(RECV_TOTAL_MAX)].reshape(RECV_TOTAL_MAX, 1)
 
     def init_recv_weights():
         w = torch.rand(RECV_TOTAL_MAX) + 0.1
-        return (w / w.sum() * TOPK).float()
+        return (w / w.sum() * TOPK).float().reshape(RECV_TOTAL_MAX, 1)
 
     def init_x_local():
         return torch.randn(T, D) * 0.05
@@ -239,8 +271,8 @@ def build_tensor_specs():
 
     return [
         TensorSpec("recv_x", [RECV_TOTAL_MAX, D], torch.bfloat16, init_value=init_recv_x),
-        TensorSpec("recv_expert_id", [RECV_TOTAL_MAX], torch.int32, init_value=init_recv_expert_id),
-        TensorSpec("recv_weights", [RECV_TOTAL_MAX], torch.float32, init_value=init_recv_weights),
+        TensorSpec("recv_expert_id", [RECV_TOTAL_MAX, 1], torch.int32, init_value=init_recv_expert_id),
+        TensorSpec("recv_weights", [RECV_TOTAL_MAX, 1], torch.float32, init_value=init_recv_weights),
         TensorSpec("x_local", [T, D], torch.bfloat16, init_value=init_x_local),
         TensorSpec("expert_w1", [N_LOCAL_EXPERTS, MOE_INTER, D], torch.bfloat16, init_value=init_w1),
         TensorSpec("expert_w3", [N_LOCAL_EXPERTS, MOE_INTER, D], torch.bfloat16, init_value=init_w3),
