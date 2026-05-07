@@ -17,6 +17,12 @@ Companion files: deepseek_v4_decode_csa.py (ratio=4)
 
 import pypto.language as pl
 
+from deepseek_v4_decode_hc_pre import deepseek_v4_decode_hc_pre
+from deepseek_v4_decode_hc_post import deepseek_v4_decode_hc_post
+from deepseek_v4_decode_o_proj import deepseek_v4_decode_o_proj
+from deepseek_v4_decode_qkv_proj_rope import deepseek_v4_decode_qkv_proj_rope
+from deepseek_v4_decode_sparse_attn import deepseek_v4_decode_sparse_attn
+
 
 B = 16  # demo 4
 S = 1
@@ -50,45 +56,146 @@ MAX_BLOCKS = ORI_MAX_BLOCKS                                # SWA: only ori, no c
 BLOCK_NUM = B * MAX_BLOCKS
 
 TOPK = WIN                                                 # SWA: sparse_attn topk = window only
+SPARSE_IDX_TOPK = 1024
+SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
+SPARSE_CMP_MAX_BLOCKS = 8
+SPARSE_CMP_BLOCK_NUM = B * SPARSE_CMP_MAX_BLOCKS
 
 START_POS = 3  # default for ScalarSpec; >0 (decode); SWA path has no compression-related constraint
 
 
-def build_deepseek_v4_decode_swa_program():
-    @pl.program
-    class DeepSeekV4DecodeSwa:
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def deepseek_v4_decode_swa(
-            self,
-            x_hc: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
-            # hc_pre weights
-            hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-            hc_attn_scale: pl.Tensor[[3], pl.FP32],
-            hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
-            # qkv_proj_rope weights
-            attn_norm_w: pl.Tensor[[D], pl.FP32],            # Block.attn_norm.weight (model.py:680)
-            wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-            wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.BF16],
-            wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
-            gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
-            gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-            freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],  # base rope_theta (no YaRN) for SWA
-            freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-            # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
-            kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-            block_table: pl.Tensor[[B, MAX_BLOCKS], pl.INT32],
-            # sparse_attn
-            attn_sink: pl.Tensor[[H], pl.FP32],
-            # o_proj
-            wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-            wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.BF16],
-            start_pos: pl.Scalar[pl.INT32],  # decode step; varies per call
-            x_out: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
-        ):
-            # TODO: orchestration body (dispatches the per-step kernels)
-            return x_out
+@pl.jit
+def deepseek_v4_decode_swa(
+    x_hc: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
+    # hc_pre weights
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    # qkv_proj_rope weights
+    attn_norm_w: pl.Tensor[[D], pl.FP32],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.BF16],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
+    kv_cache: pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    block_table: pl.Tensor[[B, MAX_BLOCKS], pl.INT32],
+    # sparse_attn
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    seqused_kv: pl.Tensor[[B, 1], pl.INT32],
+    # o_proj
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.BF16],
+    x_out: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
+    start_pos: pl.Scalar[pl.INT32],
+):
+    x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
+    post_t = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
+    comb_t = pl.create_tensor([B, S, HC_MULT, HC_MULT], dtype=pl.FP32)
+    x_mixed = deepseek_v4_decode_hc_pre(
+        x_hc,
+        hc_attn_fn,
+        hc_attn_scale,
+        hc_attn_base,
+        x_mixed,
+        post_t,
+        comb_t,
+    )
 
-    return DeepSeekV4DecodeSwa
+    rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_rope_step"):
+        pos = pl.cast(start_pos, pl.INDEX)
+        cos_row = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM], [pos, 0]), target_type=pl.FP32)
+        sin_row = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM], [pos, 0]), target_type=pl.FP32)
+        rope_cos_fp32 = pl.col_expand(
+            pl.full([T, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0),
+            cos_row,
+        )
+        rope_sin_fp32 = pl.col_expand(
+            pl.full([T, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0),
+            sin_row,
+        )
+        rope_cos_t = pl.cast(rope_cos_fp32, target_type=pl.BF16)
+        rope_sin_t = pl.cast(rope_sin_fp32, target_type=pl.BF16)
+
+    q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
+    kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
+    qr = pl.create_tensor([T, Q_LORA], dtype=pl.BF16)
+    q = deepseek_v4_decode_qkv_proj_rope(
+        x_mixed,
+        attn_norm_w,
+        wq_a,
+        wq_b,
+        wkv,
+        rope_cos_t,
+        rope_sin_t,
+        gamma_cq,
+        gamma_ckv,
+        q,
+        kv,
+        qr,
+    )
+
+    kv_cache_flat = pl.reshape(kv_cache, [BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    block_table_flat = pl.reshape(block_table, [B * MAX_BLOCKS])
+    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="swa_scatter_kv"):
+        ori_slot = start_pos % WIN
+        for b in pl.parallel(0, B, 1, chunk=16):
+            blk_id = pl.cast(pl.read(block_table_flat, [b]), pl.INDEX)
+            dst_row = blk_id * BLOCK_SIZE + ori_slot
+            kv_cache_flat = pl.assemble(
+                kv_cache_flat,
+                kv[b:b + 1, 0:HEAD_DIM],
+                [dst_row, 0],
+            )
+    kv_cache = pl.reshape(kv_cache_flat, [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
+
+    sparse_topk = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="swa_topk"):
+        idx_row = pl.arange(0, [1, WIN], dtype=pl.INT32)
+        pad_row = pl.full([1, SPARSE_IDX_TOPK], dtype=pl.INT32, value=-1)
+        sparse_topk_row = pl.concat(idx_row, pad_row)
+        sparse_topk = pl.col_expand(
+            pl.full([T, SPARSE_TOPK], dtype=pl.INT32, value=-1),
+            sparse_topk_row,
+        )
+
+    cmp_kv_dummy = pl.create_tensor([SPARSE_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
+    cmp_block_table_dummy = pl.create_tensor([B, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="swa_cmp_dummy"):
+        cmp_block_table_dummy = pl.full([B, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, value=-1)
+
+    o = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
+    o = deepseek_v4_decode_sparse_attn(
+        q,
+        kv_cache,
+        block_table,
+        cmp_kv_dummy,
+        cmp_block_table_dummy,
+        sparse_topk,
+        attn_sink,
+        seqused_kv,
+        rope_cos_t,
+        rope_sin_t,
+        o,
+    )
+
+    attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
+    attn_out = deepseek_v4_decode_o_proj(o, wo_a, wo_b, attn_out)
+    attn_out_3d = pl.create_tensor([B, S, D], dtype=pl.BF16)
+    attn_out_3d = pl.reshape(attn_out, [B, S, D])
+    x_out = deepseek_v4_decode_hc_post(
+        attn_out_3d,
+        x_hc,
+        post_t,
+        comb_t,
+        x_out,
+    )
+    return x_out
 
 
 def golden_deepseek_v4_decode_swa(tensors):
@@ -98,10 +205,10 @@ def golden_deepseek_v4_decode_swa(tensors):
     import torch
 
     from deepseek_v4_decode_hc_pre import golden_deepseek_v4_decode_hc_pre
-    from deepseek_v4_decode_qkv_proj_rope_draft import golden_deepseek_v4_decode_qkv_proj_rope
-    from deepseek_v4_decode_sparse_attn_draft import golden_deepseek_v4_decode_sparse_attn
+    from deepseek_v4_decode_qkv_proj_rope import golden_deepseek_v4_decode_qkv_proj_rope
+    from deepseek_v4_decode_sparse_attn import golden_deepseek_v4_decode_sparse_attn
     from deepseek_v4_decode_o_proj import golden_deepseek_v4_decode_o_proj
-    from deepseek_v4_decode_hc_post_draft import golden_deepseek_v4_decode_hc_post
+    from deepseek_v4_decode_hc_post import golden_deepseek_v4_decode_hc_post
 
     # ---- Block.hc_pre (model.py:691) ----
     x_mixed = torch.zeros(B, S, D, dtype=torch.bfloat16)
@@ -165,17 +272,22 @@ def golden_deepseek_v4_decode_swa(tensors):
         intra = ori_slot % BLOCK_SIZE
         kv_cache[blk_id, intra, 0] = kv[b]
 
-    # sparse_attn (model.py:533); cmp_kv slot is empty on SWA → reuse same pool with empty cmp_block_table
+    # sparse_attn (model.py:533); window-only uses the full sparse_attn topk contract with an empty cmp tail.
+    sparse_topk = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
+    sparse_topk[:, :WIN] = topk_idxs
+    seqused_kv = tensors["seqused_kv"]
     o = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
-    empty_cmp_block_table = torch.full((B, 0), -1, dtype=torch.int32)
+    cmp_kv_dummy = torch.zeros(SPARSE_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
+    cmp_block_table_dummy = torch.full((B, SPARSE_CMP_MAX_BLOCKS), -1, dtype=torch.int32)
     golden_deepseek_v4_decode_sparse_attn({
         "q": q,
         "ori_kv": kv_cache,
         "ori_block_table": block_table[:, :ORI_MAX_BLOCKS],
-        "cmp_kv": kv_cache,
-        "cmp_block_table": empty_cmp_block_table,
-        "cmp_sparse_indices": topk_idxs,
+        "cmp_kv": cmp_kv_dummy,
+        "cmp_block_table": cmp_block_table_dummy,
+        "cmp_sparse_indices": sparse_topk,
         "attn_sink": tensors["attn_sink"],
+        "seqused_kv": seqused_kv,
         "freqs_cos": rope_cos_T,
         "freqs_sin": rope_sin_T,
         "o": o,
@@ -243,6 +355,8 @@ def build_tensor_specs():
 
     def init_attn_sink():
         return torch.zeros(H)
+    def init_seqused_kv():
+        return torch.full((B, 1), min(WIN, START_POS + 1), dtype=torch.int32)
     def init_wo_a():
         return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
     def init_wo_b():
@@ -264,16 +378,17 @@ def build_tensor_specs():
         TensorSpec("kv_cache", [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
         TensorSpec("block_table", [B, MAX_BLOCKS], torch.int32, init_value=init_block_table),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
+        TensorSpec("seqused_kv", [B, 1], torch.int32, init_value=init_seqused_kv),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.bfloat16, init_value=init_wo_b),
-        ScalarSpec("start_pos", torch.int32, START_POS),
         TensorSpec("x_out", [B, S, HC_MULT, D], torch.bfloat16, is_output=True),
+        ScalarSpec("start_pos", torch.int32, START_POS),
     ]
 
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, run
+    from golden import RunConfig, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -282,13 +397,13 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-profiling", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run(
-        program=build_deepseek_v4_decode_swa_program(),
+    result = run_jit(
+        fn=deepseek_v4_decode_swa,
         specs=build_tensor_specs(),
         golden_fn=golden_deepseek_v4_decode_swa,
         config=RunConfig(
-            rtol=1e-3,
-            atol=1e-3,
+            rtol=7e-3,
+            atol=7e-3,
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,

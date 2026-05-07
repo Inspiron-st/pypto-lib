@@ -23,54 +23,60 @@ D_BLOCKS = D // D_CHUNK
 HC_DIM  = HC_MULT * D
 
 
-def build_deepseek_v4_decode_hc_post_program():
-    @pl.program
-    class DeepSeekV4DecodeHcPost:
-        @pl.function(type=pl.FunctionType.Opaque)
-        def deepseek_v4_decode_hc_post(
-            self,
-            x:        pl.Tensor[[B, S, D],                    pl.BF16],
-            residual: pl.Tensor[[B, S, HC_MULT, D],           pl.BF16],
-            post:     pl.Tensor[[B, S, HC_MULT],              pl.FP32],
-            comb:     pl.Tensor[[B, S, HC_MULT, HC_MULT],     pl.FP32],
-            y:        pl.Out[pl.Tensor[[B, S, HC_MULT, D],    pl.BF16]],
-        ):
-            x_flat = pl.reshape(x, [T, D])
-            residual_flat = pl.reshape(residual, [T, HC_DIM])
-            post_flat = pl.reshape(post, [T * HC_MULT])
-            comb_flat = pl.reshape(comb, [T * HC_MULT * HC_MULT])
-            y_flat = pl.reshape(y, [T, HC_DIM])
+@pl.jit.inline
+def deepseek_v4_decode_hc_post(
+    x:        pl.Tensor[[B, S, D],                    pl.BF16],
+    residual: pl.Tensor[[B, S, HC_MULT, D],           pl.BF16],
+    post:     pl.Tensor[[B, S, HC_MULT],              pl.FP32],
+    comb:     pl.Tensor[[B, S, HC_MULT, HC_MULT],     pl.FP32],
+    y:        pl.Out[pl.Tensor[[B, S, HC_MULT, D],    pl.BF16]],
+):
+    x_flat = pl.reshape(x, [T, D])
+    residual_flat = pl.reshape(residual, [T, HC_DIM])
+    post_flat = pl.reshape(post, [T * HC_MULT])
+    comb_flat = pl.reshape(comb, [T * HC_MULT * HC_MULT])
+    y_flat = pl.reshape(y, [T, HC_DIM])
 
-            for out_h in pl.parallel(HC_MULT):
-                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="hc_post"):
-                    for t in pl.parallel(0, T, 1, chunk=16):
-                        post_w = pl.read(post_flat, [t * HC_MULT + out_h])
-                        for db in pl.range(D_BLOCKS):
-                            d0 = db * D_CHUNK
-                            x_row = pl.cast(
-                                pl.slice(x_flat, [1, D_CHUNK], [t, d0]),
-                                target_type=pl.FP32,
-                            )
-                            y_row = pl.mul(x_row, post_w)
-                            for in_h in pl.range(HC_MULT):
-                                comb_w = pl.read(
-                                    comb_flat,
-                                    [t * HC_MULT * HC_MULT + in_h * HC_MULT + out_h],
-                                )
-                                residual_row = pl.cast(
-                                    pl.slice(residual_flat, [1, D_CHUNK], [t, in_h * D + d0]),
-                                    target_type=pl.FP32,
-                                )
-                                y_row = pl.add(y_row, pl.mul(residual_row, comb_w))
-                            y_flat = pl.assemble(
-                                y_flat,
-                                pl.cast(y_row, target_type=pl.BF16),
-                                [t, out_h * D + d0],
-                            )
-            y = pl.reshape(y_flat, [B, S, HC_MULT, D])
-            return y
+    for out_h in pl.parallel(HC_MULT):
+        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="hc_post"):
+            for t in pl.parallel(0, T, 1, chunk=16):
+                post_w = pl.read(post_flat, [t * HC_MULT + out_h])
+                for db in pl.range(D_BLOCKS):
+                    d0 = db * D_CHUNK
+                    x_row = pl.cast(
+                        pl.slice(x_flat, [1, D_CHUNK], [t, d0]),
+                        target_type=pl.FP32,
+                    )
+                    y_row = pl.mul(x_row, post_w)
+                    for in_h in pl.range(HC_MULT):
+                        comb_w = pl.read(
+                            comb_flat,
+                            [t * HC_MULT * HC_MULT + in_h * HC_MULT + out_h],
+                        )
+                        residual_row = pl.cast(
+                            pl.slice(residual_flat, [1, D_CHUNK], [t, in_h * D + d0]),
+                            target_type=pl.FP32,
+                        )
+                        y_row = pl.add(y_row, pl.mul(residual_row, comb_w))
+                    y_flat = pl.assemble(
+                        y_flat,
+                        pl.cast(y_row, target_type=pl.BF16),
+                        [t, out_h * D + d0],
+                    )
+    y = pl.reshape(y_flat, [B, S, HC_MULT, D])
+    return y
 
-    return DeepSeekV4DecodeHcPost
+
+@pl.jit
+def deepseek_v4_decode_hc_post_test(
+    x:        pl.Tensor[[B, S, D],                    pl.BF16],
+    residual: pl.Tensor[[B, S, HC_MULT, D],           pl.BF16],
+    post:     pl.Tensor[[B, S, HC_MULT],              pl.FP32],
+    comb:     pl.Tensor[[B, S, HC_MULT, HC_MULT],     pl.FP32],
+    y:        pl.Out[pl.Tensor[[B, S, HC_MULT, D],    pl.BF16]],
+):
+    y = deepseek_v4_decode_hc_post(x, residual, post, comb, y)
+    return y
 
 
 def golden_deepseek_v4_decode_hc_post(tensors):
@@ -82,12 +88,13 @@ def golden_deepseek_v4_decode_hc_post(tensors):
     post     = tensors["post"].float()        # [B, S, HC]
     comb     = tensors["comb"].float()        # [B, S, HC, HC]
 
-    # post.unsqueeze(-1) * x.unsqueeze(-2): [B,S,HC,1] * [B,S,1,D] -> [B,S,HC,D]
-    # comb.unsqueeze(-1) * residual.unsqueeze(-2): [B,S,HC,HC,1] * [B,S,1,HC,D]
-    #   -> [B,S,HC,HC,D], sum over dim=2 -> [B,S,HC,D]
-    term1 = post.unsqueeze(-1) * x.unsqueeze(-2)
-    term2 = (comb.unsqueeze(-1) * residual.unsqueeze(-2)).sum(dim=2)
-    y = (term1 + term2).to(torch.bfloat16)
+    y_fp32 = torch.zeros(B, S, HC_MULT, D, dtype=torch.float32)
+    for out_h in range(HC_MULT):
+        y_row = x * post[:, :, out_h:out_h + 1]
+        for in_h in range(HC_MULT):
+            y_row = y_row + residual[:, :, in_h, :] * comb[:, :, in_h, out_h:out_h + 1]
+        y_fp32[:, :, out_h, :] = y_row
+    y = y_fp32.to(torch.bfloat16)
 
     tensors["y"][:] = y
 
@@ -118,7 +125,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, run
+    from golden import RunConfig, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -127,8 +134,8 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-profiling", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run(
-        program=build_deepseek_v4_decode_hc_post_program(),
+    result = run_jit(
+        fn=deepseek_v4_decode_hc_post_test,
         specs=build_tensor_specs(),
         golden_fn=golden_deepseek_v4_decode_hc_post,
         config=RunConfig(
