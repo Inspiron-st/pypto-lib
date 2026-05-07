@@ -37,8 +37,19 @@ HEAD_GROUP_BLOCKS = (H * HEAD_DIM) // (HEAD_CHUNK * HEAD_GROUP)
 D_CHUNK = 512
 Q_LORA_CHUNK = Q_LORA_TILE
 KV_CHUNK = 32
+assert D % D_CHUNK == 0
+assert Q_LORA % Q_LORA_TILE == 0
+assert ROPE_DIM % 2 == 0
+assert NOPE_DIM >= 0
+assert HEAD_DIM % HEAD_CHUNK == 0
+assert HEAD_DIM % KV_CHUNK == 0
+assert NOPE_DIM % HEAD_CHUNK == 0
+assert NOPE_DIM % KV_CHUNK == 0
 D_BLOCKS = D // D_CHUNK
 KV_BLOCKS = HEAD_DIM // KV_CHUNK
+# Aliases for `qkv_proj_rope_jit` (same tile sizes as D_CHUNK / KV_CHUNK).
+D_TILE = D_CHUNK
+KV_TILE = KV_CHUNK
 
 
 @pl.jit.inline
@@ -262,6 +273,214 @@ def deepseek_v4_decode_qkv_proj_rope_test(
     return q
 
 
+@pl.jit
+def qkv_proj_rope_jit(
+    x: pl.Tensor[[B, S, D], pl.BF16],
+    norm_w: pl.Tensor[[D], pl.FP32],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.BF16],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    rope_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    rope_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    q: pl.Out[pl.Tensor[[T, H, HEAD_DIM], pl.BF16]],
+    kv: pl.Out[pl.Tensor[[T, HEAD_DIM], pl.BF16]],
+    qr: pl.Out[pl.Tensor[[T, Q_LORA], pl.BF16]],
+):
+    x_flat = pl.reshape(x, [T, D])
+
+    # Stage 0.1: fused attention RMSNorm — reduce squared tokens to inv-RMS (sequential over D tiles).
+    with pl.at(level=pl.Level.CORE_GROUP):
+        x_sq_sum = pl.full([1, T], dtype=pl.FP32, value=0.0)
+        for db in pl.range(D_BLOCKS):
+            d_off = db * D_TILE
+            x_blk = pl.cast(pl.slice(x_flat, [T, D_TILE], [0, d_off]), target_type=pl.FP32)
+            x_sq_sum = pl.add(x_sq_sum, pl.reshape(pl.row_sum(pl.mul(x_blk, x_blk)), [1, T]))
+        x_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS)))
+
+    x_inv_rms_t = pl.reshape(x_inv_rms, [T, 1])
+    token_x_bf16 = pl.create_tensor([T, D], dtype=pl.BF16)
+    # Stage 0.2: parallel per-D_TILE RMSNorm and direct BF16 assemble for each shard.
+    for db in pl.parallel(0, D_BLOCKS, 1):
+        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+            d_off = db * D_TILE
+            x_blk = pl.cast(pl.slice(x_flat, [T, D_TILE], [0, d_off]), target_type=pl.FP32)
+            nw_blk = pl.reshape(pl.slice(norm_w, [D_TILE], [d_off]), [1, D_TILE])
+            x_normed = pl.col_expand_mul(pl.row_expand_mul(x_blk, x_inv_rms_t), nw_blk)
+            token_x_bf16 = pl.assemble(token_x_bf16, pl.cast(x_normed, target_type=pl.BF16), [0, d_off])
+
+    # Stage 1.1: Q LoRA matmul — parallel over LoRA tiles; inner D scan stays sequential.
+    qr_fp32 = pl.create_tensor([T, Q_LORA], dtype=pl.FP32)
+    for qb in pl.parallel(0, Q_BLOCKS, 1):
+        with pl.at(level=pl.Level.CORE_GROUP):
+            xa0 = pl.slice(token_x_bf16, [T, D_TILE], [0, 0])
+            wa0 = pl.slice(wq_a, [D_TILE, Q_LORA_TILE], [0, qb * Q_LORA_TILE])
+            q_acc = pl.matmul(xa0, wa0, out_dtype=pl.FP32)
+            for db in pl.range(1, D_BLOCKS):
+                xa_i = pl.slice(token_x_bf16, [T, D_TILE], [0, db * D_TILE])
+                wa_i = pl.slice(wq_a, [D_TILE, Q_LORA_TILE], [db * D_TILE, qb * Q_LORA_TILE])
+                q_acc = pl.matmul_acc(q_acc, xa_i, wa_i)
+            qr_fp32 = pl.assemble(qr_fp32, q_acc, [0, qb * Q_LORA_TILE])
+
+    # Stage 1.2: RMS stats over full qr_fp32 row — sequential reduction into qr_sq_sum.
+    with pl.at(level=pl.Level.CORE_GROUP):
+        qr_sq_sum = pl.full([1, T], dtype=pl.FP32, value=0.0)
+        for qb in pl.range(Q_BLOCKS):
+            qr_blk = pl.slice(qr_fp32, [T, Q_LORA_TILE], [0, qb * Q_LORA_TILE])
+            qr_sq_sum = pl.add(qr_sq_sum, pl.reshape(pl.row_sum(pl.mul(qr_blk, qr_blk)), [1, T]))
+        qr_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(qr_sq_sum, 1.0 / Q_LORA), EPS)))
+
+    qr_inv_rms_t = pl.reshape(qr_inv_rms, [T, 1])
+    # Stage 1.3: parallel LoRA tiles — RMS scale + gamma_cq and direct BF16 `qr` writes.
+    for qb in pl.parallel(0, Q_BLOCKS, 1):
+        with pl.at(level=pl.Level.CORE_GROUP):
+            qr_blk = pl.slice(qr_fp32, [T, Q_LORA_TILE], [0, qb * Q_LORA_TILE])
+            g_blk = pl.reshape(
+                pl.cast(pl.slice(gamma_cq, [Q_LORA_TILE], [qb * Q_LORA_TILE]), target_type=pl.FP32),
+                [1, Q_LORA_TILE],
+            )
+            qr_normed = pl.col_expand_mul(pl.row_expand_mul(qr_blk, qr_inv_rms_t), g_blk)
+            qr = pl.assemble(qr, pl.cast(qr_normed, target_type=pl.BF16), [0, qb * Q_LORA_TILE])
+
+    # Stage 2.1: expand `qr` to head layout via wq_b — parallel over HEAD_GROUP_BLOCKS.
+    q_proj_fp32 = pl.create_tensor([T, H * HEAD_DIM], dtype=pl.FP32)
+    for hgb in pl.parallel(0, HEAD_GROUP_BLOCKS, 1):
+        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+            # Sequential HEAD_GROUP micro-grid inside each parallel hgb shard.
+            for hi in pl.range(HEAD_GROUP):
+                qr0 = pl.slice(qr, [T, Q_LORA_TILE], [0, 0])
+                wb0 = pl.slice(
+                    wq_b,
+                    [Q_LORA_TILE, HEAD_CHUNK],
+                    [0, (hgb * HEAD_GROUP + hi) * HEAD_CHUNK],
+                )
+                col_acc = pl.matmul(qr0, wb0, out_dtype=pl.FP32)
+                for q_inner in pl.range(1, Q_BLOCKS):
+                    qr_i = pl.slice(qr, [T, Q_LORA_TILE], [0, q_inner * Q_LORA_TILE])
+                    wb_i = pl.slice(
+                        wq_b,
+                        [Q_LORA_TILE, HEAD_CHUNK],
+                        [q_inner * Q_LORA_TILE, (hgb * HEAD_GROUP + hi) * HEAD_CHUNK],
+                    )
+                    col_acc = pl.matmul_acc(col_acc, qr_i, wb_i)
+                q_proj_fp32 = pl.assemble(
+                    q_proj_fp32,
+                    col_acc,
+                    [0, (hgb * HEAD_GROUP + hi) * HEAD_CHUNK],
+                )
+
+    # Stage 3.1: per-head RMSNorm + RoPE — parallel over head index `h_idx`.
+    q_flat = pl.reshape(q, [T, H * HEAD_DIM])
+    for h_idx in pl.parallel(0, H, 1):
+        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+            # Within-head RMS reduce (sequential over HEAD_CHUNK strips).
+            q_head_sq_sum = pl.full([1, T], dtype=pl.FP32, value=0.0)
+            for db in pl.range(HEAD_DIM // HEAD_CHUNK):
+                q_rms_blk = pl.slice(
+                    q_proj_fp32,
+                    [T, HEAD_CHUNK],
+                    [0, h_idx * HEAD_DIM + db * HEAD_CHUNK],
+                )
+                q_head_sq_sum = pl.add(
+                    q_head_sq_sum,
+                    pl.reshape(pl.row_sum(pl.mul(q_rms_blk, q_rms_blk)), [1, T]),
+                )
+            q_head_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(q_head_sq_sum, 1.0 / HEAD_DIM), EPS)))
+            q_head_inv_rms_t = pl.reshape(q_head_inv_rms, [T, 1])
+
+            # Nope dims → BF16 strips on `q_flat`.
+            for nb in pl.range(NOPE_DIM // HEAD_CHUNK):
+                q_nope_blk = pl.slice(
+                    q_proj_fp32,
+                    [T, HEAD_CHUNK],
+                    [0, h_idx * HEAD_DIM + nb * HEAD_CHUNK],
+                )
+                q_normed_bf = pl.row_expand_mul(q_nope_blk, q_head_inv_rms_t)
+                q_flat = pl.assemble(
+                    q_flat,
+                    pl.cast(q_normed_bf, target_type=pl.BF16),
+                    [0, h_idx * HEAD_DIM + nb * HEAD_CHUNK],
+                )
+
+            # RoPE slice: cos/sin and assemble into `q_flat`.
+            q_lo = pl.slice(q_proj_fp32, [T, ROPE_HALF], [0, h_idx * HEAD_DIM + NOPE_DIM])
+            q_hi = pl.slice(q_proj_fp32, [T, ROPE_HALF], [0, h_idx * HEAD_DIM + NOPE_DIM + ROPE_HALF])
+            q_lo_norm = pl.row_expand_mul(q_lo, q_head_inv_rms_t)
+            q_hi_norm = pl.row_expand_mul(q_hi, q_head_inv_rms_t)
+            cos_lo = pl.cast(pl.slice(rope_cos, [T, ROPE_HALF], [0, 0]), target_type=pl.FP32)
+            cos_hi = pl.cast(pl.slice(rope_cos, [T, ROPE_HALF], [0, ROPE_HALF]), target_type=pl.FP32)
+            sin_lo = pl.cast(pl.slice(rope_sin, [T, ROPE_HALF], [0, 0]), target_type=pl.FP32)
+            sin_hi = pl.cast(pl.slice(rope_sin, [T, ROPE_HALF], [0, ROPE_HALF]), target_type=pl.FP32)
+            q_rot_lo = pl.sub(pl.mul(q_lo_norm, cos_lo), pl.mul(q_hi_norm, sin_lo))
+            q_rot_hi = pl.add(pl.mul(q_hi_norm, cos_hi), pl.mul(q_lo_norm, sin_hi))
+            q_flat = pl.assemble(q_flat, pl.cast(q_rot_lo, target_type=pl.BF16), [0, h_idx * HEAD_DIM + NOPE_DIM])
+            q_flat = pl.assemble(q_flat, pl.cast(q_rot_hi, target_type=pl.BF16), [0, h_idx * HEAD_DIM + NOPE_DIM + ROPE_HALF])
+
+    # Stage 3.2: reshape flat head layout to `[T, H, HEAD_DIM]`.
+    q = pl.reshape(q_flat, [T, H, HEAD_DIM])
+
+    # Stage 4.1: KV projection — parallel over KV_TILE columns into kv_fp32.
+    kv_fp32 = pl.create_tensor([T, HEAD_DIM], dtype=pl.FP32)
+    for kb in pl.parallel(0, KV_BLOCKS, 1):
+        with pl.at(level=pl.Level.CORE_GROUP):
+            xa_kv0 = pl.slice(token_x_bf16, [T, D_TILE], [0, 0])
+            wkv0 = pl.slice(wkv, [D_TILE, KV_TILE], [0, kb * KV_TILE])
+            kv_acc = pl.matmul(xa_kv0, wkv0, out_dtype=pl.FP32)
+            for db in pl.range(1, D_BLOCKS):
+                xa_kv_i = pl.slice(token_x_bf16, [T, D_TILE], [0, db * D_TILE])
+                wkv_i = pl.slice(wkv, [D_TILE, KV_TILE], [db * D_TILE, kb * KV_TILE])
+                kv_acc = pl.matmul_acc(kv_acc, xa_kv_i, wkv_i)
+            kv_fp32 = pl.assemble(kv_fp32, kv_acc, [0, kb * KV_TILE])
+
+    # Stage 4.2: KV RMS — sequential reduction over KV tiles into kv_sq_sum.
+    with pl.at(level=pl.Level.CORE_GROUP):
+        kv_sq_sum = pl.full([1, T], dtype=pl.FP32, value=0.0)
+        for kb in pl.range(KV_BLOCKS):
+            kv_blk = pl.slice(kv_fp32, [T, KV_TILE], [0, kb * KV_TILE])
+            kv_sq_sum = pl.add(kv_sq_sum, pl.reshape(pl.row_sum(pl.mul(kv_blk, kv_blk)), [1, T]))
+        kv_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(kv_sq_sum, 1.0 / HEAD_DIM), EPS)))
+
+    kv_inv_rms_t = pl.reshape(kv_inv_rms, [T, 1])
+    # Stage 4.3: parallel BF16 writes for KV nope segment (RoPE follows in Stage 4.4).
+    for nb in pl.parallel(0, NOPE_DIM // KV_TILE, 1):
+        with pl.at(level=pl.Level.CORE_GROUP):
+            kv_blk_fp = pl.slice(kv_fp32, [T, KV_TILE], [0, nb * KV_TILE])
+            g_kv = pl.reshape(
+                pl.cast(pl.slice(gamma_ckv, [KV_TILE], [nb * KV_TILE]), target_type=pl.FP32),
+                [1, KV_TILE],
+            )
+            kv_normed = pl.col_expand_mul(pl.row_expand_mul(kv_blk_fp, kv_inv_rms_t), g_kv)
+            kv = pl.assemble(kv, pl.cast(kv_normed, target_type=pl.BF16), [0, nb * KV_TILE])
+            
+    # Stage 4.4: KV RoPE — apply cos/sin to rope dims and write BF16 `kv`.
+    with pl.at(level=pl.Level.CORE_GROUP):
+        kv_lo = pl.slice(kv_fp32, [T, ROPE_HALF], [0, NOPE_DIM])
+        kv_hi = pl.slice(kv_fp32, [T, ROPE_HALF], [0, NOPE_DIM + ROPE_HALF])
+        g_lo = pl.reshape(
+            pl.cast(pl.slice(gamma_ckv, [ROPE_HALF], [NOPE_DIM]), target_type=pl.FP32),
+            [1, ROPE_HALF],
+        )
+        g_hi = pl.reshape(
+            pl.cast(pl.slice(gamma_ckv, [ROPE_HALF], [NOPE_DIM + ROPE_HALF]), target_type=pl.FP32),
+            [1, ROPE_HALF],
+        )
+        kv_lo_norm = pl.col_expand_mul(pl.row_expand_mul(kv_lo, kv_inv_rms_t), g_lo)
+        kv_hi_norm = pl.col_expand_mul(pl.row_expand_mul(kv_hi, kv_inv_rms_t), g_hi)
+        cos_lo = pl.cast(pl.slice(rope_cos, [T, ROPE_HALF], [0, 0]), target_type=pl.FP32)
+        cos_hi = pl.cast(pl.slice(rope_cos, [T, ROPE_HALF], [0, ROPE_HALF]), target_type=pl.FP32)
+        sin_lo = pl.cast(pl.slice(rope_sin, [T, ROPE_HALF], [0, 0]), target_type=pl.FP32)
+        sin_hi = pl.cast(pl.slice(rope_sin, [T, ROPE_HALF], [0, ROPE_HALF]), target_type=pl.FP32)
+        kv_rot_lo = pl.sub(pl.mul(kv_lo_norm, cos_lo), pl.mul(kv_hi_norm, sin_lo))
+        kv_rot_hi = pl.add(pl.mul(kv_hi_norm, cos_hi), pl.mul(kv_lo_norm, sin_hi))
+        kv = pl.assemble(kv, pl.cast(kv_rot_lo, target_type=pl.BF16), [0, NOPE_DIM])
+        kv = pl.assemble(kv, pl.cast(kv_rot_hi, target_type=pl.BF16), [0, NOPE_DIM + ROPE_HALF])
+    return q, kv, qr
+
+
+
+
+
 def golden_deepseek_v4_decode_qkv_proj_rope(tensors):
     """Torch reference: attn_norm fused, then Q/KV LoRA + RoPE (model.py 692, 495-504)."""
     import torch
@@ -329,6 +548,11 @@ def golden_deepseek_v4_decode_qkv_proj_rope(tensors):
     tensors["qr"][:] = qr_out.to(torch.bfloat16)
 
 
+def golden_deepseek_v4_decode_qkv_proj_rope_jit(tensors):
+    """PyTorch reference for run_jit against qkv_proj_rope_jit (same numerics as the default golden)."""
+    golden_deepseek_v4_decode_qkv_proj_rope(tensors)
+
+
 def build_tensor_specs():
     import torch
     from golden import TensorSpec
@@ -380,9 +604,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run_jit(
-        fn=deepseek_v4_decode_qkv_proj_rope_test,
+        fn=qkv_proj_rope_jit,
         specs=build_tensor_specs(),
-        golden_fn=golden_deepseek_v4_decode_qkv_proj_rope,
+        golden_fn=golden_deepseek_v4_decode_qkv_proj_rope_jit,
         config=RunConfig(
             # Tightened after fixing KV RoPE gamma_ckv application.
             # On-board a2a3 validation still shows small q-path BF16 drift at 5e-3.
