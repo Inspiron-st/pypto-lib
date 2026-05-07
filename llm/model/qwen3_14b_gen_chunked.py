@@ -6,12 +6,28 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-import importlib
-import pathlib
 
-_kernel = importlib.import_module(
-    "examples.models.qwen3.14b.qwen3_14b_gen_chunked",
-    package=str(pathlib.Path(__file__).resolve().parents[2]),
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
+
+_KERNEL_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "models"
+    / "qwen3"
+    / "14b"
+    / "qwen3_14b_gen_chunked.py"
 )
-build_qwen3_14b_gen_chunked_program = _kernel.build_qwen3_14b_gen_chunked_program
-stack_layer_weights_chunked = _kernel.stack_layer_weights_chunked
+_SPEC = importlib.util.spec_from_file_location("_qwen3_14b_gen_chunked_kernel", _KERNEL_PATH)
+if _SPEC is None or _SPEC.loader is None:
+    raise ImportError(f"Unable to load Qwen3-14B gen_chunked kernel from {_KERNEL_PATH}")
+
+_KERNEL = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_KERNEL)
+
+build_qwen3_14b_gen_chunked_program = _KERNEL.build_qwen3_14b_gen_chunked_program
+stack_layer_weights_full = _KERNEL.stack_layer_weights_full
+
+__all__ = ["build_qwen3_14b_gen_chunked_program", "stack_layer_weights_full"]
