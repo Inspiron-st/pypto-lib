@@ -271,9 +271,10 @@ def run(
 
     # Runtime
     with _stage("runtime"):
-        # All tensors before any scalar — required by simpler's ChipStorageTaskArgs.
-        ordered: list[Any] = [tensors[s.name] for s in tensor_specs]
-        ordered.extend(scalar_specs_eff[s.name].to_ctypes() for s in scalar_specs)
+        ordered: list[Any] = [
+            tensors[s.name] if isinstance(s, TensorSpec) else scalar_specs_eff[s.name].to_ctypes()
+            for s in specs
+        ]
         execute_compiled(work_dir, ordered, **config.runtime)
 
     if golden_fn is None and golden_data is None:
@@ -521,8 +522,10 @@ def run_jit(
     # Runtime
     with _stage("runtime"):
         if runtime_dir is not None:
-            ordered: list[Any] = [tensors[s.name] for s in tensor_specs]
-            ordered.extend(scalar_specs_eff[s.name].to_ctypes() for s in scalar_specs)
+            ordered: list[Any] = [
+                tensors[s.name] if isinstance(s, TensorSpec) else scalar_specs_eff[s.name].to_ctypes()
+                for s in specs
+            ]
             # execute_compiled only accepts a subset of pypto.runtime.RunConfig
             # fields — strip the compile-only ones (dump_passes, codegen_only,
             # rtol, atol, etc.) before forwarding.

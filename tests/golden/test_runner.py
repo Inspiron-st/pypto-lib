@@ -596,10 +596,10 @@ class TestScalarMixedSpecs:
     """Mixed TensorSpec + ScalarSpec exercises the scalar path through run()."""
 
     def test_scalar_passed_as_ctypes_to_execute(self, mixed_specs, tmp_path):
-        """run() buckets tensors before scalars regardless of their order in
-        ``specs``: for ``[Tensor x, Scalar alpha, Tensor y]`` the args list
-        passed to execute_compiled is ``[x, y, alpha]`` (tensor pool first,
-        scalar pool after — matching simpler's ChipStorageTaskArgs contract)."""
+        """run() forwards args in the user-declared spec order: for
+        ``[Tensor x, Scalar alpha, Tensor y]`` the args list passed to
+        execute_compiled is ``[x, alpha, y]`` (scalars are encoded via ctypes
+        but stay in their declared position)."""
         compiled_dir = tmp_path / "build"
         compiled_dir.mkdir()
 
@@ -610,7 +610,7 @@ class TestScalarMixedSpecs:
             observed["arg1"] = args[1]
             observed["arg2"] = args[2]
             # Make validation pass: y = x + alpha (via ctypes scalar)
-            args[1][:] = args[0] + args[2].value
+            args[2][:] = args[0] + args[1].value
 
         def golden_fn(scratch):
             scratch["y"][:] = scratch["x"] + scratch["alpha"]
@@ -620,11 +620,11 @@ class TestScalarMixedSpecs:
             r = run(program=object(), specs=mixed_specs, golden_fn=golden_fn)
 
         assert r.passed, f"unexpected failure: {r.error}"
-        # Bucketed: x (input tensor), y (output tensor), alpha (scalar)
+        # Spec order: x (input tensor), alpha (scalar), y (output tensor)
         assert isinstance(observed["arg0"], torch.Tensor)
-        assert isinstance(observed["arg1"], torch.Tensor)
-        assert isinstance(observed["arg2"], ctypes.c_float)
-        assert observed["arg2"].value == pytest.approx(2.5)
+        assert isinstance(observed["arg1"], ctypes.c_float)
+        assert isinstance(observed["arg2"], torch.Tensor)
+        assert observed["arg1"].value == pytest.approx(2.5)
 
     def test_scalar_persisted_to_pt(self, mixed_specs, tmp_path):
         """After a successful run, work_dir/data/in/{name}.pt must exist with
@@ -633,8 +633,8 @@ class TestScalarMixedSpecs:
         compiled_dir.mkdir()
 
         def fake_execute(_work_dir, args, **_kwargs):
-            # Bucketed args: [x (in tensor), y (out tensor), alpha (scalar)]
-            args[1][:] = args[0] + args[2].value
+            # Spec order: [x (in tensor), alpha (scalar), y (out tensor)]
+            args[2][:] = args[0] + args[1].value
 
         def golden_fn(scratch):
             scratch["y"][:] = scratch["x"] + scratch["alpha"]
@@ -667,10 +667,10 @@ class TestScalarMixedSpecs:
         observed_alpha: dict[str, object] = {}
 
         def fake_execute(_work_dir, args, **_kwargs):
-            # Bucketed args: [x (in tensor), y (out tensor), alpha (scalar)]
-            observed_alpha["scalar"] = args[2]
+            # Spec order: [x (in tensor), alpha (scalar), y (out tensor)]
+            observed_alpha["scalar"] = args[1]
             # Device writes y = x + alpha so cache golden matches
-            args[1][:] = args[0] + args[2].value
+            args[2][:] = args[0] + args[1].value
 
         compile_p, exec_p = _patch_compile_and_execute(compiled_dir, fake_execute=fake_execute)
         with compile_p, exec_p:
@@ -755,8 +755,8 @@ class TestScalarMixedSpecs:
             scratch["y"][:] = scratch["x"] + scratch["alpha"]
 
         def fake_execute(_work_dir, args, **_kwargs):
-            # Bucketed args: [x (in tensor), y (out tensor), alpha (scalar)]
-            args[1][:] = args[0] + args[2].value
+            # Spec order: [x (in tensor), alpha (scalar), y (out tensor)]
+            args[2][:] = args[0] + args[1].value
 
         compile_p, exec_p = _patch_compile_and_execute(compiled_dir, fake_execute=fake_execute)
         with compile_p, exec_p:
