@@ -203,8 +203,8 @@ jobs:
           test ! -e "$PYPTO_SRC/runtime/build" \
             && echo "OK: runtime build removed" \
             || { echo "FAIL: runtime build dir still exists"; exit 1; }
-          pip install "$PYPTO_SRC"
-          pip install "$PYPTO_SRC/runtime"
+          pip install --no-build-isolation "$PYPTO_SRC"
+          pip install --no-build-isolation "$PYPTO_SRC/runtime"
 
       - name: Show ccache stats (after)
         run: ccache -s || true
