@@ -78,7 +78,7 @@ jobs:
 
       - name: Clone pto-isa repository (pinned)
         run: |
-          git clone https://github.com/hw-native-sys/pto-isa.git $GITHUB_WORKSPACE/pto-isa
+          git clone https://gitcode.com/luohuan40/pto-isa.git $GITHUB_WORKSPACE/pto-isa
           cd $GITHUB_WORKSPACE/pto-isa
           git checkout ${{ env.PTO_ISA_COMMIT }}
 
@@ -151,16 +151,16 @@ jobs:
       CCACHE_MAXSIZE: 5G
       PIP_CACHE_DIR: /root/.cache/pip
     container:
-      image: localhost:5000/ci-device-py310:latest
+      image: localhost:5001/ci-device-py310:latest
       options: >-
         --privileged
         -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro
         -v /usr/local/Ascend:/usr/local/Ascend:ro
         -v /dev:/dev
-        -v /home/ci-runner/hw-native-sys-pypto/ci-cache/pip:/root/.cache/pip
-        -v /home/ci-runner/hw-native-sys-pypto/ci-cache/ccache:/root/.cache/ccache
-        -v /home/ci-runner/hw-native-sys-pypto/ci-cache/ptoas:/opt/ptoas-cache
-        -v /home/ci-runner/hw-native-sys-pypto/ci-cache/pypto-src:/opt/pypto-src
+        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pip:/root/.cache/pip
+        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ccache:/root/.cache/ccache
+        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ptoas:/opt/ptoas-cache
+        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pypto-src:/opt/pypto-src
         -e ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.0
         -e DEVICE_ID
 
@@ -232,7 +232,7 @@ jobs:
 
       - name: Clone pto-isa repository (pinned)
         run: |
-          git clone https://github.com/hw-native-sys/pto-isa.git $GITHUB_WORKSPACE/pto-isa
+          git clone https://gitcode.com/luohuan40/pto-isa.git $GITHUB_WORKSPACE/pto-isa
           cd $GITHUB_WORKSPACE/pto-isa
           git checkout ${{ env.PTO_ISA_COMMIT }}
 
