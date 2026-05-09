@@ -378,18 +378,17 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
             # Stage 2.8: Reduce q_idx_full across heads with weights to get q_idx_out.
             q_idx_out = pl.create_tensor([BATCH, INDEX_HEAD_DIM], dtype=pl.BF16)
             with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="s2_q_reduce"):
-                s2_weights_t = pl.transpose(weights, axis1=0, axis2=1)
                 for d0 in pl.parallel(0, INDEX_HEAD_DIM, QREDUCE_OUT_CHUNK):
-                    s2_q_idx_acc = pl.full([BATCH, QREDUCE_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-                    for h in pl.range(INDEX_HEADS):
-                        s2_q_h = pl.cast(
-                            pl.slice(q_idx_full, [BATCH, QREDUCE_OUT_CHUNK], [0, h * INDEX_HEAD_DIM + d0]),
-                            target_type=pl.FP32,
-                        )
-                        s2_w_h_t = pl.slice(s2_weights_t, [1, BATCH], [h, 0])
-                        s2_w_h = pl.reshape(s2_w_h_t, [BATCH, 1])
-                        s2_q_idx_acc = pl.add(s2_q_idx_acc, pl.row_expand_mul(s2_q_h, s2_w_h))
-                    q_idx_out = pl.assemble(q_idx_out, pl.cast(s2_q_idx_acc, target_type=pl.BF16), [0, d0])
+                    for b in pl.range(BATCH):
+                        s2_acc_b = pl.full([1, QREDUCE_OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                        for h in pl.range(INDEX_HEADS):
+                            s2_q_h_b = pl.cast(
+                                pl.slice(q_idx_full, [1, QREDUCE_OUT_CHUNK], [b, h * INDEX_HEAD_DIM + d0]),
+                                target_type=pl.FP32,
+                            )
+                            s2_w_h_b = pl.read(weights, [b, h])
+                            s2_acc_b = pl.add(s2_acc_b, pl.mul(s2_q_h_b, s2_w_h_b))
+                        q_idx_out = pl.assemble(q_idx_out, pl.cast(s2_acc_b, target_type=pl.BF16), [b, d0])
 
             # ===== scope3: index score + topk =====
             # Inputs: q_idx_out, k_cache_idx
