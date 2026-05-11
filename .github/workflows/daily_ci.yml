@@ -84,6 +84,7 @@ jobs:
           git checkout ${{ env.PTO_ISA_COMMIT }}
 
       - name: Run model tests (${{ matrix.platform }})
+        shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}
           PTO2_RING_DEP_POOL: 1048576
@@ -93,57 +94,34 @@ jobs:
           PYPTO_WARNING_LEVEL: none
         run: |
           : > results.tsv
-          failed=""
+          failed=()
+          run_case() {
+            local file="$1" label="$2"; shift 2
+            echo "::group::${label}"
+            if ! timeout --kill-after=10s 300s python "$file" -p ${{ matrix.platform }} "$@"; then
+              failed+=("$label")
+              echo "::error file=${file}::FAIL (${label})"
+              printf '%s\tfail\n' "$label" >> results.tsv
+            else
+              printf '%s\tpass\n' "$label" >> results.tsv
+            fi
+            echo "::endgroup::"
+          }
+          # Default: every model file once with no extra args.
           for f in $(find models -name '*.py' ! -name '*draft*' | sort); do
-            echo "::group::$f"
-            if ! timeout --kill-after=10s 300s python "$f" -p ${{ matrix.platform }}; then
-              failed="$failed $f"
-              echo "::error file=$f::FAIL"
-              printf '%s\tfail\n' "$f" >> results.tsv
-            else
-              printf '%s\tpass\n' "$f" >> results.tsv
-            fi
-            echo "::endgroup::"
+            run_case "$f" "$f"
           done
-          # Extra dynamic-batch coverage for qwen3-14b-decode (default loop above
-          # already exercises batch=16; re-run with batch=1 and batch=20 to make
-          # sure a single compiled program serves arbitrary user_batch values).
-          QWEN3_14B="models/qwen3/14b/qwen3_14b_decode.py"
-          for B in 1 20; do
-            case_name="${QWEN3_14B}[batch=${B}]"
-            echo "::group::${case_name}"
-            if ! timeout --kill-after=10s 600s python "${QWEN3_14B}" -p ${{ matrix.platform }} --batch "${B}"; then
-              failed="$failed ${case_name}"
-              echo "::error file=${QWEN3_14B}::FAIL (batch=${B})"
-              printf '%s\tfail\n' "${case_name}" >> results.tsv
-            else
-              printf '%s\tpass\n' "${case_name}" >> results.tsv
-            fi
-            echo "::endgroup::"
-          done
-          # Layer-count sweep for qwen3-14b-decode_full: 1L is strict (catches
-          # single-layer kernel regressions), 10L medium, 40L permissive (the
-          # default --num-layers covers 40L via the `find models` loop above).
-          # Tighter pass_rate on small layer counts catches systematic bias
-          # before it gets diluted by the multi-layer average.
-          QWEN3_14B_FULL="models/qwen3/14b/qwen3_14b_decode_full.py"
-          for spec in "1:1.0" "10:0.999"; do
-            N="${spec%%:*}"; PR="${spec##*:}"
-            case_name="${QWEN3_14B_FULL}[num_layers=${N},pass_rate=${PR}]"
-            echo "::group::${case_name}"
-            if ! timeout --kill-after=10s 600s python "${QWEN3_14B_FULL}" \
-                -p ${{ matrix.platform }} --num-layers "${N}" --pass-rate "${PR}"; then
-              failed="$failed ${case_name}"
-              echo "::error file=${QWEN3_14B_FULL}::FAIL (num_layers=${N}, pass_rate=${PR})"
-              printf '%s\tfail\n' "${case_name}" >> results.tsv
-            else
-              printf '%s\tpass\n' "${case_name}" >> results.tsv
-            fi
-            echo "::endgroup::"
-          done
-          if [ -n "$failed" ]; then
-            echo "Failed cases:"
-            for f in $failed; do echo "  - $f"; done
+          # Extras from .github/daily_ci_cases.tsv (file <whitespace> args; '#' = comment).
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in ''|\#*) continue ;; esac
+            read -r file extra <<< "$line"
+            [ -z "$file" ] && continue
+            # shellcheck disable=SC2086  # $extra must word-split into argv
+            run_case "$file" "${file}[${extra}]" $extra
+          done < .github/daily_ci_cases.tsv
+          if [ ${#failed[@]} -ne 0 ]; then
+            echo "Failed cases (${#failed[@]}):"
+            printf '  - %s\n' "${failed[@]}"
             exit 1
           fi
           echo "All model tests passed."
@@ -265,6 +243,7 @@ jobs:
           git checkout ${{ env.PTO_ISA_COMMIT }}
 
       - name: Run model tests (a2a3)
+        shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}
           PTO2_RING_DEP_POOL: 1048576
@@ -274,57 +253,34 @@ jobs:
           PYPTO_WARNING_LEVEL: none
         run: |
           : > results.tsv
-          failed=""
+          failed=()
+          run_case() {
+            local file="$1" label="$2"; shift 2
+            echo "::group::${label}"
+            if ! timeout --kill-after=10s 300s python "$file" -p a2a3 -d "$DEVICE_ID" "$@"; then
+              failed+=("$label")
+              echo "::error file=${file}::FAIL (${label})"
+              printf '%s\tfail\n' "$label" >> results.tsv
+            else
+              printf '%s\tpass\n' "$label" >> results.tsv
+            fi
+            echo "::endgroup::"
+          }
+          # Default: every model file once with no extra args.
           for f in $(find models -name '*.py' ! -name '*draft*' | sort); do
-            echo "::group::$f"
-            if ! timeout --kill-after=10s 300s python "$f" -p a2a3 -d $DEVICE_ID; then
-              failed="$failed $f"
-              echo "::error file=$f::FAIL"
-              printf '%s\tfail\n' "$f" >> results.tsv
-            else
-              printf '%s\tpass\n' "$f" >> results.tsv
-            fi
-            echo "::endgroup::"
+            run_case "$f" "$f"
           done
-          # Extra dynamic-batch coverage for qwen3-14b-decode (default loop above
-          # already exercises batch=16; re-run with batch=1 and batch=20 to make
-          # sure a single compiled program serves arbitrary user_batch values).
-          QWEN3_14B="models/qwen3/14b/qwen3_14b_decode.py"
-          for B in 1 20; do
-            case_name="${QWEN3_14B}[batch=${B}]"
-            echo "::group::${case_name}"
-            if ! timeout --kill-after=10s 600s python "${QWEN3_14B}" -p a2a3 -d $DEVICE_ID --batch "${B}"; then
-              failed="$failed ${case_name}"
-              echo "::error file=${QWEN3_14B}::FAIL (batch=${B})"
-              printf '%s\tfail\n' "${case_name}" >> results.tsv
-            else
-              printf '%s\tpass\n' "${case_name}" >> results.tsv
-            fi
-            echo "::endgroup::"
-          done
-          # Layer-count sweep for qwen3-14b-decode_full: 1L is strict (catches
-          # single-layer kernel regressions), 10L medium, 40L permissive (the
-          # default --num-layers covers 40L via the `find models` loop above).
-          # Tighter pass_rate on small layer counts catches systematic bias
-          # before it gets diluted by the multi-layer average.
-          QWEN3_14B_FULL="models/qwen3/14b/qwen3_14b_decode_full.py"
-          for spec in "1:1.0" "10:0.999"; do
-            N="${spec%%:*}"; PR="${spec##*:}"
-            case_name="${QWEN3_14B_FULL}[num_layers=${N},pass_rate=${PR}]"
-            echo "::group::${case_name}"
-            if ! timeout --kill-after=10s 600s python "${QWEN3_14B_FULL}" \
-                -p a2a3 -d $DEVICE_ID --num-layers "${N}" --pass-rate "${PR}"; then
-              failed="$failed ${case_name}"
-              echo "::error file=${QWEN3_14B_FULL}::FAIL (num_layers=${N}, pass_rate=${PR})"
-              printf '%s\tfail\n' "${case_name}" >> results.tsv
-            else
-              printf '%s\tpass\n' "${case_name}" >> results.tsv
-            fi
-            echo "::endgroup::"
-          done
-          if [ -n "$failed" ]; then
-            echo "Failed cases:"
-            for f in $failed; do echo "  - $f"; done
+          # Extras from .github/daily_ci_cases.tsv (file <whitespace> args; '#' = comment).
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in ''|\#*) continue ;; esac
+            read -r file extra <<< "$line"
+            [ -z "$file" ] && continue
+            # shellcheck disable=SC2086  # $extra must word-split into argv
+            run_case "$file" "${file}[${extra}]" $extra
+          done < .github/daily_ci_cases.tsv
+          if [ ${#failed[@]} -ne 0 ]; then
+            echo "Failed cases (${#failed[@]}):"
+            printf '  - %s\n' "${failed[@]}"
             exit 1
           fi
           echo "All model tests passed."
