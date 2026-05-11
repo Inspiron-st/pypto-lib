@@ -76,7 +76,7 @@ FP32_NEG_INF = -3.4028234663852886e38
 # Scope4 tiles
 ATTN_SCALE = 1.0 / (QK_HEAD_DIM**0.5)
 Q_LATENT_CHUNK = 128
-V_OUT_CHUNK = 16
+V_OUT_CHUNK = 32
 MATMUL_ROW_PAD = 16
 
 
@@ -322,29 +322,22 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
                     k_idx = pl.assemble(k_idx, pl.cast(s2_k_rot_hi, target_type=pl.BF16), [b, QK_ROPE_HEAD_DIM // 2])
 
             # Stage 2.5: Apply Hadamard transform (full matrix multiplication).
-            # For q_idx_full [B, H*D], reshape conceptually to [B, H, D] and apply Hadamard per head.
-            # For k_idx [B, D], apply hadamard_k directly.
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="s2_q_hadamard"):
-                for h in pl.parallel(INDEX_HEADS):
-                    h_offset = h * INDEX_HEAD_DIM
-                    for n0 in pl.range(0, INDEX_HEAD_DIM, IDX_OUT_CHUNK):
-                        hadamard_q_acc = pl.full([BATCH, IDX_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-                        for k0 in pl.range(0, INDEX_HEAD_DIM, K_CHUNK):
-                            q_tile = q_idx_full[:, h_offset + k0 : h_offset + k0 + K_CHUNK]
-                            hadamard_q_tile = hadamard_q[k0 : k0 + K_CHUNK, n0 : n0 + IDX_OUT_CHUNK]
-                            q_h_tile = pl.matmul(q_tile, hadamard_q_tile, out_dtype=pl.FP32)
-                            hadamard_q_acc = pl.add(hadamard_q_acc, q_h_tile)
-                        q_idx_full = pl.assemble(q_idx_full, pl.cast(hadamard_q_acc, target_type=pl.BF16), [0, h_offset + n0])
+            # Keep matmul and vector writeback in separate scopes on a2a3 to avoid
+            # generating mixed AIC/AIV kernels with zero-work vector lanes.
+            for h in pl.parallel(INDEX_HEADS):
+                h_offset = h * INDEX_HEAD_DIM
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="s2_q_hadamard_matmul"):
+                    q_tile = q_idx_full[:, h_offset : h_offset + INDEX_HEAD_DIM]
+                    q_h_tile = pl.matmul(q_tile, hadamard_q, out_dtype=pl.FP32)
 
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="s2_k_hadamard"):
-                for n0 in pl.parallel(0, INDEX_HEAD_DIM, IDX_OUT_CHUNK):
-                    hadamard_k_acc = pl.full([BATCH, IDX_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-                    for k0 in pl.range(0, INDEX_HEAD_DIM, K_CHUNK):
-                        k_tile = k_idx[:, k0 : k0 + K_CHUNK]
-                        hadamard_k_tile = hadamard_k[k0 : k0 + K_CHUNK, n0 : n0 + IDX_OUT_CHUNK]
-                        k_h_tile = pl.matmul(k_tile, hadamard_k_tile, out_dtype=pl.FP32)
-                        hadamard_k_acc = pl.add(hadamard_k_acc, k_h_tile)
-                    k_idx = pl.assemble(k_idx, pl.cast(hadamard_k_acc, target_type=pl.BF16), [0, n0])
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="s2_q_hadamard_write"):
+                    q_idx_full = pl.assemble(q_idx_full, pl.cast(q_h_tile, target_type=pl.BF16), [0, h_offset])
+
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="s2_k_hadamard_matmul"):
+                k_h_tile = pl.matmul(k_idx, hadamard_k, out_dtype=pl.FP32)
+
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="s2_k_hadamard_write"):
+                k_idx = pl.assemble(k_idx, pl.cast(k_h_tile, target_type=pl.BF16), [0, 0])
 
             # Stage 2.6: weights = weights_proj(hidden_states) * n_heads^-0.5 * head_dim^-0.5.
             weights_proj_bf16 = pl.create_tensor([HIDDEN, INDEX_HEADS], dtype=pl.BF16)
@@ -377,6 +370,7 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
 
             # Stage 2.8: Reduce q_idx_full across heads with weights to get q_idx_out.
             q_idx_out = pl.create_tensor([BATCH, INDEX_HEAD_DIM], dtype=pl.BF16)
+            weights_flat = pl.reshape(weights, [BATCH * INDEX_HEADS])
             with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="s2_q_reduce"):
                 for d0 in pl.parallel(0, INDEX_HEAD_DIM, QREDUCE_OUT_CHUNK):
                     for b in pl.range(BATCH):
@@ -386,7 +380,7 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
                                 pl.slice(q_idx_full, [1, QREDUCE_OUT_CHUNK], [b, h * INDEX_HEAD_DIM + d0]),
                                 target_type=pl.FP32,
                             )
-                            s2_w_h_b = pl.read(weights, [b, h])
+                            s2_w_h_b = pl.read(weights_flat, [b * INDEX_HEADS + h])
                             s2_acc_b = pl.add(s2_acc_b, pl.mul(s2_q_h_b, s2_w_h_b))
                         q_idx_out = pl.assemble(q_idx_out, pl.cast(s2_acc_b, target_type=pl.BF16), [b, d0])
 
@@ -450,15 +444,12 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
                     s3_sorted_t = pl.tensor.mrgsort(s3_sorted_t, block_len=4096)
                     s3_sorted_gm = pl.assemble(s3_sorted_gm, s3_sorted_t, [0, 0])
 
-                s3_raw_idx_local = pl.create_tensor([1, INDEX_TOPK], dtype=pl.INT32)
-
                 # Stage 3.4: Split top-k values and raw indices, then pad invalid tail slots.
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="s3_topk_extract"):
                     s3_topk_pairs = s3_sorted_gm[:, 0 : 2 * INDEX_TOPK]
                     s3_topk_i_raw = pl.tensor.gather(s3_topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-                    s3_raw_idx_local = pl.assemble(s3_raw_idx_local, s3_topk_i_raw, [0, 0])
                     s3_valid_topk = pl.min(INDEX_TOPK, s3_ctx_len)
-                    s3_idx_valid = pl.slice(s3_raw_idx_local, [1, INDEX_TOPK], [0, 0], valid_shape=[1, s3_valid_topk])
+                    s3_idx_valid = pl.slice(s3_topk_i_raw, [1, INDEX_TOPK], [0, 0], valid_shape=[1, s3_valid_topk])
                     s3_idx_padded = pl.fillpad(s3_idx_valid, pad_value=pl.PadValue.min)
                     topk_idx = pl.assemble(topk_idx, s3_idx_padded, [b, 0])
 
@@ -467,6 +458,8 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
             # Output: dispatch_buf (cross-node dispatch buffer)
             attn_front = pl.create_tensor([BATCH, ATTN_OUT], dtype=pl.BF16)
             topk_idx_flat = pl.reshape(topk_idx, [BATCH * INDEX_TOPK])
+            w_q_nope_to_latent_2d = pl.reshape(w_q_nope_to_latent, [NUM_HEADS * QK_NOPE_HEAD_DIM, KV_LORA_RANK])
+            w_latent_to_v_2d = pl.reshape(w_latent_to_v, [NUM_HEADS * KV_LORA_RANK, V_HEAD_DIM])
 
             for b in pl.parallel(BATCH):
                 attn_row = pl.create_tensor([1, ATTN_OUT], dtype=pl.FP32)
@@ -493,16 +486,19 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
 
                     # Stage 4.2: Project q_nope to latent space chunk-by-chunk.
                     with pl.at(level=pl.Level.CORE_GROUP, name_hint="s4_q_nope_latent_proj"):
+                        q_w_row = h * QK_NOPE_HEAD_DIM
                         for q0 in pl.range(0, KV_LORA_RANK, Q_LATENT_CHUNK):
-                            w_qn_h = pl.reshape(
-                                w_q_nope_to_latent[h : h + 1, 0 : QK_NOPE_HEAD_DIM, q0 : q0 + Q_LATENT_CHUNK],
-                                [QK_NOPE_HEAD_DIM, Q_LATENT_CHUNK],
-                            )
-                            q_nope_latent_part = pl.matmul(q_nope_padded, w_qn_h, out_dtype=pl.FP32)
+                            w_qn_h_chunk = w_q_nope_to_latent_2d[q_w_row : q_w_row + QK_NOPE_HEAD_DIM, q0 : q0 + Q_LATENT_CHUNK]
+                            q_nope_latent_part = pl.matmul(q_nope_padded, w_qn_h_chunk, out_dtype=pl.FP32)
                             q_nope_latent_batch = pl.assemble(q_nope_latent_batch, q_nope_latent_part, [0, q0])
 
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="s4_softmax_init"):
-                        # Stage 4.3: Initialize online softmax state with the first topk entry.
+                    # Stage 4.3-4.5: Online softmax over the sparse top-k set.
+                    #
+                    # Keep the dynamic kk loop inside one device task. Emitting
+                    # one runtime task per top-k element creates hundreds of
+                    # thousands of tiny dependent tasks for this standalone
+                    # profile and can leave the a2a3 scheduler stuck waiting.
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="s4_softmax"):
                         topk_pos0 = pl.read(topk_idx_flat, [topk_base])
                         cache_s0 = b * MAX_SEQ + topk_pos0
                         kv_s0 = pl.cast(kv_cache[cache_s0 : cache_s0 + 1, 0 : KV_LORA_RANK], target_type=pl.FP32)
@@ -514,9 +510,7 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
                         mi = pl.mul(pl.add(score_nope0, score_pe0), ATTN_SCALE)
                         li = pl.exp(pl.sub(mi, mi))
 
-                    # Stage 4.4: Online softmax accumulation over the remaining topk entries.
-                    for kk in pl.range(1, sparse_k):
-                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="s4_softmax_accum"):
+                        for kk in pl.range(1, sparse_k):
                             topk_pos = pl.read(topk_idx_flat, [topk_base + kk])
                             cache_s = b * MAX_SEQ + topk_pos
                             kv_s = pl.cast(kv_cache[cache_s : cache_s + 1, 0 : KV_LORA_RANK], target_type=pl.FP32)
@@ -533,19 +527,18 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
                             oi = pl.add(pl.row_expand_mul(oi, alpha), pl.row_expand_mul(kv_batch, beta))
                             mi = mi_new
 
-                    # Stage 4.5: Compute the latent context vector.
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="s4_latent_context"):
                         ctx_latent_batch = pl.row_expand_div(oi, li)
 
                     # Stage 4.6: Project latent context back to V chunks.
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="s4_latent_cast"):
+                        ctx_latent_bf16_batch = pl.cast(ctx_latent_batch, target_type=pl.BF16)
+
                     with pl.at(level=pl.Level.CORE_GROUP, name_hint="s4_v_proj"):
                         ctx_v_batch = pl.full([MATMUL_ROW_PAD, V_HEAD_DIM], dtype=pl.FP32, value=0.0)
+                        v_w_row = h * KV_LORA_RANK
                         for v0 in pl.range(0, V_HEAD_DIM, V_OUT_CHUNK):
-                            wv_tile = pl.reshape(
-                                w_latent_to_v[h : h + 1, 0 : KV_LORA_RANK, v0 : v0 + V_OUT_CHUNK],
-                                [KV_LORA_RANK, V_OUT_CHUNK],
-                            )
-                            v_part_batch = pl.matmul(pl.cast(ctx_latent_batch, target_type=pl.BF16), wv_tile, out_dtype=pl.FP32)
+                            wv_tile_chunk = w_latent_to_v_2d[v_w_row : v_w_row + KV_LORA_RANK, v0 : v0 + V_OUT_CHUNK]
+                            v_part_batch = pl.matmul(ctx_latent_bf16_batch, wv_tile_chunk, out_dtype=pl.FP32)
                             ctx_v_batch = pl.assemble(ctx_v_batch, v_part_batch, [0, v0])
 
                     # Stage 4.7: Extract the leading V row and assemble it into attn_row.
