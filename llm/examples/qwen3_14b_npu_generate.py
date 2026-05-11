@@ -156,11 +156,20 @@ def InstallProfiling(engine: LLMEngine, model_id: str, collector: _TimingCollect
     )
     compiled.final_rms = collector.WrapKernel(compiled.final_rms, "kernel.final_rms")
     compiled.lm_head = collector.WrapKernel(compiled.lm_head, "kernel.lm_head")
-    # L3 l3_generate: one dispatch drives prefill_all + decode_all (all-layers L2).
-    if compiled.l3_generate is not None:
-        compiled.l3_generate = collector.WrapKernel(
-            compiled.l3_generate, "kernel.l3_generate", group_by_decode_step=True
-        )
+
+    # L3 generate wrapper. run_generate_l3 is invoked once per generate call
+    # (replaces run_prefill + run_decode in L3 mode).
+    if callable(getattr(executor, "run_generate_l3", None)):
+        orig_l3_generate = executor.run_generate_l3
+
+        def timed_l3_generate(*args, **kwargs):
+            t0 = time.perf_counter()
+            try:
+                return orig_l3_generate(*args, **kwargs)
+            finally:
+                collector.kernel_times["kernel.l3_generate"].append(time.perf_counter() - t0)
+
+        executor.run_generate_l3 = timed_l3_generate
 
     # Top-level executor API wrappers.
     orig_prefill = executor.run_prefill

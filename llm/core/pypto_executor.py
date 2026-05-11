@@ -81,18 +81,6 @@ _VOCAB_PAD_MULTIPLE = 512  # must be a multiple of qwen3_14b_lm_head.VOCAB_CHUNK
 _LOGITS_BATCH_TILE = 16
 _QWEN14B_PAGE_SIZE = 256
 
-# Substrings matched against SSA-renamed parameter names to identify static
-# weight tensors that can be pre-uploaded to device (child_memory=True).
-# These are the model weight matrices plus the RoPE tables and output-head
-# weight that are constant throughout a generate call.
-_STATIC_WEIGHT_SUBSTRINGS: frozenset[str] = frozenset({
-    "input_rms_weight", "wq", "wk", "wv", "wo",
-    "q_norm_weight", "k_norm_weight", "post_rms_weight",
-    "w_gate", "w_up", "w_down",
-    "rope_cos", "rope_sin",
-    "final_norm_weight", "lm_head_weight",
-})
-
 
 def _round_up(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
@@ -154,13 +142,8 @@ class _CompiledKernels:
     padded_lm_head_weight: torch.Tensor
     layers: list[_KernelLayerWeights]
     decode_weights: dict[str, torch.Tensor]
-    # L3 l3_generate artefacts. Populated only when l3_mode=True.
-    # ONE host_orch (L3) dispatches qwen3_prefill_all + qwen3_decode_all (L2),
-    # each iterating all layers internally via pl.range(num_layers).
-    l3_generate: object | None = None
+    # L3-wrapped generate artifacts. Populated only when l3_mode=True.
     stacked_weights: dict[str, torch.Tensor] | None = None
-    # L3-wrapped generate: chip callables for final_rms/lm_head + l3_generate
-    # setup artifacts.  Populated only when l3_mode=True.
     l3_generate_chip_callables: dict[str, object] | None = None
     l3_generate_entry_fn: object | None = None
     l3_generate_sub_worker_fns: dict[str, object] | None = None
@@ -168,10 +151,6 @@ class _CompiledKernels:
     l3_generate_platform: str | None = None
     l3_generate_runtime_name: str | None = None
     l3_generate_param_infos: object | None = None
-    # Reserved for future device-resident weight handles on the step-by-step
-    # L3 dispatch path.  Currently always None — see comment in _compile_model.
-    l3_device_weights: dict[str, object] | None = None
-    l3_device_worker: object | None = None
 
 
 @dataclass
@@ -233,14 +212,10 @@ class PyptoQwen14BExecutor(ModelExecutor):
         self._platform = platform
         self._device_id = device_id
         self._save_kernels_dir = save_kernels_dir
-        # When True, BOTH prefill and decode are dispatched via the L3
-        # l3_generate kernel, where each L2 function iterates all layers
-        # internally via pl.range(num_layers). Single dispatch per step.
+        # When True, the engine uses run_generate_l3 which dispatches the
+        # full prefill + decode loop inside a single Worker(level=3).
         self._l3_mode = l3_mode
-        # When True, run_generate_l3 emits per-stage timestamp prints from
-        # both the host_orch submit thread and the sample_and_prepare
-        # sub-worker callback (relative timestamps + Δprev + per-step
-        # chip_tasks vs sample_work split).
+        # When True, run_generate_l3 emits per-stage timestamp prints.
         self._l3_trace = l3_trace
         self._compiled: dict[str, _CompiledKernels] = {}
 
@@ -250,17 +225,6 @@ class PyptoQwen14BExecutor(ModelExecutor):
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         compiled = self._compiled[model.config.model_id]
         prefill_inputs = self._prepare_prefill_inputs(model, batch)
-
-        if self._l3_mode:
-            decode_hidden = self._run_l3_generate_prefill(model, compiled, prefill_inputs)
-            final_hidden = decode_hidden.float()
-            logits = self._project_logits(model, final_hidden)
-            for batch_idx, alloc in enumerate(batch.kv_allocations):
-                alloc.tokens_used = max(
-                    alloc.tokens_used, int(prefill_inputs.seq_lens[batch_idx].item())
-                )
-            return PrefillResult(last_hidden=final_hidden, logits=logits)
-
         hidden = prefill_inputs.hidden
         t_prefill_start = time.perf_counter()
 
@@ -322,188 +286,41 @@ class PyptoQwen14BExecutor(ModelExecutor):
         hidden = decode_inputs.hidden
         dw = compiled.decode_weights
 
-        if self._l3_mode:
-            hidden = self._run_l3_generate_decode(model, compiled, decode_inputs)
-            final_hidden = hidden.float()
-        else:
-            k_cache, v_cache = self._kv_cache_manager.materialize_decode_cache_all_layers(
-                model.config.model_id,
-            )
-            out = torch.zeros_like(hidden)
+        k_cache, v_cache = self._kv_cache_manager.materialize_decode_cache_all_layers(
+            model.config.model_id,
+        )
+        out = torch.zeros_like(hidden)
 
-            compiled.decode(
-                hidden,
-                dw["decode_input_rms_weight"],
-                dw["decode_wq"],
-                dw["decode_wk"],
-                dw["decode_wv"],
-                dw["decode_q_norm_weight"],
-                dw["decode_k_norm_weight"],
-                decode_inputs.seq_lens,
-                decode_inputs.block_table,
-                decode_inputs.slot_mapping,
-                compiled.rope_cos,
-                compiled.rope_sin,
-                k_cache,
-                v_cache,
-                dw["decode_wo"],
-                dw["decode_post_rms_weight"],
-                dw["decode_w_gate"],
-                dw["decode_w_up"],
-                dw["decode_w_down"],
-                out,
-                config=self._run_config(codegen_only=False),
-            )
+        compiled.decode(
+            hidden,
+            dw["decode_input_rms_weight"],
+            dw["decode_wq"],
+            dw["decode_wk"],
+            dw["decode_wv"],
+            dw["decode_q_norm_weight"],
+            dw["decode_k_norm_weight"],
+            decode_inputs.seq_lens,
+            decode_inputs.block_table,
+            decode_inputs.slot_mapping,
+            compiled.rope_cos,
+            compiled.rope_sin,
+            k_cache,
+            v_cache,
+            dw["decode_wo"],
+            dw["decode_post_rms_weight"],
+            dw["decode_w_gate"],
+            dw["decode_w_up"],
+            dw["decode_w_down"],
+            out,
+            config=self._run_config(codegen_only=False),
+        )
 
-            final_hidden = out.float()
+        final_hidden = out.float()
 
         logits = self._project_logits(model, final_hidden)
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
         return DecodeResult(hidden_states=final_hidden, logits=logits)
-
-    def _run_l3_generate_prefill(
-        self,
-        model: RuntimeModel,
-        compiled: _CompiledKernels,
-        prefill_inputs: _PrefillInputs,
-    ) -> torch.Tensor:
-        """Combined prefill + first-decode dispatch (has_prefill=1).
-
-        ONE host_orch (L3) dispatches:
-          1. qwen3_prefill_all (L2) — all layers, writes KV cache for all prompt positions.
-          2. qwen3_decode_all  (L2) — all layers, attends to full KV cache;
-             output is the decode hidden state that predicts the first new token.
-        """
-        if compiled.l3_generate is None or compiled.stacked_weights is None:
-            raise RuntimeError(
-                "L3 l3_generate prefill requested but artefacts not compiled. "
-                "Construct the executor with l3_mode=True."
-            )
-        # Use device-resident DeviceTensor for static weights when available
-        # to skip H2D copy inside execute_compiled (child_memory=True path).
-        dw = compiled.l3_device_weights or compiled.stacked_weights
-        rope_cos = (dw.get("rope_cos") or compiled.rope_cos)
-        rope_sin = (dw.get("rope_sin") or compiled.rope_sin)
-        actual_batch = prefill_inputs.actual_batch
-        hidden_size = model.config.hidden_size
-        max_seq = model.runtime.max_seq_len
-
-        k_cache_all, v_cache_all = self._kv_cache_manager.materialize_decode_cache_all_layers(
-            model.config.model_id,
-        )
-
-        # Build initial decode hidden: last prompt token embedding per batch item.
-        decode_hidden = torch.zeros((actual_batch, hidden_size), dtype=torch.bfloat16)
-        decode_slot_mapping = torch.zeros((actual_batch,), dtype=torch.int32)
-        for b in range(actual_batch):
-            seq_len_b = int(prefill_inputs.seq_lens[b].item())
-            decode_hidden[b] = prefill_inputs.hidden[b, seq_len_b - 1, :]
-            decode_slot_mapping[b] = int(
-                prefill_inputs.slot_mapping[b * max_seq + seq_len_b - 1].item()
-            )
-
-        has_prefill = torch.tensor(True, dtype=torch.bool)
-        prefill_out = torch.zeros_like(prefill_inputs.hidden)
-        decode_out = torch.zeros_like(decode_hidden)
-
-        compiled.l3_generate(
-            prefill_inputs.hidden,
-            prefill_inputs.seq_lens,
-            prefill_inputs.slot_mapping,
-            decode_hidden,
-            prefill_inputs.seq_lens,   # decode_seq_lens = prefill_seq_lens (= N)
-            decode_slot_mapping,
-            dw["input_rms_weight"],
-            dw["wq"],
-            dw["wk"],
-            dw["wv"],
-            dw["q_norm_weight"],
-            dw["k_norm_weight"],
-            rope_cos,
-            rope_sin,
-            prefill_inputs.block_table,
-            k_cache_all,
-            v_cache_all,
-            dw["wo"],
-            dw["post_rms_weight"],
-            dw["w_gate"],
-            dw["w_up"],
-            dw["w_down"],
-            has_prefill,
-            prefill_out,
-            decode_out,
-            config=self._run_config(codegen_only=False),
-        )
-        return decode_out
-
-    def _run_l3_generate_decode(
-        self,
-        model: RuntimeModel,
-        compiled: _CompiledKernels,
-        decode_inputs: _DecodeInputs,
-    ) -> torch.Tensor:
-        """Pure-decode dispatch (has_prefill=0).
-
-        ONE host_orch (L3) dispatches qwen3_decode_all (L2) which iterates
-        all layers internally. Prefill tensors are dummies.
-        """
-        if compiled.l3_generate is None or compiled.stacked_weights is None:
-            raise RuntimeError(
-                "L3 l3_generate decode requested but artefacts not compiled. "
-                "Construct the executor with l3_mode=True."
-            )
-        # Use device-resident DeviceTensor for static weights when available
-        # to skip H2D copy inside execute_compiled (child_memory=True path).
-        dw = compiled.l3_device_weights or compiled.stacked_weights
-        rope_cos = (dw.get("rope_cos") or compiled.rope_cos)
-        rope_sin = (dw.get("rope_sin") or compiled.rope_sin)
-        actual_batch = decode_inputs.actual_batch
-        hidden_size = model.config.hidden_size
-        max_seq = model.runtime.max_seq_len
-
-        k_cache_all, v_cache_all = self._kv_cache_manager.materialize_decode_cache_all_layers(
-            model.config.model_id,
-        )
-
-        # Dummy prefill tensors — passed but not read by the kernel (has_prefill=0).
-        dummy_prefill = torch.zeros((actual_batch, max_seq, hidden_size), dtype=torch.bfloat16)
-        dummy_seq_lens = decode_inputs.seq_lens
-        dummy_slot_mapping = torch.full((actual_batch * max_seq,), -1, dtype=torch.int32)
-        dummy_prefill_out = torch.zeros_like(dummy_prefill)
-
-        has_prefill = torch.tensor(False, dtype=torch.bool)
-        decode_out = torch.zeros_like(decode_inputs.hidden)
-
-        compiled.l3_generate(
-            dummy_prefill,
-            dummy_seq_lens,
-            dummy_slot_mapping,
-            decode_inputs.hidden,
-            decode_inputs.seq_lens,
-            decode_inputs.slot_mapping,
-            dw["input_rms_weight"],
-            dw["wq"],
-            dw["wk"],
-            dw["wv"],
-            dw["q_norm_weight"],
-            dw["k_norm_weight"],
-            rope_cos,
-            rope_sin,
-            decode_inputs.block_table,
-            k_cache_all,
-            v_cache_all,
-            dw["wo"],
-            dw["post_rms_weight"],
-            dw["w_gate"],
-            dw["w_up"],
-            dw["w_down"],
-            has_prefill,
-            dummy_prefill_out,
-            decode_out,
-            config=self._run_config(codegen_only=False),
-        )
-        return decode_out
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
         _ensure_pypto_import(self._pypto_root)
@@ -571,9 +388,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             model.config.rope_theta,
         )
 
-        # L3 l3_generate artefacts (built only when l3_mode=True).
-        # L3 l3_generate: ONE host_orch dispatches prefill_all + decode_all,
-        # each iterating all layers internally via pl.range(num_layers).
+        # L3 artefacts (built only when l3_mode=True).
         l3_generate: object | None = None
         stacked_weights: dict[str, torch.Tensor] | None = None
         if self._l3_mode:
@@ -709,16 +524,6 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
         decode_weights = self._stack_decode_weights(layers)
 
-        # l3_device_weights / l3_device_worker: reserved for future persistent
-        # weight residency across generate calls.  Currently always None —
-        # the run_generate_l3 path pre-uploads weights inside generate_orch_fn
-        # via orch.malloc/copy_to which is safe because it runs inside the
-        # already-open level-3 Worker context.  Creating a second Worker here
-        # at compile time is avoided: two concurrent Worker instances share
-        # the same device context and conflict, causing a hang on init.
-        l3_device_weights: dict[str, object] | None = None
-        l3_device_worker: object | None = None
-
         return _CompiledKernels(
             prefill=prefill,
             decode=decode,
@@ -731,7 +536,6 @@ class PyptoQwen14BExecutor(ModelExecutor):
             padded_lm_head_weight=padded_lm_head_weight,
             layers=layers,
             decode_weights=decode_weights,
-            l3_generate=l3_generate,
             stacked_weights=stacked_weights,
             l3_generate_chip_callables=l3_generate_chip_callables,
             l3_generate_entry_fn=l3_generate_entry_fn,
@@ -740,8 +544,6 @@ class PyptoQwen14BExecutor(ModelExecutor):
             l3_generate_platform=l3_generate_platform,
             l3_generate_runtime_name=l3_generate_runtime_name,
             l3_generate_param_infos=l3_generate_param_infos,
-            l3_device_weights=l3_device_weights,
-            l3_device_worker=l3_device_worker,
         )
 
     @staticmethod
@@ -866,15 +668,6 @@ class PyptoQwen14BExecutor(ModelExecutor):
         ).share_memory_()
         decode_out = _decode_out_storage[:actual_batch, :]   # [actual_batch, hidden_size]
         rms_x = _decode_out_storage                          # [_LOGITS_BATCH_TILE, hidden_size]
-        # Dummy prefill tensors for decode-only dispatches (has_prefill=False).
-        # Pre-allocated once to avoid creating new shared-memory tensors per chunk.
-        dummy_prefill = torch.zeros(
-            (actual_batch, max_seq, hidden_size), dtype=torch.bfloat16,
-        ).share_memory_()
-        dummy_slot_mapping = torch.full(
-            (actual_batch * max_seq,), -1, dtype=torch.int32,
-        ).share_memory_()
-        dummy_prefill_out = torch.zeros_like(dummy_prefill).share_memory_()
         # final_rms / lm_head intermediates.
         rms_gamma = model.final_norm_weight.view(1, hidden_size).float().cpu().share_memory_()
         rms_normed = torch.zeros((_LOGITS_BATCH_TILE, hidden_size), dtype=torch.bfloat16).share_memory_()
@@ -931,8 +724,6 @@ class PyptoQwen14BExecutor(ModelExecutor):
         _decode_seq_lens = decode_seq_lens
         _decode_slot_mapping_buf = decode_slot_mapping_buf
         _logits_padded = logits_padded
-        _block_table = block_table
-        _kv_manager = self._kv_cache_manager
         _prefill_batch = prefill_batch
 
         # L3 tracing: enabled by the executor's l3_trace flag (typically wired

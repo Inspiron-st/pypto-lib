@@ -62,8 +62,6 @@ NUM_KV_HEADS = 8
 HEAD_DIM = 128
 HIDDEN = NUM_HEADS * HEAD_DIM  # 5120
 INTERMEDIATE = 17408
-KV_HIDDEN = NUM_KV_HEADS * HEAD_DIM
-
 EPS = 1e-6
 
 # Shared tiling constants.
@@ -142,7 +140,6 @@ def build_qwen3_14b_l3_generate_program(
     @pl.program
     class Qwen3GenChunked:
 
-        # ── L2: per-layer prefill ──────────────────────────────────────────────
         # ── L2: all-layers prefill ─────────────────────────────────────────────
         @pl.function(type=pl.FunctionType.Opaque)
         def qwen3_prefill_all(
