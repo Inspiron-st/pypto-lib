@@ -52,16 +52,29 @@ class LLMEngine:
         model_format: str | None = None,
         **loader_options: object,
     ) -> None:
+        import time as _time  # noqa: PLC0415
+
+        _verbose = getattr(self._executor, "_l3_trace", False)
+        _t0 = _time.perf_counter()
+        _stages: list[tuple[str, float]] = []
+
+        def _mark(label: str) -> None:
+            if _verbose:
+                _stages.append((label, _time.perf_counter()))
+
         loaded = self._model_loader.load(
             model_id=model_id,
             model_dir=model_dir,
             runtime_config=runtime_config,
             model_format=model_format,
+            profile_verbose=_verbose,
             **loader_options,
         )
+        _mark("model_loader.load")
         config = loaded.config
         runtime = loaded.runtime_model.runtime
         self._kv_cache_manager.register_model(model_id, config, runtime)
+        _mark("kv_cache_manager.register")
         self._models[model_id] = ModelRecord(
             config=config,
             runtime=runtime,
@@ -69,9 +82,21 @@ class LLMEngine:
             layer_specs=loaded.layer_specs,
             runtime_model=loaded.runtime_model,
         )
+        _mark("create_model_record")
         register_model = getattr(self._executor, "register_model", None)
         if callable(register_model):
             register_model(model_id, self._models[model_id])
+        _mark("executor.register_model")
+
+        if _verbose and _stages:
+            prev = _t0
+            total_ms = (_stages[-1][1] - _t0) * 1000.0
+            print("[init-breakdown] init_model stage timings:", flush=True)
+            for label, t in _stages:
+                dt_ms = (t - prev) * 1000.0
+                print(f"[init-breakdown]   {label:30s} : {dt_ms:9.1f} ms", flush=True)
+                prev = t
+            print(f"[init-breakdown]   {'TOTAL':30s} : {total_ms:9.1f} ms", flush=True)
 
     def generate(self, model_id: str, prompt: str, config: GenerateConfig | None = None) -> str | Iterator[str]:
         generate_config = config or GenerateConfig()

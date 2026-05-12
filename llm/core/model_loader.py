@@ -152,6 +152,16 @@ class HuggingFaceDirectoryLoader:
         return False
 
     def load(self, request: ModelLoadRequest) -> LoadedModel:
+        import time as _time  # noqa: PLC0415
+
+        _verbose = bool(request.loader_options.get("profile_verbose", False))
+        _t0 = _time.perf_counter()
+        _stages: list[tuple[str, float]] = []
+
+        def _mark(label: str) -> None:
+            if _verbose:
+                _stages.append((label, _time.perf_counter()))
+
         model_path = Path(request.model_dir)
         config_path = model_path / "config.json"
         if not config_path.exists():
@@ -162,11 +172,14 @@ class HuggingFaceDirectoryLoader:
             str(model_path),
             trust_remote_code=trust_remote_code,
         )
+        _mark("load_tokenizer")
         config_data = json.loads(config_path.read_text())
         config = _build_model_config(request.model_id, config_data, tokenizer)
         runtime = request.runtime_config or RuntimeConfig(max_seq_len=config.max_position_embeddings)
         layer_specs = _build_layer_specs(config)
+        _mark("parse_config")
         state_dict = _load_safetensors_dir(model_path)
+        _mark("load_safetensors")
 
         if config.architecture.lower() not in {"qwen2forcausallm", "qwen3forcausallm", "qwen2model", "qwen3model"}:
             raise ValueError(
@@ -185,6 +198,7 @@ class HuggingFaceDirectoryLoader:
         else:
             lm_head = _cast_weight(lm_head, runtime)
 
+        _mark("embed_norm_lmhead")
         layers: list[LayerWeights] = []
         default_dtype = _torch_dtype_from_name(runtime.weight_dtype)
         for spec in layer_specs:
@@ -218,6 +232,8 @@ class HuggingFaceDirectoryLoader:
                 )
             )
 
+        _mark("cast_layer_weights")
+
         runtime_model = RuntimeModel(
             config=config,
             runtime=runtime,
@@ -226,6 +242,18 @@ class HuggingFaceDirectoryLoader:
             lm_head=lm_head,
             layers=layers,
         )
+
+        # ── loader stage breakdown report ──
+        if _verbose and _stages:
+            prev = _t0
+            total_ms = (_stages[-1][1] - _t0) * 1000.0
+            print("[loader-breakdown] HuggingFaceLoader.load stage timings:", flush=True)
+            for label, t in _stages:
+                dt_ms = (t - prev) * 1000.0
+                print(f"[loader-breakdown]   {label:30s} : {dt_ms:9.1f} ms", flush=True)
+                prev = t
+            print(f"[loader-breakdown]   {'TOTAL':30s} : {total_ms:9.1f} ms", flush=True)
+
         return LoadedModel(
             model_id=request.model_id,
             model_dir=str(model_path),
