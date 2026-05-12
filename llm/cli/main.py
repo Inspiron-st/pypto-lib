@@ -27,6 +27,7 @@ PyptoQwen14BExecutor = None
 
 
 _VALID_BACKENDS = {"cpu", "npu"}
+_L3_BATCH_TILE = 16
 _EXIT_COMMANDS = {"/exit", "/quit"}
 _HELP_COMMANDS = {"/help", "?"}
 _CONFIG_COMMANDS = {"/config"}
@@ -47,6 +48,7 @@ class NpuCliConfig:
     device_id: int = 0
     save_kernels_dir: str | None = None
     pypto_root: str | None = None
+    l3_mode: bool = False
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt", help="Prompt text for one-shot generation.")
     parser.add_argument("--interactive", action="store_true", help="Read prompts interactively after loading the model.")
     parser.add_argument("--stream", action="store_true", help="Override generation.stream=true for this run.")
+    parser.add_argument("--l3", action="store_true", help="Override npu.l3=true for this run.")
     parser.add_argument(
         "--show-startup-logs",
         action="store_true",
@@ -75,7 +78,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def load_serving_config(config_path: str | Path, *, stream_override: bool = False) -> ServingConfig:
+def load_serving_config(
+    config_path: str | Path,
+    *,
+    stream_override: bool = False,
+    l3_override: bool = False,
+) -> ServingConfig:
     _ensure_core_imports()
     path = Path(config_path)
     try:
@@ -103,19 +111,6 @@ def load_serving_config(config_path: str | Path, *, stream_override: bool = Fals
         loader_options=dict(_optional_mapping(model_section.get("loader_options"), "model.loader_options")),
     )
 
-    page_size = _get_optional_int(runtime_section, "page_size")
-    if page_size is None:
-        page_size = 256 if backend == "npu" else 64
-    runtime = RuntimeConfig(
-        page_size=page_size,
-        max_batch_size=_get_int(runtime_section, "max_batch_size", 1),
-        max_seq_len=_get_int(runtime_section, "max_seq_len", 4096),
-        device=_get_str(runtime_section, "device", "cpu"),
-        kv_dtype=_get_str(runtime_section, "kv_dtype", "bfloat16"),
-        weight_dtype=_get_str(runtime_section, "weight_dtype", "float32"),
-        total_kv_pages=_get_optional_int(runtime_section, "total_kv_pages"),
-    )
-
     generation_defaults = GenerateConfig()
     generation = GenerateConfig(
         max_new_tokens=_get_int(generation_section, "max_new_tokens", generation_defaults.max_new_tokens),
@@ -126,11 +121,35 @@ def load_serving_config(config_path: str | Path, *, stream_override: bool = Fals
         stream=stream_override or _get_bool(generation_section, "stream", generation_defaults.stream),
     )
 
+    npu_l3_mode = l3_override or _get_bool_alias(npu_section, ("l3", "l3_mode"), False)
+
+    page_size = _get_optional_int(runtime_section, "page_size")
+    if page_size is None:
+        page_size = 256 if backend == "npu" else 64
+    max_batch_size_default = _L3_BATCH_TILE if backend == "npu" and npu_l3_mode else 1
+    max_batch_size = _get_int(runtime_section, "max_batch_size", max_batch_size_default)
+    if backend == "npu" and npu_l3_mode and max_batch_size != _L3_BATCH_TILE:
+        raise ValueError(
+            f"npu.l3 requires runtime.max_batch_size={_L3_BATCH_TILE}; "
+            f"got {max_batch_size}."
+        )
+    runtime = RuntimeConfig(
+        page_size=page_size,
+        max_batch_size=max_batch_size,
+        max_seq_len=_get_int(runtime_section, "max_seq_len", 4096),
+        device=_get_str(runtime_section, "device", "cpu"),
+        kv_dtype=_get_str(runtime_section, "kv_dtype", "bfloat16"),
+        weight_dtype=_get_str(runtime_section, "weight_dtype", "float32"),
+        total_kv_pages=_get_optional_int(runtime_section, "total_kv_pages"),
+        max_new_tokens=generation.max_new_tokens,
+    )
+
     npu = NpuCliConfig(
         platform=_get_str(npu_section, "platform", "a2a3"),
         device_id=_get_int(npu_section, "device_id", 0),
         save_kernels_dir=_get_optional_str(npu_section, "save_kernels_dir"),
         pypto_root=_get_optional_str(npu_section, "pypto_root"),
+        l3_mode=npu_l3_mode,
     )
 
     return ServingConfig(
@@ -154,6 +173,7 @@ def create_engine(config: ServingConfig) -> LLMEngine:
         platform=config.npu.platform,
         device_id=config.npu.device_id,
         save_kernels_dir=config.npu.save_kernels_dir,
+        l3_mode=config.npu.l3_mode,
     )
     return LLMEngine(kv_cache_manager=kv_cache_manager, executor=executor)
 
@@ -235,7 +255,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("Specify exactly one of --prompt or --interactive.")
 
     with _startup_log_context(enabled=not args.show_startup_logs):
-        config = load_serving_config(args.config, stream_override=args.stream)
+        config = load_serving_config(
+            args.config,
+            stream_override=args.stream,
+            l3_override=args.l3,
+        )
         engine = create_engine(config)
         init_engine(engine, config)
 
@@ -312,7 +336,8 @@ def _print_runtime_summary(config: ServingConfig, stdout: TextIO) -> None:
     )
     if config.backend == "npu":
         print(
-            f"NPU: platform={config.npu.platform}, device_id={config.npu.device_id}",
+            f"NPU: platform={config.npu.platform}, device_id={config.npu.device_id}, "
+            f"l3={config.npu.l3_mode}",
             file=stdout,
         )
 
@@ -419,6 +444,13 @@ def _get_bool(section: Mapping[str, Any], key: str, default: bool) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{key} must be a boolean.")
     return value
+
+
+def _get_bool_alias(section: Mapping[str, Any], keys: tuple[str, ...], default: bool) -> bool:
+    for key in keys:
+        if key in section:
+            return _get_bool(section, key, default)
+    return default
 
 
 def _get_stop(section: Mapping[str, Any]) -> tuple[str, ...]:

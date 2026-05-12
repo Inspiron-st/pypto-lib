@@ -6,13 +6,13 @@
   },
   "runtime": {
     "backend": "npu",
-    "max_seq_len": 128,
-    "max_batch_size": 1,
+    "max_seq_len": 512,
+    "max_batch_size": 16,
     "kv_dtype": "bfloat16",
     "weight_dtype": "float32"
   },
   "generation": {
-    "max_new_tokens": 10,
+    "max_new_tokens": 32,
     "temperature": 0.0,
     "top_p": 1.0,
     "top_k": null,
@@ -21,8 +21,9 @@
   },
   "npu": {
     "platform": "a2a3",
-    "device_id": 6,
+    "device_id": 0,
     "save_kernels_dir": null,
-    "pypto_root": null
+    "pypto_root": null,
+    "l3": true
   }
 }

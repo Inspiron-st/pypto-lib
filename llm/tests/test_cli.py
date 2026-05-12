@@ -96,7 +96,51 @@ def test_load_serving_config_defaults_npu_page_size(tmp_path):
     assert config.backend == "npu"
     assert config.runtime.page_size == 256
     assert config.runtime.max_seq_len == 128
+    assert config.runtime.max_new_tokens == 4
     assert config.generation.stop == ("</s>",)
+    assert config.npu.l3_mode is False
+
+
+def test_load_serving_config_accepts_l3_npu_options(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    config_data = _base_config(model_dir, backend="npu")
+    config_data["npu"] = {
+        "l3": True,
+    }
+    config_path = _write_config(tmp_path, config_data)
+
+    config = cli.load_serving_config(config_path)
+
+    assert config.runtime.max_batch_size == 16
+    assert config.runtime.max_new_tokens == 4
+    assert config.generation.max_new_tokens == 4
+    assert config.npu.l3_mode is True
+
+
+def test_load_serving_config_rejects_l3_max_batch_size_mismatch(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    config_data = _base_config(model_dir, backend="npu")
+    config_data["runtime"]["max_batch_size"] = 1
+    config_data["npu"] = {
+        "l3": True,
+    }
+    config_path = _write_config(tmp_path, config_data)
+
+    with pytest.raises(ValueError, match="runtime.max_batch_size=16"):
+        cli.load_serving_config(config_path)
+
+
+def test_load_serving_config_applies_l3_cli_overrides(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    config_path = _write_config(tmp_path, _base_config(model_dir, backend="npu"))
+
+    config = cli.load_serving_config(config_path, l3_override=True)
+
+    assert config.runtime.max_batch_size == 16
+    assert config.npu.l3_mode is True
 
 
 def test_load_serving_config_rejects_missing_model_dir(tmp_path):
@@ -193,7 +237,28 @@ def test_create_engine_npu_wires_executor_options(tmp_path, monkeypatch):
         "platform": "a5",
         "device_id": 3,
         "save_kernels_dir": "/tmp/kernels",
+        "l3_mode": False,
     }
+
+
+def test_create_engine_npu_wires_l3_executor_options(tmp_path, monkeypatch):
+    _FakeEngine.instances.clear()
+    _FakeNpuExecutor.instances.clear()
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    config_data = _base_config(model_dir, backend="npu")
+    config_data["npu"] = {
+        "l3_mode": True,
+    }
+    config_path = _write_config(tmp_path, config_data)
+    monkeypatch.setattr(cli, "LLMEngine", _FakeEngine)
+    monkeypatch.setattr(cli, "PyptoQwen14BExecutor", _FakeNpuExecutor)
+
+    engine = cli.create_engine(cli.load_serving_config(config_path))
+
+    executor = _FakeNpuExecutor.instances[-1]
+    assert engine.executor is executor
+    assert executor.kwargs["l3_mode"] is True
 
 
 def test_run_interactive_reuses_engine_until_exit(capsys):
