@@ -19,6 +19,7 @@ import torch
 
 _TIMING_ENABLED = True
 
+from ._profiling import StageTimer
 from .executor import ModelExecutor
 from .kv_cache import KvCacheManager
 from .types import (
@@ -323,15 +324,14 @@ class PyptoQwen14BExecutor(ModelExecutor):
         return DecodeResult(hidden_states=final_hidden, logits=logits)
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
-        import time as _time  # noqa: PLC0415
-
-        _verbose = self._l3_trace
-        _t0 = _time.perf_counter()
-        _stages: list[tuple[str, float]] = []
+        timer = StageTimer(
+            enabled=self._l3_trace,
+            prefix="compile-breakdown",
+            title="_compile_model stage timings",
+        )
 
         def _mark(label: str) -> None:
-            if _verbose:
-                _stages.append((label, _time.perf_counter()))
+            timer.mark(label)
 
         _ensure_pypto_import(self._pypto_root)
         from pypto.runtime import run
@@ -547,16 +547,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
         decode_weights = self._stack_decode_weights(layers)
         _mark("stack_decode_weights")
 
-        # ── _compile_model stage breakdown report ──
-        if _verbose and _stages:
-            prev = _t0
-            total_ms = (_stages[-1][1] - _t0) * 1000.0
-            print("[compile-breakdown] _compile_model stage timings:", flush=True)
-            for label, t in _stages:
-                dt_ms = (t - prev) * 1000.0
-                print(f"[compile-breakdown]   {label:30s} : {dt_ms:9.1f} ms", flush=True)
-                prev = t
-            print(f"[compile-breakdown]   {'TOTAL':30s} : {total_ms:9.1f} ms", flush=True)
+        timer.report()
 
         return _CompiledKernels(
             prefill=prefill,
@@ -655,15 +646,16 @@ class PyptoQwen14BExecutor(ModelExecutor):
         """
         from simpler.task_interface import CallConfig  # noqa: PLC0415
         from simpler.worker import Worker  # noqa: PLC0415
-        import time as _time  # noqa: PLC0415
 
         _verbose = self._l3_trace
-        _t_fn_entry = _time.perf_counter()
-        _stage_times: list[tuple[str, float]] = []
+        timer = StageTimer(
+            enabled=_verbose,
+            prefix="L3-breakdown",
+            title="run_generate_l3 stage timings",
+        )
 
         def _mark(label: str) -> None:
-            if _verbose:
-                _stage_times.append((label, _time.perf_counter()))
+            timer.mark(label)
 
         compiled = self._compiled[model.config.model_id]
         if compiled.l3_generate_chip_callables is None:
@@ -803,8 +795,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
         def sample_and_prepare_fn(task_args):
             """Sub-worker: sample token from logits, prepare next decode inputs."""
-            import time as _time  # noqa: PLC0415
-            _t_enter = _time.perf_counter()
+            _t_enter = time.perf_counter()
             if _done_flag[0].item():
                 return  # EOS already hit, no-op.
 
@@ -826,7 +817,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
             if _eos_id is not None and token_id == _eos_id:
                 _done_flag[0] = 1
-                _t_exit = _time.perf_counter()
+                _t_exit = time.perf_counter()
                 _sample_done_ts[0] = _t_exit
                 if _l3_trace_enabled:
                     work_ms = (_t_exit - _t_enter) * 1000.0
@@ -839,7 +830,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
             if step + 1 >= max_new_tokens:
                 _done_flag[0] = 1
-                _t_exit = _time.perf_counter()
+                _t_exit = time.perf_counter()
                 _sample_done_ts[0] = _t_exit
                 if _l3_trace_enabled:
                     work_ms = (_t_exit - _t_enter) * 1000.0
@@ -864,7 +855,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 if page_idx < len(alloc.page_ids):
                     _decode_slot_mapping_buf[b] = alloc.page_ids[page_idx] * _page_size + slot_in_page
 
-            _t_exit = _time.perf_counter()
+            _t_exit = time.perf_counter()
             _sample_done_ts[0] = _t_exit
             if _l3_trace_enabled:
                 work_ms = (_t_exit - _t_enter) * 1000.0
@@ -946,13 +937,12 @@ class PyptoQwen14BExecutor(ModelExecutor):
         _kv_dev_ptrs: list[tuple[int, int, int]] = []
 
         def generate_orch_fn(orch, _args, _cfg):
-            import time as _time  # noqa: PLC0415
             _keep: list = []
             call_config = CallConfig()
             call_config.block_dim = lg_dc.block_dim
             call_config.aicpu_thread_num = lg_dc.aicpu_thread_num
 
-            _t_pf = _time.perf_counter()
+            _t_pf = time.perf_counter()
             _t_anchors[0] = _t_pf
             _t_anchors[1] = _t_pf
             _sample_done_ts[0] = _t_pf  # baseline for step 0 chip_tasks measurement
@@ -1006,7 +996,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             _submit_l3_generate(orch, call_config, td, _keep)
 
             if _l3_trace_enabled:
-                print(f"[L3-step] all submits done {_fmt_rel(_time.perf_counter())}", flush=True)
+                print(f"[L3-step] all submits done {_fmt_rel(time.perf_counter())}", flush=True)
 
         # ── Create Worker and execute ──
 
@@ -1040,7 +1030,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
         worker.init()
         _mark("worker_init")
         try:
-            _t_run_start = _time.perf_counter()
+            _t_run_start = time.perf_counter()
             worker.run(generate_orch_fn)
             _mark("worker_run_generate")
 
@@ -1058,7 +1048,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 worker.run(_kv_sync_orch_fn)
             _mark("worker_run_kv_sync")
 
-            _t_run_end = _time.perf_counter()
+            _t_run_end = time.perf_counter()
             print(
                 f"[L3-timer] worker.run total wall-clock: "
                 f"{(_t_run_end-_t_run_start)*1000:.1f}ms",
@@ -1078,16 +1068,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
         ret_val = ids, decode_out[:actual_batch].float()
         _mark("post_process")
 
-        # ── Stage breakdown report ──
-        if _verbose and _stage_times:
-            prev_t = _t_fn_entry
-            total_ms = (_stage_times[-1][1] - _t_fn_entry) * 1000.0
-            print("[L3-breakdown] run_generate_l3 stage timings:", flush=True)
-            for label, t in _stage_times:
-                dt_ms = (t - prev_t) * 1000.0
-                print(f"[L3-breakdown]   {label:30s} : {dt_ms:9.1f} ms", flush=True)
-                prev_t = t
-            print(f"[L3-breakdown]   {'TOTAL':30s} : {total_ms:9.1f} ms", flush=True)
+        timer.report()
         return ret_val
 
     def _prepare_prefill_inputs(

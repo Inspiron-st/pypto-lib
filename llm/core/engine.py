@@ -14,6 +14,7 @@ from collections.abc import Iterator
 
 import torch
 
+from ._profiling import StageTimer
 from .executor import ModelExecutor
 from .kv_cache import KvCacheManager
 from .model_loader import ModelLoader
@@ -52,29 +53,29 @@ class LLMEngine:
         model_format: str | None = None,
         **loader_options: object,
     ) -> None:
-        import time as _time  # noqa: PLC0415
-
         _verbose = getattr(self._executor, "_l3_trace", False)
-        _t0 = _time.perf_counter()
-        _stages: list[tuple[str, float]] = []
+        timer = StageTimer(
+            enabled=_verbose,
+            prefix="init-breakdown",
+            title="init_model stage timings",
+        )
 
-        def _mark(label: str) -> None:
-            if _verbose:
-                _stages.append((label, _time.perf_counter()))
-
+        # Caller-supplied loader_options["profile_verbose"] takes precedence
+        # over the executor-derived default; avoid passing the same kwarg twice.
+        effective_loader_options = dict(loader_options)
+        effective_loader_options.setdefault("profile_verbose", _verbose)
         loaded = self._model_loader.load(
             model_id=model_id,
             model_dir=model_dir,
             runtime_config=runtime_config,
             model_format=model_format,
-            profile_verbose=_verbose,
-            **loader_options,
+            **effective_loader_options,
         )
-        _mark("model_loader.load")
+        timer.mark("model_loader.load")
         config = loaded.config
         runtime = loaded.runtime_model.runtime
         self._kv_cache_manager.register_model(model_id, config, runtime)
-        _mark("kv_cache_manager.register")
+        timer.mark("kv_cache_manager.register")
         self._models[model_id] = ModelRecord(
             config=config,
             runtime=runtime,
@@ -82,21 +83,13 @@ class LLMEngine:
             layer_specs=loaded.layer_specs,
             runtime_model=loaded.runtime_model,
         )
-        _mark("create_model_record")
+        timer.mark("create_model_record")
         register_model = getattr(self._executor, "register_model", None)
         if callable(register_model):
             register_model(model_id, self._models[model_id])
-        _mark("executor.register_model")
+        timer.mark("executor.register_model")
 
-        if _verbose and _stages:
-            prev = _t0
-            total_ms = (_stages[-1][1] - _t0) * 1000.0
-            print("[init-breakdown] init_model stage timings:", flush=True)
-            for label, t in _stages:
-                dt_ms = (t - prev) * 1000.0
-                print(f"[init-breakdown]   {label:30s} : {dt_ms:9.1f} ms", flush=True)
-                prev = t
-            print(f"[init-breakdown]   {'TOTAL':30s} : {total_ms:9.1f} ms", flush=True)
+        timer.report()
 
     def generate(self, model_id: str, prompt: str, config: GenerateConfig | None = None) -> str | Iterator[str]:
         generate_config = config or GenerateConfig()
@@ -162,18 +155,32 @@ class LLMEngine:
                 # host-side ensure_one_more_slot calls, so pre-allocate KV
                 # capacity for the full prompt + max_new_tokens upfront.
                 if is_l3:
-                    total_needed = len(token_ids) + generate_config.max_new_tokens
+                    prompt_len = len(token_ids)
                     max_seq = record.runtime.max_seq_len
-                    if total_needed > max_seq:
+                    if generate_config.max_new_tokens < 1:
                         raise ValueError(
-                            f"L3 mode: prompt length ({len(token_ids)}) + "
-                            f"max_new_tokens ({generate_config.max_new_tokens}) = {total_needed} "
+                            f"L3 mode requires max_new_tokens >= 1, got "
+                            f"{generate_config.max_new_tokens}."
+                        )
+                    if prompt_len > max_seq:
+                        raise ValueError(
+                            f"L3 mode: prompt length ({prompt_len}) exceeds "
+                            f"max_seq_len ({max_seq}). Either shorten the prompt "
+                            f"or increase --max-seq-len to at least {prompt_len}."
+                        )
+                    alloc_len = prompt_len + generate_config.max_new_tokens
+                    if alloc_len > max_seq:
+                        allowed_new_tokens = max_seq - prompt_len
+                        raise ValueError(
+                            f"L3 mode: prompt length ({prompt_len}) + "
+                            f"max_new_tokens ({generate_config.max_new_tokens}) = {alloc_len} "
                             f"exceeds max_seq_len ({max_seq}). "
                             f"Either reduce --max-new-tokens to at most "
-                            f"{max_seq - len(token_ids)}, or increase --max-seq-len to at least "
-                            f"{total_needed}."
+                            f"{allowed_new_tokens}, or increase --max-seq-len to at least "
+                            f"{alloc_len}."
                         )
-                alloc_len = len(token_ids) + generate_config.max_new_tokens if is_l3 else len(token_ids)
+                else:
+                    alloc_len = len(token_ids)
                 alloc = self._kv_cache_manager.allocate_for_prompt(model_id, request_id, alloc_len)
                 allocations.append(alloc)
                 requests.append(

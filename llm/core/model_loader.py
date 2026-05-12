@@ -16,6 +16,7 @@ from typing import Protocol
 
 import torch
 
+from ._profiling import StageTimer
 from .tokenizer import TokenizerAdapter, TransformersTokenizerAdapter
 from .types import LayerSpec, LayerWeights, LoadedModel, ModelConfig, RuntimeConfig, RuntimeModel
 
@@ -152,15 +153,14 @@ class HuggingFaceDirectoryLoader:
         return False
 
     def load(self, request: ModelLoadRequest) -> LoadedModel:
-        import time as _time  # noqa: PLC0415
-
-        _verbose = bool(request.loader_options.get("profile_verbose", False))
-        _t0 = _time.perf_counter()
-        _stages: list[tuple[str, float]] = []
+        timer = StageTimer(
+            enabled=bool(request.loader_options.get("profile_verbose", False)),
+            prefix="loader-breakdown",
+            title="HuggingFaceLoader.load stage timings",
+        )
 
         def _mark(label: str) -> None:
-            if _verbose:
-                _stages.append((label, _time.perf_counter()))
+            timer.mark(label)
 
         model_path = Path(request.model_dir)
         config_path = model_path / "config.json"
@@ -244,15 +244,7 @@ class HuggingFaceDirectoryLoader:
         )
 
         # ── loader stage breakdown report ──
-        if _verbose and _stages:
-            prev = _t0
-            total_ms = (_stages[-1][1] - _t0) * 1000.0
-            print("[loader-breakdown] HuggingFaceLoader.load stage timings:", flush=True)
-            for label, t in _stages:
-                dt_ms = (t - prev) * 1000.0
-                print(f"[loader-breakdown]   {label:30s} : {dt_ms:9.1f} ms", flush=True)
-                prev = t
-            print(f"[loader-breakdown]   {'TOTAL':30s} : {total_ms:9.1f} ms", flush=True)
+        timer.report()
 
         return LoadedModel(
             model_id=request.model_id,
