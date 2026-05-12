@@ -585,10 +585,8 @@ def build_tensor_specs():
             m[2 * i + 1, i] = 1
         return m
 
-    def init_normalized_cache(shape, seed):
-        generator = torch.Generator()
-        generator.manual_seed(seed)
-        cache = torch.randn(*shape, generator=generator)
+    def init_normalized_cache(shape):
+        cache = torch.randn(*shape)
         denom = cache.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(EPS)
         return (cache / denom).to(torch.bfloat16)
 
@@ -605,9 +603,9 @@ def build_tensor_specs():
     def init_cmp_score_state():
         return torch.full((B, MAIN_STATE_LEN, MAIN_OUT_DIM), float("-inf"))
     def init_kv_cache():
-        return init_normalized_cache((ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM), seed=20260512)
+        return init_normalized_cache((ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
     def init_cmp_kv():
-        return init_normalized_cache((CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM), seed=20260513)
+        return init_normalized_cache((CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
 
     def init_ori_block_table():
         tbl = torch.full((B, ORI_MAX_BLOCKS), -1, dtype=torch.int32)

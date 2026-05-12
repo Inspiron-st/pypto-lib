@@ -452,15 +452,13 @@ def build_tensor_specs():
             m[2 * i + 1, i] = 1
         return m
 
-    def init_normalized_cache(shape, seed):
-        generator = torch.Generator()
-        generator.manual_seed(seed)
-        cache = torch.randn(*shape, generator=generator)
+    def init_normalized_cache(shape):
+        cache = torch.randn(*shape)
         denom = cache.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(EPS)
         return (cache / denom).to(torch.bfloat16)
 
     def init_kv_cache():
-        return init_normalized_cache((BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM), seed=20260512)
+        return init_normalized_cache((BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
 
     def init_block_table():
         tbl = torch.full((B, MAX_BLOCKS), -1, dtype=torch.int32)
