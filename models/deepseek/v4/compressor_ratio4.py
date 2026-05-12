@@ -8,9 +8,14 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 KV Compressor (decode incremental, ratio=4 overlap).
 
-Uses overlapping state layout with 8 slots.
-Front slots 0-3 at columns [0:HEAD_DIM], back slots 4-7 at columns [HEAD_DIM:OUT_DIM].
-Tree reduction for softmax+pool. State shift after compression."""
+State buffer layout (STATE_LEN = 2 * ratio = 8 slots, OUT_DIM = 2 * HEAD_DIM):
+    slots 0..ratio-1  hold the previous (overlapping) window, valid in cols [0, HEAD_DIM)
+    slots ratio..2*ratio-1 hold the current window, valid in cols [HEAD_DIM, OUT_DIM)
+Softmax+pool tree-reduces across all 8 slots; the back half rolls forward into the
+front half after compression so the next step starts with the fresh overlap window.
+
+norm_w is BF16 here to mirror the official checkpoint format (`compressor.norm_w`
+is stored as BF16). It is upcast to FP32 inside RMSNorm for the multiply."""
 
 
 import pypto.language as pl
@@ -24,7 +29,7 @@ COMPRESS_RATIO = 4
 HEAD_DIM = 512
 ROTATE = False
 
-D = 4096
+D = 4096  # flash:4096 pro:7168
 ROPE_HEAD_DIM = 64
 NOPE_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
 OVERLAP = COMPRESS_RATIO == 4
@@ -39,6 +44,7 @@ APE_ROW = START_POS % COMPRESS_RATIO if COMPRESS_RATIO != 0 else 0
 SCATTER_SLOT = (COMPRESS_RATIO + APE_ROW) if OVERLAP else APE_ROW
 
 HEAD_DIM_INV = 1.0 / HEAD_DIM
+HALF_RD = ROPE_HEAD_DIM // 2
 
 K_CHUNK = 512
 OUT_CHUNK = 64
@@ -65,75 +71,88 @@ def compressor(
     out: pl.Tensor[[B, HEAD_DIM], pl.BF16],
 ):
     x_flat = pl.reshape(x, [B, D])
+    # Flatten state to 2D so scattering into a specific slot is a single slice-assign.
     kv_state_flat = pl.reshape(kv_state, [B, STATE_LEN * OUT_DIM])
     score_state_flat = pl.reshape(score_state, [B, STATE_LEN * OUT_DIM])
+    slot_off = SCATTER_SLOT * OUT_DIM
 
     kv_fp32 = pl.create_tensor([B, OUT_DIM], dtype=pl.FP32)
     score_fp32 = pl.create_tensor([B, OUT_DIM], dtype=pl.FP32)
-    slot_off = SCATTER_SLOT * OUT_DIM
 
+    # Stage 1: kv/score projections + APE bias + state scatter, tiled along OUT_DIM.
     for ob in pl.parallel(0, OUT_BLOCKS, 1):
         oc0 = ob * OUT_CHUNK
-        # Block 1a (Cube): kv = x @ wkv.T
+
+        # Cube: kv = x @ wkv.T
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj"):
-            a0 = pl.slice(x_flat, [B, K_CHUNK], [0, 0])
-            b0 = pl.slice(wkv, [OUT_CHUNK, K_CHUNK], [oc0, 0])
+            a0 = x_flat[:, :K_CHUNK]
+            b0 = wkv[oc0 : oc0 + OUT_CHUNK, :K_CHUNK]
             kv_acc = pl.matmul(a0, b0, out_dtype=pl.FP32, b_trans=True)
             for kb in pl.range(1, K_BLOCKS):
-                a_i = pl.slice(x_flat, [B, K_CHUNK], [0, kb * K_CHUNK])
-                b_i = pl.slice(wkv, [OUT_CHUNK, K_CHUNK], [oc0, kb * K_CHUNK])
-                kv_acc = pl.matmul_acc(kv_acc, a_i, b_i, b_trans=True)
-            kv_fp32 = pl.assemble(kv_fp32, kv_acc, [0, oc0])
+                a_kb = x_flat[:, kb * K_CHUNK : (kb + 1) * K_CHUNK]
+                b_kb = wkv[oc0 : oc0 + OUT_CHUNK, kb * K_CHUNK : (kb + 1) * K_CHUNK]
+                kv_acc = pl.matmul_acc(kv_acc, a_kb, b_kb, b_trans=True)
+            kv_fp32[:, oc0 : oc0 + OUT_CHUNK] = kv_acc
 
-        # Block 1b (Cube): score = x @ wgate.T
+        # Cube: score = x @ wgate.T
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="score_proj"):
-            a0g = pl.slice(x_flat, [B, K_CHUNK], [0, 0])
-            b0g = pl.slice(wgate, [OUT_CHUNK, K_CHUNK], [oc0, 0])
-            sc_acc = pl.matmul(a0g, b0g, out_dtype=pl.FP32, b_trans=True)
+            ag0 = x_flat[:, :K_CHUNK]
+            bg0 = wgate[oc0 : oc0 + OUT_CHUNK, :K_CHUNK]
+            sc_acc = pl.matmul(ag0, bg0, out_dtype=pl.FP32, b_trans=True)
             for kb in pl.range(1, K_BLOCKS):
-                a_ig = pl.slice(x_flat, [B, K_CHUNK], [0, kb * K_CHUNK])
-                b_ig = pl.slice(wgate, [OUT_CHUNK, K_CHUNK], [oc0, kb * K_CHUNK])
-                sc_acc = pl.matmul_acc(sc_acc, a_ig, b_ig, b_trans=True)
-            score_fp32 = pl.assemble(score_fp32, sc_acc, [0, oc0])
+                ag_kb = x_flat[:, kb * K_CHUNK : (kb + 1) * K_CHUNK]
+                bg_kb = wgate[oc0 : oc0 + OUT_CHUNK, kb * K_CHUNK : (kb + 1) * K_CHUNK]
+                sc_acc = pl.matmul_acc(sc_acc, ag_kb, bg_kb, b_trans=True)
+            score_fp32[:, oc0 : oc0 + OUT_CHUNK] = sc_acc
 
-        # Block 2 (Vector): score += ape[APE_ROW]
+        # Vector: score += ape[APE_ROW] (broadcast across batch via [B,1]-ones × [1,N])
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="ape_add"):
-            sc = pl.slice(score_fp32, [B, OUT_CHUNK], [0, oc0])
-            ape_row = pl.slice(ape, [1, OUT_CHUNK], [APE_ROW, oc0])
+            ape_row = ape[APE_ROW : APE_ROW + 1, oc0 : oc0 + OUT_CHUNK]
             ones_b = pl.full([B, OUT_CHUNK], dtype=pl.FP32, value=1.0)
-            ape_broadcast = pl.col_expand_mul(ones_b, ape_row)
-            sc = pl.add(sc, ape_broadcast)
-            score_fp32 = pl.assemble(score_fp32, sc, [0, oc0])
+            ape_bcast = pl.col_expand_mul(ones_b, ape_row)
+            sc = score_fp32[:, oc0 : oc0 + OUT_CHUNK]
+            score_fp32[:, oc0 : oc0 + OUT_CHUNK] = pl.add(sc, ape_bcast)
 
-        # Block 3 (Vector): scatter current kv/score into state
+        # Vector: scatter this step's kv/score into state slot SCATTER_SLOT.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter"):
-            kv_chunk = pl.slice(kv_fp32, [B, OUT_CHUNK], [0, oc0])
-            kv_state_flat = pl.assemble(kv_state_flat, kv_chunk, [0, slot_off + oc0])
-            sc_chunk = pl.slice(score_fp32, [B, OUT_CHUNK], [0, oc0])
-            score_state_flat = pl.assemble(score_state_flat, sc_chunk, [0, slot_off + oc0])
+            kv_state_flat[:, slot_off + oc0 : slot_off + oc0 + OUT_CHUNK] = kv_fp32[:, oc0 : oc0 + OUT_CHUNK]
+            score_state_flat[:, slot_off + oc0 : slot_off + oc0 + OUT_CHUNK] = score_fp32[:, oc0 : oc0 + OUT_CHUNK]
 
-    # Reshape state to per-state-row 2D views
+    # Per-state-row view: rows are stacked as [B * STATE_LEN, OUT_DIM] so a slice on
+    # the row dim addresses one (batch, slot) pair.
     kv_state_per_row = pl.reshape(kv_state_flat, [B * STATE_LEN, OUT_DIM])
     score_state_per_row = pl.reshape(score_state_flat, [B * STATE_LEN, OUT_DIM])
 
-    # Block 5+6 (Vector): softmax+pool over STATE_LEN slots via tree reduction.
+    # Stage 2 + 3: softmax+pool, then state shift, fused in a single CORE_GROUP
+    # scope. Slots 0..3 live in cols [0, HEAD_DIM); slots 4..7 in cols
+    # [HEAD_DIM, OUT_DIM). Tree reduction for max -> exp/sum -> weighted-sum.
+    #
+    # Two reasons everything must run as one kernel and not parallel-per-batch:
+    #   1) `pooled` is a fresh create_tensor; the compiler signs it pl.Out and
+    #      the orchestration emits add_output -> parallel AIV tasks would race
+    #      on the buffer.
+    #   2) If state_shift is its own pl.parallel(B) task, the scheduler runs
+    #      shift iterations before the pool task completes (the pool's read of
+    #      score_state_per_row doesn't fence shift's inout writes). Pool then
+    #      sees post-shift state where slot 3 = old slot 7, mixing slot 3 +
+    #      slot 7 in the softmax and producing wrong (but deterministic) output.
+    # Fusing pool + shift per-batch in one kernel scope orders them strictly.
     pooled = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
-    for b_idx in pl.parallel(0, B, 1):
-        row_b = b_idx * STATE_LEN
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="softmax_pool"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="softmax_pool"):
+        for b_idx in pl.range(B):
+            row_b = b_idx * STATE_LEN
             for hb in pl.range(HEAD_BLOCKS):
                 h0 = hb * HEAD_CHUNK
 
-                s0 = pl.slice(score_state_per_row, [1, HEAD_CHUNK], [row_b + 0, h0])
-                s1 = pl.slice(score_state_per_row, [1, HEAD_CHUNK], [row_b + 1, h0])
-                s2 = pl.slice(score_state_per_row, [1, HEAD_CHUNK], [row_b + 2, h0])
-                s3 = pl.slice(score_state_per_row, [1, HEAD_CHUNK], [row_b + 3, h0])
-                s4 = pl.slice(score_state_per_row, [1, HEAD_CHUNK], [row_b + 4, HEAD_DIM + h0])
-                s5 = pl.slice(score_state_per_row, [1, HEAD_CHUNK], [row_b + 5, HEAD_DIM + h0])
-                s6 = pl.slice(score_state_per_row, [1, HEAD_CHUNK], [row_b + 6, HEAD_DIM + h0])
-                s7 = pl.slice(score_state_per_row, [1, HEAD_CHUNK], [row_b + 7, HEAD_DIM + h0])
+                s0 = score_state_per_row[row_b + 0 : row_b + 1, h0 : h0 + HEAD_CHUNK]
+                s1 = score_state_per_row[row_b + 1 : row_b + 2, h0 : h0 + HEAD_CHUNK]
+                s2 = score_state_per_row[row_b + 2 : row_b + 3, h0 : h0 + HEAD_CHUNK]
+                s3 = score_state_per_row[row_b + 3 : row_b + 4, h0 : h0 + HEAD_CHUNK]
+                s4 = score_state_per_row[row_b + 4 : row_b + 5, HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK]
+                s5 = score_state_per_row[row_b + 5 : row_b + 6, HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK]
+                s6 = score_state_per_row[row_b + 6 : row_b + 7, HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK]
+                s7 = score_state_per_row[row_b + 7 : row_b + 8, HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK]
 
-                # Max via tree of pl.maximum.
                 m01 = pl.maximum(s0, s1)
                 m23 = pl.maximum(s2, s3)
                 m45 = pl.maximum(s4, s5)
@@ -142,15 +161,22 @@ def compressor(
                 m4567 = pl.maximum(m45, m67)
                 s_max = pl.maximum(m0123, m4567)
 
-                # Exp(s - max) tree.
-                e0 = pl.exp(pl.sub(s0, s_max))
-                e1 = pl.exp(pl.sub(s1, s_max))
-                e2 = pl.exp(pl.sub(s2, s_max))
-                e3 = pl.exp(pl.sub(s3, s_max))
-                e4 = pl.exp(pl.sub(s4, s_max))
-                e5 = pl.exp(pl.sub(s5, s_max))
-                e6 = pl.exp(pl.sub(s6, s_max))
-                e7 = pl.exp(pl.sub(s7, s_max))
+                d0 = pl.sub(s0, s_max)
+                d1 = pl.sub(s1, s_max)
+                d2 = pl.sub(s2, s_max)
+                d3 = pl.sub(s3, s_max)
+                d4 = pl.sub(s4, s_max)
+                d5 = pl.sub(s5, s_max)
+                d6 = pl.sub(s6, s_max)
+                d7 = pl.sub(s7, s_max)
+                e0 = pl.exp(d0)
+                e1 = pl.exp(d1)
+                e2 = pl.exp(d2)
+                e3 = pl.exp(d3)
+                e4 = pl.exp(d4)
+                e5 = pl.exp(d5)
+                e6 = pl.exp(d6)
+                e7 = pl.exp(d7)
 
                 es01 = pl.add(e0, e1)
                 es23 = pl.add(e2, e3)
@@ -160,91 +186,89 @@ def compressor(
                 es4567 = pl.add(es45, es67)
                 e_sum = pl.add(es0123, es4567)
 
-                # Weighted kv tree.
-                kv_s0 = pl.slice(kv_state_per_row, [1, HEAD_CHUNK], [row_b + 0, h0])
-                kv_s1 = pl.slice(kv_state_per_row, [1, HEAD_CHUNK], [row_b + 1, h0])
-                kv_s2 = pl.slice(kv_state_per_row, [1, HEAD_CHUNK], [row_b + 2, h0])
-                kv_s3 = pl.slice(kv_state_per_row, [1, HEAD_CHUNK], [row_b + 3, h0])
-                kv_s4 = pl.slice(kv_state_per_row, [1, HEAD_CHUNK], [row_b + 4, HEAD_DIM + h0])
-                kv_s5 = pl.slice(kv_state_per_row, [1, HEAD_CHUNK], [row_b + 5, HEAD_DIM + h0])
-                kv_s6 = pl.slice(kv_state_per_row, [1, HEAD_CHUNK], [row_b + 6, HEAD_DIM + h0])
-                kv_s7 = pl.slice(kv_state_per_row, [1, HEAD_CHUNK], [row_b + 7, HEAD_DIM + h0])
+                kv0 = kv_state_per_row[row_b + 0 : row_b + 1, h0 : h0 + HEAD_CHUNK]
+                kv1 = kv_state_per_row[row_b + 1 : row_b + 2, h0 : h0 + HEAD_CHUNK]
+                kv2 = kv_state_per_row[row_b + 2 : row_b + 3, h0 : h0 + HEAD_CHUNK]
+                kv3 = kv_state_per_row[row_b + 3 : row_b + 4, h0 : h0 + HEAD_CHUNK]
+                kv4 = kv_state_per_row[row_b + 4 : row_b + 5, HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK]
+                kv5 = kv_state_per_row[row_b + 5 : row_b + 6, HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK]
+                kv6 = kv_state_per_row[row_b + 6 : row_b + 7, HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK]
+                kv7 = kv_state_per_row[row_b + 7 : row_b + 8, HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK]
 
-                w0 = pl.mul(e0, kv_s0)
-                w1 = pl.mul(e1, kv_s1)
-                w2 = pl.mul(e2, kv_s2)
-                w3 = pl.mul(e3, kv_s3)
-                w4 = pl.mul(e4, kv_s4)
-                w5 = pl.mul(e5, kv_s5)
-                w6 = pl.mul(e6, kv_s6)
-                w7 = pl.mul(e7, kv_s7)
-
+                w0 = pl.mul(e0, kv0)
+                w1 = pl.mul(e1, kv1)
+                w2 = pl.mul(e2, kv2)
+                w3 = pl.mul(e3, kv3)
+                w4 = pl.mul(e4, kv4)
+                w5 = pl.mul(e5, kv5)
+                w6 = pl.mul(e6, kv6)
+                w7 = pl.mul(e7, kv7)
                 ws01 = pl.add(w0, w1)
                 ws23 = pl.add(w2, w3)
                 ws45 = pl.add(w4, w5)
                 ws67 = pl.add(w6, w7)
                 ws0123 = pl.add(ws01, ws23)
                 ws4567 = pl.add(ws45, ws67)
-                pooled_acc = pl.add(ws0123, ws4567)
+                wsum = pl.add(ws0123, ws4567)
 
-                pooled_chunk = pl.div(pooled_acc, e_sum)
-                pooled = pl.assemble(pooled, pooled_chunk, [b_idx, h0])
+                pooled[b_idx : b_idx + 1, h0 : h0 + HEAD_CHUNK] = pl.div(wsum, e_sum)
 
-    # Block 7 (Vector): shift state down -- state[:, :ratio] = state[:, ratio:]
-    for b_sh in pl.parallel(0, B, 1):
-        row_sh = b_sh * STATE_LEN
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_shift"):
-            kv_src = pl.slice(kv_state_per_row, [COMPRESS_RATIO, OUT_DIM], [row_sh + COMPRESS_RATIO, 0])
-            kv_state_per_row = pl.assemble(kv_state_per_row, kv_src, [row_sh, 0])
-            sc_src = pl.slice(score_state_per_row, [COMPRESS_RATIO, OUT_DIM], [row_sh + COMPRESS_RATIO, 0])
-            score_state_per_row = pl.assemble(score_state_per_row, sc_src, [row_sh, 0])
+            # Stage 3: roll state[:, :ratio] = state[:, ratio:] for THIS batch,
+            # inside the same kernel scope so it strictly follows the pool's
+            # reads of this batch's slots. A separate state_shift task races
+            # ahead of softmax_pool in the scheduler -- treat pool+shift as
+            # one atomic unit per batch.
+            kv_state_per_row[row_b : row_b + COMPRESS_RATIO, :] = \
+                kv_state_per_row[row_b + COMPRESS_RATIO : row_b + 2 * COMPRESS_RATIO, :]
+            score_state_per_row[row_b : row_b + COMPRESS_RATIO, :] = \
+                score_state_per_row[row_b + COMPRESS_RATIO : row_b + 2 * COMPRESS_RATIO, :]
 
-    # Reshape state back to 3D
     kv_state = pl.reshape(kv_state_per_row, [B, STATE_LEN, OUT_DIM])
     score_state = pl.reshape(score_state_per_row, [B, STATE_LEN, OUT_DIM])
 
-    # Block 8 (Vector): RMSNorm pooled with norm_w over HEAD_DIM.
-    normed_pooled = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
+    # Stage 4: RMSNorm over HEAD_DIM with BF16 weight (upcast to FP32 for the multiply).
+    normed = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm"):
-        partial_sq = pl.full([1, B], dtype=pl.FP32, value=0.0)
+        sq_sum = pl.full([1, B], dtype=pl.FP32, value=0.0)
         for hb in pl.range(HEAD_BLOCKS):
             h0 = hb * HEAD_CHUNK
-            pc = pl.slice(pooled, [B, HEAD_CHUNK], [0, h0])
-            partial_sq = pl.add(
-                partial_sq,
-                pl.reshape(pl.row_sum(pl.mul(pc, pc)), [1, B]),
-            )
-        inv_rms = pl.reshape(
-            pl.recip(pl.sqrt(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS))),
-            [B, 1],
-        )
+            pc_sq = pooled[:, h0 : h0 + HEAD_CHUNK]
+            sq = pl.mul(pc_sq, pc_sq)
+            rs = pl.row_sum(sq)
+            rs_2d = pl.reshape(rs, [1, B])
+            sq_sum = pl.add(sq_sum, rs_2d)
+        var = pl.mul(sq_sum, HEAD_DIM_INV)
+        var = pl.add(var, EPS)
+        rms = pl.sqrt(var)
+        inv = pl.recip(rms)
+        inv_rms = pl.reshape(inv, [B, 1])
         for hb in pl.range(HEAD_BLOCKS):
             h0 = hb * HEAD_CHUNK
-            nc = pl.slice(pooled, [B, HEAD_CHUNK], [0, h0])
-            nw_chunk = pl.cast(
-                pl.slice(norm_w_2d, [1, HEAD_CHUNK], [0, h0]),
-                target_type=pl.FP32,
-            )
-            normed = pl.col_expand_mul(pl.row_expand_mul(nc, inv_rms), nw_chunk)
-            normed_pooled = pl.assemble(normed_pooled, normed, [0, h0])
+            pc_norm = pooled[:, h0 : h0 + HEAD_CHUNK]
+            nw = pl.cast(norm_w_2d[:, h0 : h0 + HEAD_CHUNK], target_type=pl.FP32)
+            scaled = pl.row_expand_mul(pc_norm, inv_rms)
+            normed[:, h0 : h0 + HEAD_CHUNK] = pl.col_expand_mul(scaled, nw)
 
-    # Block 11a (Vector): cast non-rope range to BF16 and store to out.
+    # Stage 5a: store non-rope head dims as BF16.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="store_nope"):
-        nope_chunk = pl.slice(normed_pooled, [B, NOPE_HEAD_DIM], [0, 0])
-        out = pl.assemble(out, pl.cast(nope_chunk, target_type=pl.BF16), [0, 0])
+        nope = normed[:, :NOPE_HEAD_DIM]
+        out[:, :NOPE_HEAD_DIM] = pl.cast(nope, target_type=pl.BF16)
 
-    # Block 9 + 11b (Vector): half-vector RoPE on the last ROPE_HEAD_DIM cols, then store.
-    HALF_RD = ROPE_HEAD_DIM // 2
+    # Stage 5b: half-vector RoPE on the trailing ROPE_HEAD_DIM cols, then store.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_store"):
-        x_lo = pl.slice(normed_pooled, [B, HALF_RD], [0, NOPE_HEAD_DIM])
-        x_hi = pl.slice(normed_pooled, [B, HALF_RD], [0, NOPE_HEAD_DIM + HALF_RD])
+        x_lo = normed[:, NOPE_HEAD_DIM : NOPE_HEAD_DIM + HALF_RD]
+        x_hi = normed[:, NOPE_HEAD_DIM + HALF_RD : NOPE_HEAD_DIM + 2 * HALF_RD]
         cos_fp32 = pl.cast(cos, target_type=pl.FP32)
         sin_fp32 = pl.cast(sin, target_type=pl.FP32)
-        y_lo = pl.sub(pl.col_expand_mul(x_lo, cos_fp32), pl.col_expand_mul(x_hi, sin_fp32))
-        y_hi = pl.add(pl.col_expand_mul(x_lo, sin_fp32), pl.col_expand_mul(x_hi, cos_fp32))
-        out = pl.assemble(out, pl.cast(y_lo, target_type=pl.BF16), [0, NOPE_HEAD_DIM])
-        out = pl.assemble(out, pl.cast(y_hi, target_type=pl.BF16), [0, NOPE_HEAD_DIM + HALF_RD])
+        lo_cos = pl.col_expand_mul(x_lo, cos_fp32)
+        hi_sin = pl.col_expand_mul(x_hi, sin_fp32)
+        lo_sin = pl.col_expand_mul(x_lo, sin_fp32)
+        hi_cos = pl.col_expand_mul(x_hi, cos_fp32)
+        y_lo = pl.sub(lo_cos, hi_sin)
+        y_hi = pl.add(lo_sin, hi_cos)
+        out[:, NOPE_HEAD_DIM : NOPE_HEAD_DIM + HALF_RD] = pl.cast(y_lo, target_type=pl.BF16)
+        out[:, NOPE_HEAD_DIM + HALF_RD : NOPE_HEAD_DIM + 2 * HALF_RD] = pl.cast(y_hi, target_type=pl.BF16)
 
     return out
 
@@ -300,7 +324,11 @@ def golden_compressor(tensors):
         if should_compress:
             kvs = torch.cat([kv_state[:bsz, :ratio, :d], kv_state[:bsz, ratio:, d:]], dim=1)
             scs = torch.cat([score_state[:bsz, :ratio, :d], score_state[:bsz, ratio:, d:]], dim=1)
-            kv = (kvs * scs.softmax(dim=1)).sum(dim=1, keepdim=True)
+            # Decomposed softmax to mirror the kernel's tree reduction (max/sub/exp/sum/div).
+            scs_max = scs.amax(dim=1, keepdim=True)
+            scs_exp = (scs - scs_max).exp()
+            scs_sum = scs_exp.sum(dim=1, keepdim=True)
+            kv = (kvs * scs_exp).sum(dim=1, keepdim=True) / scs_sum
             kv_state[:bsz, :ratio] = kv_state[:bsz, ratio:]
             score_state[:bsz, :ratio] = score_state[:bsz, ratio:]
 
@@ -385,8 +413,8 @@ if __name__ == "__main__":
         specs=build_tensor_specs(),
         golden_fn=golden_compressor,
         config=RunConfig(
-            rtol=4e-3,
-            atol=4e-3,
+            rtol=1e-3,
+            atol=1e-3,
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,
