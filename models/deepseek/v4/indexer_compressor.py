@@ -23,10 +23,10 @@ B = DECODE_BATCH
 S = DECODE_SEQ
 EPS = M.rms_norm_eps
 D = M.hidden_size
-HEAD_DIM = M.head_dim
+HEAD_DIM = M.index_head_dim
 HEAD_DIM_INV = 1.0 / HEAD_DIM
 ROPE_HEAD_DIM = M.qk_rope_head_dim
-NOPE_HEAD_DIM = M.nope_head_dim
+NOPE_HEAD_DIM = M.index_nope_head_dim
 MAX_SEQ_LEN = M.max_position_embeddings
 
 # kernel-local (ratio-4 overlapping compressor)
@@ -45,8 +45,8 @@ SCATTER_SLOT = (COMPRESS_RATIO + APE_ROW) if OVERLAP else APE_ROW
 # tiling
 ROPE_CHUCK = 32
 K_CHUNK = 512
-OUT_CHUNK = 128
-HEAD_CHUNK = 128
+OUT_CHUNK = 32
+HEAD_CHUNK = 32
 HEAD_DIM_CHUCK = 128
 K_BLOCKS = D // K_CHUNK
 OUT_BLOCKS = OUT_DIM // OUT_CHUNK
