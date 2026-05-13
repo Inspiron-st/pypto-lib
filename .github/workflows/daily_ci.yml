@@ -126,6 +126,10 @@ jobs:
           fi
           echo "All model tests passed."
 
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf build_output
+
       - name: Upload results artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -284,6 +288,10 @@ jobs:
             exit 1
           fi
           echo "All model tests passed."
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf build_output
 
       - name: Upload results artifact
         if: always()
