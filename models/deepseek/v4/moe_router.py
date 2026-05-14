@@ -27,12 +27,20 @@ ROUTE_SCALE   = M.routed_scaling_factor
 # tiling
 D_CHUNK          = 512
 D_BLOCKS         = D // D_CHUNK
-# SCORE_PAD = sort32 row width; PAIR_PAD covers the (val, idx) interleaved
-# topk slice. FP32_NEG_INF seeds the unused tail so padding ranks last.
-SCORE_PAD        = 32
+# SCORE_PAD = padded expert row width. sort32 handles 32-value runs; the
+# 512-wide path uses two mrgsort passes to cover FLASH/PRO expert counts.
+if N_EXPERTS <= 32:
+    SCORE_PAD    = 32
+elif N_EXPERTS <= 512:
+    SCORE_PAD    = 512
+else:
+    raise ValueError(f"moe_router supports at most 512 routed experts, got {N_EXPERTS}")
+# PAIR_PAD covers the (val, idx) interleaved topk slice. FP32_NEG_INF seeds
+# the unused tail so padding ranks last.
 PAIR_PAD         = 32
 TOPK_GATHER_PAD  = PAIR_PAD // 2
 FP32_NEG_INF     = -1.0e30
+assert TOPK <= TOPK_GATHER_PAD
 
 
 @pl.jit.inline
@@ -78,11 +86,14 @@ def moe_router(
     # Stage 2: gate.forward — dot(x_norm, gate_w) → sqrt(softplus(.)) + bias.
     # Single fused pl.at across all N_EXPERTS: per-expert kernels would
     # collapse to identical outputs for tokens 1..15 on hardware.
+    route_scores = pl.create_tensor([T, SCORE_PAD], dtype=pl.FP32)
     biased_scores = pl.create_tensor([T, SCORE_PAD], dtype=pl.FP32)
+    route_flat = pl.reshape(route_scores, [T * SCORE_PAD])
     biased_flat = pl.reshape(biased_scores, [T * SCORE_PAD])
     with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="gate_dot"):
         # Pad-tail seeded to -inf so sort32 ranks padded slots after real
         # scores (otherwise pad-zero beats negative reals and topk picks pads).
+        route_scores[:, :] = pl.full([T, SCORE_PAD], dtype=pl.FP32, value=0.0)
         biased_scores[:, :] = pl.full([T, SCORE_PAD], dtype=pl.FP32, value=FP32_NEG_INF)
         score_acc_buf = pl.create_tensor([1, T], dtype=pl.FP32)
         for expert_i in pl.range(N_EXPERTS):
@@ -105,55 +116,59 @@ def moe_router(
             softplus = pl.add(relu_logits, pl.log(pl.add(pl.exp(pl.neg(abs_logits)), 1.0)))
             score_tile = pl.sqrt(softplus)
             biased_tile = pl.add(score_tile, bias)
+            score_row_flat = pl.reshape(score_tile, [T])
             biased_row_flat = pl.reshape(biased_tile, [T])
             for t in pl.unroll(T):
+                pl.write(route_flat, [t * SCORE_PAD + expert_i], pl.read(score_row_flat, [t]))
                 pl.write(biased_flat, [t * SCORE_PAD + expert_i], pl.read(biased_row_flat, [t]))
+    route_scores = pl.reshape(route_flat, [T, SCORE_PAD])
     biased_scores = pl.reshape(biased_flat, [T, SCORE_PAD])
 
-    # Stage 3: per-token sort32 with paired UINT32 indices.
+    # Stage 3: per-token sort with paired UINT32 indices.
     sorted_rows = pl.create_tensor([T, 2 * SCORE_PAD], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_sort_top2"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_sort_topk"):
         for t in pl.unroll(T):
             score_row = biased_scores[t : t + 1, :]
             idx_init = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
             sorted_t = pl.tensor.sort32(score_row, idx_init)
+            if SCORE_PAD == 512:
+                sorted_t = pl.tensor.mrgsort(sorted_t, block_len=64)
+                sorted_t = pl.tensor.mrgsort(sorted_t, block_len=256)
             sorted_rows[t : t + 1, :] = sorted_t
 
-    # Stage 4: extract topk vals/idx. Declaration order matters — codegen
-    # binds GM buffers in source order and the block below writes vals first;
-    # swapping these two lines silently rebinds downstream readers.
+    # Stage 4: extract topk indices from the biased sort result.
     topk_vals_pad = pl.create_tensor([T, SCORE_PAD], dtype=pl.FP32)
     topk_idx_pad = pl.create_tensor([T, SCORE_PAD], dtype=pl.INT32)
+    topk_idx_work = pl.create_tensor([T, TOPK_GATHER_PAD], dtype=pl.INT32)
     weight_out_pad = pl.create_tensor([T, SCORE_PAD], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_extract_top2"):
-        # topk_idx_pad is fully covered by the per-token assemble below, so
-        # only the FP32 vals table needs zero-init.
-        topk_vals_pad[:, :] = pl.full([T, SCORE_PAD], dtype=pl.FP32, value=0.0)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_extract_topk"):
         for t in pl.unroll(T):
             topk_pairs = sorted_rows[t : t + 1, 0 : PAIR_PAD]
-            topk_vals = pl.tensor.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
             topk_i_raw = pl.tensor.gather(
                 topk_pairs,
                 mask_pattern=pl.tile.MaskPattern.P1010,
                 output_dtype=pl.INT32,
             )
+            topk_idx_work[t : t + 1, :] = topk_i_raw
+            topk_idx_pad[t : t + 1, 0 : TOPK_GATHER_PAD] = topk_i_raw
+
+    # Stage 5: gather unbiased score values for the selected biased topk ids.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_gather_weights"):
+        topk_scores = pl.tensor.gather(route_scores, dim=-1, index=topk_idx_work)
+        topk_vals_pad[:, :] = pl.full([T, SCORE_PAD], dtype=pl.FP32, value=0.0)
+        for t in pl.unroll(T):
             # `valid_shape` carries the meaningful [1, TOPK] subspan so
             # fillpad zeros the padding columns; no [:] equivalent.
             topk_vals_valid = pl.slice(
-                topk_vals,
+                topk_scores,
                 [1, TOPK_GATHER_PAD],
-                [0, 0],
+                [t, 0],
                 valid_shape=[1, TOPK],
             )
             topk_vals_padded = pl.fillpad(topk_vals_valid, pad_value=pl.PadValue.zero)
-            # Bias handling: weights here are taken straight from sort32, so
-            # they include route bias. The zero-bias fixture makes them equal
-            # to the unbiased scores; non-zero bias needs an indirect gather
-            # on the score table, blocked on ptoas `gather(input, dim, index)`.
             topk_vals_pad[t : t + 1, 0 : TOPK_GATHER_PAD] = topk_vals_padded
-            topk_idx_pad[t : t + 1, 0 : TOPK_GATHER_PAD] = topk_i_raw
 
-    # Stage 5: normalize weights, then scatter first TOPK cols to GM outputs.
+    # Stage 6: normalize weights, then scatter first TOPK cols to GM outputs.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_normalize_weights"):
         denom = pl.reshape(pl.row_sum(topk_vals_pad), [T, 1])
         weights_pad = pl.mul(pl.row_expand_div(topk_vals_pad, denom), ROUTE_SCALE)
@@ -230,8 +245,7 @@ def build_tensor_specs():
     def init_gate_w():
         return torch.randn(N_EXPERTS, D) / D ** 0.5
     def init_gate_bias():
-        # Pinned to zero — see bias note at `route_extract_top2`.
-        return torch.zeros(N_EXPERTS)
+        return torch.randn(N_EXPERTS) * 0.1
     return [
         TensorSpec("x_mixed",      [B, S, D],                  torch.bfloat16, init_value=init_x_mixed),
         TensorSpec("norm_w",       [D],                        torch.float32,  init_value=init_norm_w),
