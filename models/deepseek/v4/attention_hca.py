@@ -59,6 +59,7 @@ ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS  # ori KV pool size (matches sparse_attn ORI_
 CMP_MAX_BLOCKS = 64                 # matches sparse_attn CMP_MAX_BLOCKS (HCA writes 1 cmp slot; pool sized for the contract)
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS  # cmp KV pool size
 CMP_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO   # demo 32; flash/pro 8192 (= 1048576/128); max compressed positions
+IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO  # matches compressor_ratio128 kv_cache 2nd-dim contract
 SPARSE_IDX_TOPK = M.index_topk             # sparse_attn module's IDX_TOPK (static shape contract)
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK        # sparse_attn module's TOPK (= 640 for demo)
 START_POS = 127      # ScalarSpec default; (START_POS+1)%COMPRESS_RATIO==0 to cover the full compression path
@@ -104,10 +105,12 @@ def attention_hca(
     even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     # main compressor (rotate=False, head_dim=HEAD_DIM, ratio=128, overlap=False)
-    cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
-    cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
+    cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
+    cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
-    cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+    cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
+    cmp_even_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
+    cmp_odd_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
     cmp_kv_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
     cmp_score_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
     # KV cache split into ori (sliding window) and cmp (compressed) pools to match sparse_attn's contract.
@@ -124,6 +127,7 @@ def attention_hca(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
     start_pos: pl.Scalar[pl.INT32],  # decode step; MUST equal compile-time START_POS — see contract above
+    cmp_rotate: pl.Scalar[pl.BOOL],  # always False on the ratio=128 path; threaded through for the compressor inline contract
 ):
     """HCA decode orchestration for compress_ratio=128. Caller contract:
     runtime ``start_pos`` MUST equal compile-time ``START_POS`` AND
@@ -162,20 +166,18 @@ def attention_hca(
     # Compressor RoPE row at start_pos + 1 - ratio; half-vector layout.
     # Module-level `assert SHOULD_COMPRESS` guarantees (start_pos+1) is a positive multiple
     # of COMPRESS_RATIO, so cmp_pos = start_pos + 1 - ratio is always >= 0.
-    cmp_cos = pl.create_tensor([1, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
-    cmp_sin = pl.create_tensor([1, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
+    cmp_cos = pl.create_tensor([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+    cmp_sin = pl.create_tensor([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cmp_rope"):
         cmp_pos = pl.cast(start_pos + 1 - COMPRESS_RATIO, pl.INDEX)
-        cmp_cos_fp32 = pl.col_expand(
+        cmp_cos = pl.col_expand(
             pl.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0),
             pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM // 2], [cmp_pos, 0]), target_type=pl.FP32),
         )
-        cmp_sin_fp32 = pl.col_expand(
+        cmp_sin = pl.col_expand(
             pl.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0),
             pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM // 2], [cmp_pos, 0]), target_type=pl.FP32),
         )
-        cmp_cos = pl.cast(cmp_cos_fp32, target_type=pl.BF16, mode="rint")
-        cmp_sin = pl.cast(cmp_sin_fp32, target_type=pl.BF16, mode="rint")
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
@@ -215,15 +217,17 @@ def attention_hca(
             )
     kv_cache = pl.reshape(kv_cache_flat, [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
 
-    # Main compressor (ratio=128, rotate=False); writes cmp_out.
-    # `hadamard` is a dead parameter on the ratio=128 path: ROTATE=False in
-    # compressor_ratio128.py, and the JIT body never reads it (only the golden does).
-    # Initializing a [HEAD_DIM, HEAD_DIM] BF16 buffer here would exceed the Vec buffer
-    # budget on a2a3 (524288 B > 196608 B limit), so leave uninitialized.
-    cmp_out = pl.create_tensor([B, HEAD_DIM], dtype=pl.BF16)
+    # Main compressor (ratio=128, rotate=False).
+    # New compressor signature returns (kv, kv_state, score_state, kv_cache); the BF16
+    # compressed row we want is `cmp_kv_buf[:, start_pos // COMPRESS_RATIO, :]`.
+    # `hadamard_identity` is a dead buffer on this path (rotate=False); pypto leaves
+    # `pl.create_tensor` uninitialized so it does not consume Vec buffer budget.
+    cmp_kv_proj = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
+    cmp_kv_buf = pl.create_tensor([B, IDX_KV_LEN, HEAD_DIM], dtype=pl.BF16)
     hadamard_identity = pl.create_tensor([HEAD_DIM, HEAD_DIM], dtype=pl.BF16)
-    cmp_out = compressor(
+    cmp_kv_proj, cmp_kv_state, cmp_score_state, cmp_kv_buf = compressor(
         x_mixed,
+        cmp_kv_proj,
         cmp_kv_state,
         cmp_score_state,
         cmp_wkv,
@@ -232,9 +236,12 @@ def attention_hca(
         cmp_norm_w,
         cmp_cos,
         cmp_sin,
+        cmp_even_select,
+        cmp_odd_select,
         hadamard_identity,
+        cmp_kv_buf,
         start_pos,
-        cmp_out,
+        cmp_rotate,
     )
 
     # cmp_kv scatter — emitted unconditionally because the module-level
@@ -242,6 +249,7 @@ def attention_hca(
     # invocations only; non-compression steps must dispatch elsewhere.
     cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     cmp_block_table_flat = pl.reshape(cmp_block_table, [B * CMP_MAX_BLOCKS])
+    cmp_kv_buf_flat = pl.reshape(cmp_kv_buf, [B * IDX_KV_LEN, HEAD_DIM])
     with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="hca_scatter_cmp"):
         cmp_slot_rel = start_pos // COMPRESS_RATIO
         cmp_intra = cmp_slot_rel % BLOCK_SIZE
@@ -249,9 +257,10 @@ def attention_hca(
         for b in pl.parallel(0, B, 1, chunk=1):
             cmp_blk_id = pl.cast(pl.read(cmp_block_table_flat, [b * CMP_MAX_BLOCKS + cmp_blk_off]), pl.INDEX)
             cmp_dst_row = cmp_blk_id * BLOCK_SIZE + cmp_intra
+            cmp_src_row = b * IDX_KV_LEN + cmp_slot_rel
             cmp_kv_flat = pl.assemble(
                 cmp_kv_flat,
-                cmp_out[b:b + 1, 0:HEAD_DIM],
+                cmp_kv_buf_flat[cmp_src_row:cmp_src_row + 1, 0:HEAD_DIM],
                 [cmp_dst_row, 0],
             )
     cmp_kv = pl.reshape(cmp_kv_flat, [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
@@ -326,10 +335,12 @@ def attention_hca_test(
     odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
     even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
-    cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
-    cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
+    cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
+    cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
-    cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+    cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
+    cmp_even_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
+    cmp_odd_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
     cmp_kv_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
     cmp_score_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
@@ -343,6 +354,7 @@ def attention_hca_test(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
     start_pos: pl.Scalar[pl.INT32],
+    cmp_rotate: pl.Scalar[pl.BOOL],
 ):
     x_out = attention_hca(
         x_hc,
@@ -351,12 +363,14 @@ def attention_hca_test(
         freqs_cos, freqs_sin, even_select_t, odd_select_t,
         even_select_local, odd_select_local,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
+        cmp_even_select, cmp_odd_select,
         cmp_kv_state, cmp_score_state,
         kv_cache, ori_block_table, cmp_kv, cmp_block_table,
         attn_sink, seqused_kv,
         wo_a, wo_b, wo_b_scale,
         x_out,
         start_pos,
+        cmp_rotate,
     )
     return x_out
 
@@ -453,9 +467,13 @@ def golden_attention_hca(tensors):
         kv_cache[blk_id, intra, 0] = kv[b]
 
     # main compressor (writes cmp_kv via the orchestration scatter below on should_compress)
-    cmp_out = torch.zeros(B, HEAD_DIM, dtype=torch.bfloat16)
+    # New golden_compressor contract: requires `kv` / `kv_cache` / `rotate` / `even_select` / `odd_select`,
+    # writes the BF16 compressed row into kv_cache[:bsz, start_pos // ratio].
+    cmp_kv_proj = torch.zeros(B, S, HEAD_DIM, dtype=torch.float32)
+    cmp_kv_cache_buf = torch.zeros(B, MAX_SEQ_LEN // ratio, HEAD_DIM, dtype=torch.bfloat16)
     golden_compressor({
         "x": x_mixed,
+        "kv": cmp_kv_proj,
         "kv_state": tensors["cmp_kv_state"],
         "score_state": tensors["cmp_score_state"],
         "wkv": tensors["cmp_wkv"],
@@ -464,16 +482,19 @@ def golden_attention_hca(tensors):
         "norm_w": tensors["cmp_norm_w"],
         "cos": cmp_cos,
         "sin": cmp_sin,
+        "even_select": tensors["cmp_even_select"],
+        "odd_select": tensors["cmp_odd_select"],
         "hadamard": torch.eye(HEAD_DIM, dtype=torch.bfloat16),                 # rotate=False; identity placeholder
+        "kv_cache": cmp_kv_cache_buf,
         "start_pos": tensors["start_pos"],
-        "out": cmp_out,
+        "rotate": torch.tensor(False),
     })
     if should_compress:
         cmp_slot_rel = start_pos // ratio
         for b in range(B):
             blk_id = int(cmp_block_table[b, cmp_slot_rel // BLOCK_SIZE].item())
             intra = cmp_slot_rel % BLOCK_SIZE
-            cmp_kv[blk_id, intra, 0] = cmp_out[b]
+            cmp_kv[blk_id, intra, 0] = cmp_kv_cache_buf[b, cmp_slot_rel]
 
     # sparse_attn + fused o_proj
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
@@ -582,13 +603,23 @@ def build_tensor_specs():
         return (cache / denom).to(torch.bfloat16)
 
     def init_cmp_wkv():
-        return torch.randn(MAIN_OUT_DIM, D) / D ** 0.5
+        return torch.randn(D, MAIN_OUT_DIM) / D ** 0.5
     def init_cmp_wgate():
-        return torch.randn(MAIN_OUT_DIM, D) / D ** 0.5
+        return torch.randn(D, MAIN_OUT_DIM) / D ** 0.5
     def init_cmp_ape():
         return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.01
     def init_cmp_norm_w():
         return torch.ones(HEAD_DIM)
+    def init_cmp_even_select():
+        m = torch.zeros((ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2))
+        for i in range(ROPE_HEAD_DIM // 2):
+            m[2 * i, i] = 1
+        return m
+    def init_cmp_odd_select():
+        m = torch.zeros((ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2))
+        for i in range(ROPE_HEAD_DIM // 2):
+            m[2 * i + 1, i] = 1
+        return m
     def init_cmp_kv_state():
         return torch.zeros(B, MAIN_STATE_LEN, MAIN_OUT_DIM)
     def init_cmp_score_state():
@@ -650,10 +681,12 @@ def build_tensor_specs():
         TensorSpec("odd_select_t", [ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_odd_select_t),
         TensorSpec("even_select_local", [SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], torch.bfloat16, init_value=init_even_select_local),
         TensorSpec("odd_select_local", [SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], torch.bfloat16, init_value=init_odd_select_local),
-        TensorSpec("cmp_wkv", [MAIN_OUT_DIM, D], torch.bfloat16, init_value=init_cmp_wkv),
-        TensorSpec("cmp_wgate", [MAIN_OUT_DIM, D], torch.bfloat16, init_value=init_cmp_wgate),
+        TensorSpec("cmp_wkv", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wkv),
+        TensorSpec("cmp_wgate", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
-        TensorSpec("cmp_norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_cmp_norm_w),
+        TensorSpec("cmp_norm_w", [HEAD_DIM], torch.float32, init_value=init_cmp_norm_w),
+        TensorSpec("cmp_even_select", [ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], torch.bfloat16, init_value=init_cmp_even_select),
+        TensorSpec("cmp_odd_select", [ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], torch.bfloat16, init_value=init_cmp_odd_select),
         TensorSpec("cmp_kv_state", [B, MAIN_STATE_LEN, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_kv_state),
         TensorSpec("cmp_score_state", [B, MAIN_STATE_LEN, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_score_state),
         TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
@@ -667,12 +700,13 @@ def build_tensor_specs():
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("x_out", [B, S, HC_MULT, D], torch.bfloat16, is_output=True),
         ScalarSpec("start_pos", torch.int32, START_POS),
+        ScalarSpec("cmp_rotate", torch.bool, ROTATE_MAIN),
     ]
 
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, run_jit
+    from golden import RunConfig, ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -690,6 +724,9 @@ if __name__ == "__main__":
             # instead of the previous all-zero cache.
             rtol=1e-2,
             atol=1e-2,
+            compare_fn={
+                "x_out": ratio_allclose(atol=3e-3, rtol=2.0 / 128),
+            },
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,

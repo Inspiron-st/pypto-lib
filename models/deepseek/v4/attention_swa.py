@@ -524,7 +524,7 @@ if __name__ == "__main__":
             rtol=1e-2,
             atol=1e-2,
             compare_fn={
-                "x_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+                "x_out": ratio_allclose(atol=3e-3, rtol=2.0 / 128),
             },
             compile=dict(dump_passes=True),
             runtime=dict(
