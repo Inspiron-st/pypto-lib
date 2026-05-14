@@ -87,8 +87,8 @@ def moe_dispatch(
                 pl.write(recv_token_flat, [dst], pl.cast(t, pl.INT32))
                 pl.write(count_flat, [e], pl.cast(slot_i32 + 1, pl.INT32))
 
-    for e in pl.unroll(N_LOCAL_EXPERTS):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="packed_materialize_metadata"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="packed_materialize_metadata"):
+        for e in pl.range(N_LOCAL_EXPERTS):
             w_row_1d = pl.slice(recv_weights_flat, [RECV_MAX], [e * RECV_MAX])
             tok_row_1d = pl.slice(recv_token_flat, [RECV_MAX], [e * RECV_MAX])
             recv_weights = pl.assemble(recv_weights, pl.reshape(w_row_1d, [1, RECV_MAX]), [e, 0])
