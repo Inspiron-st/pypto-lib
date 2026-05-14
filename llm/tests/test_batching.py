@@ -10,10 +10,7 @@
 import torch
 
 from core.engine import LLMEngine
-from core.executor import ModelExecutor
 from core.kv_cache import KvCacheManager
-from core.pypto_executor import PyptoQwen14BExecutor
-from core.pypto_executor import _CompiledKernels
 from core.types import (
     DecodeBatch,
     GenerateConfig,
@@ -24,6 +21,10 @@ from core.types import (
     RuntimeConfig,
     RuntimeModel,
 )
+from model.cpu_executor import CpuModelExecutor
+from model.qwen3_14b_executor import Qwen314BPyptoExecutor as PyptoExecutor
+from model.qwen3_14b_runner import Qwen314BModelRunner as ModelRunner
+from model.qwen3_14b_runner import _CompiledKernels
 
 
 class _Tokenizer:
@@ -87,7 +88,15 @@ def test_prefill_inputs_use_actual_user_batch_without_padding_lanes():
     model = _model(max_batch_size=15)
     manager = KvCacheManager()
     manager.register_model(model.config.model_id, model.config, model.runtime)
-    executor = PyptoQwen14BExecutor(manager)
+    runner = ModelRunner(
+        model_id=model.config.model_id,
+        compiled=None,  # type: ignore[arg-type]
+        kv_cache_manager=manager,
+        platform="a2a3sim",
+        device_id=0,
+        save_kernels_dir=None,
+        l3_trace=False,
+    )
     allocations = [
         manager.allocate_for_prompt(model.config.model_id, f"req-{idx}", idx + 1)
         for idx in range(2)
@@ -102,7 +111,7 @@ def test_prefill_inputs_use_actual_user_batch_without_padding_lanes():
         model.config.hidden_size,
     )
 
-    prepared = executor._prepare_prefill_inputs(
+    prepared = runner._prepare_prefill_inputs(
         model,
         PrefillBatch(
             request_ids=[alloc.request_id for alloc in allocations],
@@ -133,11 +142,19 @@ def test_decode_inputs_use_actual_user_batch_without_padding_lanes():
     model = _model(max_batch_size=1)
     manager = KvCacheManager()
     manager.register_model(model.config.model_id, model.config, model.runtime)
-    executor = PyptoQwen14BExecutor(manager)
+    runner = ModelRunner(
+        model_id=model.config.model_id,
+        compiled=None,  # type: ignore[arg-type]
+        kv_cache_manager=manager,
+        platform="a2a3sim",
+        device_id=0,
+        save_kernels_dir=None,
+        l3_trace=False,
+    )
     alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 1)
     hidden_states = torch.ones(1, model.config.hidden_size)
 
-    prepared = executor._prepare_decode_inputs(
+    prepared = runner._prepare_decode_inputs(
         model,
         DecodeBatch(
             request_ids=[alloc.request_id],
@@ -161,7 +178,7 @@ def test_decode_inputs_use_actual_user_batch_without_padding_lanes():
 def test_engine_generate_batch_uses_batched_executor_results():
     model = _model(max_batch_size=2, eos_token_id=0)
     manager = KvCacheManager()
-    executor = ModelExecutor(manager)
+    executor = CpuModelExecutor(manager)
     engine = LLMEngine(kv_cache_manager=manager, executor=executor)
     manager.register_model(model.config.model_id, model.config, model.runtime)
     engine._models[model.config.model_id] = ModelRecord(
@@ -187,10 +204,10 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
     model.layers = [_layer(model.config.hidden_size, model.config.intermediate_size, model.config.head_dim)]
     manager = KvCacheManager()
     manager.register_model(model.config.model_id, model.config, model.runtime)
-    executor = PyptoQwen14BExecutor(manager)
+    executor = PyptoExecutor(manager)
     cached_layer = executor._kernel_layer_weights(model.layers[0])
     fake_kernel = _CopyKernel()
-    executor._compiled[model.config.model_id] = _CompiledKernels(
+    compiled = _CompiledKernels(
         prefill=fake_kernel,
         decode=fake_kernel,
         final_rms=_NoopKernel(),
@@ -201,9 +218,20 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
         padded_vocab=model.config.vocab_size,
         padded_lm_head_weight=torch.zeros(model.config.vocab_size, model.config.hidden_size),
         layers=[cached_layer],
+        decode_weights=executor._stack_decode_weights([cached_layer]),
+    )
+    executor._compiled[model.config.model_id] = compiled
+    executor._runners[model.config.model_id] = ModelRunner(
+        model_id=model.config.model_id,
+        compiled=compiled,
+        kv_cache_manager=manager,
+        platform=executor._platform,
+        device_id=executor._device_id,
+        save_kernels_dir=executor._save_kernels_dir,
+        l3_trace=executor._l3_trace,
     )
     monkeypatch.setattr(
-        PyptoQwen14BExecutor,
+        PyptoExecutor,
         "_kernel_weight",
         staticmethod(lambda weight: (_ for _ in ()).throw(AssertionError("_kernel_weight should be cached"))),
     )

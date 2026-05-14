@@ -31,6 +31,8 @@ from .types import (
 
 
 class LLMEngine:
+    """High-level model registry and text generation coordinator."""
+
     def __init__(
         self,
         model_loader: ModelLoader | None = None,
@@ -38,9 +40,12 @@ class LLMEngine:
         executor: ModelExecutor | None = None,
         sampler: Sampler | None = None,
     ) -> None:
+        """Create an engine from pluggable loader, cache, executor, and sampler."""
         self._model_loader = model_loader or ModelLoader()
         self._kv_cache_manager = kv_cache_manager or KvCacheManager()
-        self._executor = executor or ModelExecutor(self._kv_cache_manager)
+        if executor is None:
+            raise ValueError("LLMEngine requires a ModelExecutor instance.")
+        self._executor = executor
         self._sampler = sampler or Sampler()
         self._models: dict[str, ModelRecord] = {}
         self._request_counter = itertools.count()
@@ -53,7 +58,8 @@ class LLMEngine:
         model_format: str | None = None,
         **loader_options: object,
     ) -> None:
-        _verbose = getattr(self._executor, "_l3_trace", False)
+        """Load a model, register its KV cache, and notify the executor."""
+        _verbose = self._executor.profile_verbose
         timer = StageTimer(
             enabled=_verbose,
             prefix="init-breakdown",
@@ -92,12 +98,14 @@ class LLMEngine:
         timer.report()
 
     def generate(self, model_id: str, prompt: str, config: GenerateConfig | None = None) -> str | Iterator[str]:
+        """Generate text for one prompt, optionally returning a text stream."""
         generate_config = config or GenerateConfig()
         if generate_config.stream:
             return self._generate_stream(model_id, prompt, generate_config)
         return self._generate_result(model_id, prompt, generate_config).text
 
     def _generate_non_stream(self, model_id: str, prompt: str, config: GenerateConfig) -> str:
+        """Generate non-streaming text for one prompt."""
         return self._generate_result(model_id, prompt, config).text
 
     def generate_batch(
@@ -106,6 +114,7 @@ class LLMEngine:
         prompts: list[str] | tuple[str, ...],
         config: GenerateConfig | None = None,
     ) -> list[GenerateResult]:
+        """Generate non-streaming completions for a batch of prompts."""
         generate_config = config or GenerateConfig()
         if generate_config.stream:
             raise ValueError("generate_batch requires stream=False")
@@ -129,58 +138,18 @@ class LLMEngine:
             if not token_ids:
                 raise ValueError("Prompt tokenization produced no tokens.")
 
-        # L3 fast path currently supports batch_size=1 only.
-        is_l3 = callable(getattr(self._executor, "run_generate_l3", None)) and getattr(
-            self._executor, "_l3_mode", False
-        )
-        if is_l3 and len(prompts) > 1:
-            raise NotImplementedError(
-                "L3 generate fast path currently supports batch_size=1; "
-                f"got {len(prompts)} prompts."
-            )
-        # The L3 device-side loop cannot evaluate Python stop strings mid-flight,
-        # so reject them up-front rather than silently ignoring.
-        if is_l3 and any(generate_config.stop):
-            raise NotImplementedError(
-                "L3 generate fast path does not support generate_config.stop; "
-                "the device-side decode loop cannot break on host-side string matches."
-            )
+        self._executor.validate_generate_batch(record, len(prompts), generate_config)
 
         requests: list[RequestState] = []
         allocations = []
         try:
             for prompt, token_ids in zip(prompts, prompt_token_ids, strict=True):
                 request_id = f"req-{next(self._request_counter)}"
-                # In L3 mode the entire decode loop runs on device without
-                # host-side ensure_one_more_slot calls, so pre-allocate KV
-                # capacity for the full prompt + max_new_tokens upfront.
-                if is_l3:
-                    prompt_len = len(token_ids)
-                    max_seq = record.runtime.max_seq_len
-                    if generate_config.max_new_tokens < 1:
-                        raise ValueError(
-                            f"L3 mode requires max_new_tokens >= 1, got "
-                            f"{generate_config.max_new_tokens}."
-                        )
-                    if prompt_len > max_seq:
-                        raise ValueError(
-                            f"L3 mode: prompt length ({prompt_len}) exceeds "
-                            f"max_seq_len ({max_seq}). Either shorten the prompt "
-                            f"or increase --max-seq-len to at least {prompt_len}."
-                        )
-                    alloc_len = prompt_len + generate_config.max_new_tokens
-                    if alloc_len > max_seq:
-                        allowed_new_tokens = max_seq - prompt_len
-                        raise ValueError(
-                            f"L3 mode: prompt length ({prompt_len}) + "
-                            f"max_new_tokens ({generate_config.max_new_tokens}) = {alloc_len} "
-                            f"exceeds max_seq_len ({max_seq}). "
-                            f"Either reduce --max-new-tokens to at most "
-                            f"{allowed_new_tokens}, or increase --max-seq-len to at least "
-                            f"{alloc_len}."
-                        )
-                else:
-                    alloc_len = len(token_ids)
+                alloc_len = self._executor.prompt_allocation_length(
+                    record,
+                    len(token_ids),
+                    generate_config,
+                )
                 alloc = self._kv_cache_manager.allocate_for_prompt(model_id, request_id, alloc_len)
                 allocations.append(alloc)
                 requests.append(
@@ -217,59 +186,30 @@ class LLMEngine:
                     row_tokens,
                 )
 
-            # L3-wrapped generate: entire prefill + decode loop in one worker.run().
-            if is_l3:
-                run_generate_l3 = self._executor.run_generate_l3
-                prefill_batch = PrefillBatch(
-                    request_ids=[request.request_id for request in requests],
-                    token_ids=token_tensor,
-                    input_embeddings=embeddings,
-                    seq_lens=torch.tensor(
-                        [len(token_ids) for token_ids in prompt_token_ids],
-                        dtype=torch.int32,
-                        device=runtime_model.runtime.device,
-                    ),
-                    kv_allocations=allocations,
-                )
-                generated_ids, _ = run_generate_l3(
-                    runtime_model,
-                    prefill_batch,
-                    max_new_tokens=generate_config.max_new_tokens,
-                    eos_token_id=record.config.eos_token_id,
-                )
-                request = requests[0]
-                request.generated_token_ids = list(generated_ids)
-                request.output_text = tokenizer.decode(generated_ids)
-                if generated_ids and record.config.eos_token_id is not None and generated_ids[-1] == record.config.eos_token_id:
-                    finish_reason = "eos"
-                else:
-                    # The L3 loop only exits on EOS or after producing
-                    # max_new_tokens; stop strings are rejected at entry above.
-                    finish_reason = "length"
-                return [
-                    GenerateResult(
-                        text=request.output_text,
-                        token_ids=list(request.generated_token_ids),
-                        finish_reason=finish_reason,
-                    )
-                ]
+            prefill_batch = PrefillBatch(
+                request_ids=[request.request_id for request in requests],
+                token_ids=token_tensor,
+                input_embeddings=embeddings,
+                seq_lens=torch.tensor(
+                    [len(token_ids) for token_ids in prompt_token_ids],
+                    dtype=torch.int32,
+                    device=runtime_model.runtime.device,
+                ),
+                kv_allocations=allocations,
+            )
+            fast_path_result = self._executor.try_generate_batch(
+                record,
+                requests,
+                prefill_batch,
+                generate_config,
+            )
+            if fast_path_result is not None:
+                return fast_path_result
 
-            # Hold one shared L3 Worker across prefill + all decode steps.
-            # For the baseline executor, session() is a no-op.
             with self._executor.session():
                 prefill_result = self._executor.run_prefill(
                     runtime_model,
-                    PrefillBatch(
-                        request_ids=[request.request_id for request in requests],
-                        token_ids=token_tensor,
-                        input_embeddings=embeddings,
-                        seq_lens=torch.tensor(
-                            [len(token_ids) for token_ids in prompt_token_ids],
-                            dtype=torch.int32,
-                            device=runtime_model.runtime.device,
-                        ),
-                        kv_allocations=allocations,
-                    ),
+                    prefill_batch,
                 )
 
                 sampling_params = self._sampler.from_generate_config(generate_config)
@@ -366,6 +306,7 @@ class LLMEngine:
         ]
 
     def _generate_stream(self, model_id: str, prompt: str, config: GenerateConfig) -> Iterator[str]:
+        """Yield decoded text deltas for one streaming prompt."""
         if model_id not in self._models:
             raise KeyError(f"Model {model_id} is not initialized.")
         record = self._models[model_id]
@@ -396,8 +337,6 @@ class LLMEngine:
             token_tensor = torch.tensor(prompt_token_ids, dtype=torch.long, device=runtime_model.runtime.device)
             embeddings = self._executor.lookup_embeddings(runtime_model, token_tensor).unsqueeze(0)
 
-            # Hold one shared L3 Worker across prefill + all decode steps.
-            # For the baseline executor, session() is a no-op.
             with self._executor.session():
                 prefill_result = self._executor.run_prefill(
                     runtime_model,
@@ -460,16 +399,19 @@ class LLMEngine:
             self._kv_cache_manager.free(alloc)
 
     def generate_result(self, model_id: str, prompt: str, config: GenerateConfig | None = None) -> GenerateResult:
+        """Generate a structured non-streaming result for one prompt."""
         generate_config = config or GenerateConfig()
         if generate_config.stream:
             raise ValueError("generate_result requires stream=False")
         return self._generate_result(model_id, prompt, generate_config)
 
     def _generate_result(self, model_id: str, prompt: str, config: GenerateConfig) -> GenerateResult:
+        """Generate one result by reusing the batch path."""
         return self.generate_batch(model_id, [prompt], config)[0]
 
     @staticmethod
     def _select_batch_row(tensor: torch.Tensor, row_idx: int) -> torch.Tensor:
+        """Return row ``row_idx`` from a batch tensor or the tensor itself."""
         return tensor[row_idx] if tensor.dim() > 1 else tensor
 
     @staticmethod
@@ -480,6 +422,7 @@ class LLMEngine:
         emitted_text: str,
         current_token: int,
     ) -> bool:
+        """Return whether generation should stop for one request."""
         if record.config.eos_token_id is not None and current_token == record.config.eos_token_id:
             return True
         if len(generated) >= config.max_new_tokens:

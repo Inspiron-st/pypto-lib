@@ -22,6 +22,7 @@ class StageTimer:
     __slots__ = ("_enabled", "_prefix", "_title", "_t0", "_stages")
 
     def __init__(self, *, enabled: bool, prefix: str, title: str) -> None:
+        """Create a timer that prints labels with a shared prefix."""
         self._enabled = enabled
         self._prefix = prefix
         self._title = title
@@ -29,10 +30,12 @@ class StageTimer:
         self._stages: list[tuple[str, float]] = []
 
     def mark(self, label: str) -> None:
+        """Record the current time for a labelled stage."""
         if self._enabled:
             self._stages.append((label, time.perf_counter()))
 
     def report(self) -> None:
+        """Print per-stage elapsed time and total time when enabled."""
         if not self._enabled or not self._stages:
             return
         prev = self._t0

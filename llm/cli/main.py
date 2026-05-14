@@ -23,7 +23,8 @@ GenerateConfig = None
 LLMEngine = None
 RuntimeConfig = None
 KvCacheManager = None
-PyptoQwen14BExecutor = None
+CpuModelExecutor = None
+PyptoExecutor = None
 
 
 _VALID_BACKENDS = {"cpu", "npu"}
@@ -47,7 +48,6 @@ class NpuCliConfig:
     platform: str = "a2a3"
     device_id: int = 0
     save_kernels_dir: str | None = None
-    pypto_root: str | None = None
     l3_mode: bool = False
 
 
@@ -148,7 +148,6 @@ def load_serving_config(
         platform=_get_str(npu_section, "platform", "a2a3"),
         device_id=_get_int(npu_section, "device_id", 0),
         save_kernels_dir=_get_optional_str(npu_section, "save_kernels_dir"),
-        pypto_root=_get_optional_str(npu_section, "pypto_root"),
         l3_mode=npu_l3_mode,
     )
 
@@ -162,14 +161,14 @@ def load_serving_config(
 
 
 def create_engine(config: ServingConfig) -> LLMEngine:
-    _ensure_core_imports(executor=config.backend == "npu")
-    if config.backend == "cpu":
-        return LLMEngine()
-
+    _ensure_core_imports(cpu_executor=config.backend == "cpu", executor=config.backend == "npu")
     kv_cache_manager = KvCacheManager()
-    executor = PyptoQwen14BExecutor(
+    if config.backend == "cpu":
+        executor = CpuModelExecutor(kv_cache_manager)
+        return LLMEngine(kv_cache_manager=kv_cache_manager, executor=executor)
+
+    executor = PyptoExecutor(
         kv_cache_manager,
-        pypto_root=config.npu.pypto_root,
         platform=config.npu.platform,
         device_id=config.npu.device_id,
         save_kernels_dir=config.npu.save_kernels_dir,
@@ -270,8 +269,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def _ensure_core_imports(*, executor: bool = False) -> None:
-    global GenerateConfig, LLMEngine, RuntimeConfig, KvCacheManager, PyptoQwen14BExecutor
+def _ensure_core_imports(*, cpu_executor: bool = False, executor: bool = False) -> None:
+    global GenerateConfig, LLMEngine, RuntimeConfig, KvCacheManager, CpuModelExecutor, PyptoExecutor
 
     if GenerateConfig is None or LLMEngine is None or RuntimeConfig is None:
         try:
@@ -297,12 +296,19 @@ def _ensure_core_imports(*, executor: bool = False) -> None:
             from core.kv_cache import KvCacheManager as imported_kv_cache_manager
         KvCacheManager = imported_kv_cache_manager
 
-    if executor and PyptoQwen14BExecutor is None:
+    if cpu_executor and CpuModelExecutor is None:
         try:
-            from ..core.pypto_executor import PyptoQwen14BExecutor as imported_executor
+            from ..model.cpu_executor import CpuModelExecutor as imported_cpu_executor
         except ImportError:
-            from core.pypto_executor import PyptoQwen14BExecutor as imported_executor
-        PyptoQwen14BExecutor = imported_executor
+            from model.cpu_executor import CpuModelExecutor as imported_cpu_executor
+        CpuModelExecutor = imported_cpu_executor
+
+    if executor and PyptoExecutor is None:
+        try:
+            from ..model.qwen3_14b_executor import Qwen314BPyptoExecutor as imported_executor
+        except ImportError:
+            from model.qwen3_14b_executor import Qwen314BPyptoExecutor as imported_executor
+        PyptoExecutor = imported_executor
 
 
 def _print_interactive_banner(config: ServingConfig, stdout: TextIO) -> None:

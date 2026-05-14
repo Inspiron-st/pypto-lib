@@ -19,6 +19,8 @@ from .types import KvAllocation, ModelConfig, RuntimeConfig
 
 @dataclass
 class _CachePool:
+    """Paged KV cache storage for one registered model."""
+
     page_size: int
     num_layers: int
     num_kv_heads: int
@@ -30,10 +32,14 @@ class _CachePool:
 
 
 class KvCacheManager:
+    """Allocate and materialize paged KV cache for generation requests."""
+
     def __init__(self) -> None:
+        """Create an empty registry of model-specific KV pools."""
         self._pools: dict[str, _CachePool] = {}
 
     def register_model(self, model_id: str, config: ModelConfig, runtime: RuntimeConfig) -> None:
+        """Create the KV page pool for a model if it is not already registered."""
         if model_id in self._pools:
             return
         max_blocks_per_seq = math.ceil(runtime.max_seq_len / runtime.page_size)
@@ -63,6 +69,7 @@ class KvCacheManager:
         )
 
     def allocate_for_prompt(self, model_id: str, request_id: str, prompt_len: int) -> KvAllocation:
+        """Allocate enough KV pages to store a prompt of ``prompt_len`` tokens."""
         pool = self._pool(model_id)
         num_pages = max(1, math.ceil(prompt_len / pool.page_size))
         page_ids = self._take_pages(pool, num_pages)
@@ -75,6 +82,7 @@ class KvCacheManager:
         )
 
     def ensure_one_more_slot(self, alloc: KvAllocation) -> int:
+        """Ensure a request has capacity for one more token and return its slot."""
         pool = self._pool(alloc.model_id)
         if alloc.tokens_used >= alloc.tokens_capacity:
             alloc.page_ids.extend(self._take_pages(pool, 1))
@@ -82,9 +90,11 @@ class KvCacheManager:
         return self.slot_mapping_for_request(alloc, alloc.tokens_used)
 
     def block_table_for_request(self, alloc: KvAllocation) -> torch.Tensor:
+        """Return the page IDs for one request as an int32 tensor."""
         return torch.tensor(alloc.page_ids, dtype=torch.int32)
 
     def block_table_for_batch(self, allocations: list[KvAllocation]) -> torch.Tensor:
+        """Return a dense ``[batch, max_blocks]`` block table for requests."""
         max_blocks = max((len(alloc.page_ids) for alloc in allocations), default=0)
         table = torch.full((len(allocations), max_blocks), -1, dtype=torch.int32)
         for row, alloc in enumerate(allocations):
@@ -113,6 +123,7 @@ class KvCacheManager:
         return table
 
     def slot_mapping_for_request(self, alloc: KvAllocation, token_index: int | None = None) -> int:
+        """Return the physical slot index for a request token."""
         pool = self._pool(alloc.model_id)
         logical_index = alloc.tokens_used if token_index is None else token_index
         page_idx = logical_index // pool.page_size
@@ -120,12 +131,14 @@ class KvCacheManager:
         return alloc.page_ids[page_idx] * pool.page_size + offset
 
     def slot_mapping_for_batch(self, allocations: list[KvAllocation]) -> torch.Tensor:
+        """Return current decode slot mappings for a batch."""
         return torch.tensor(
             [self.slot_mapping_for_request(alloc) for alloc in allocations],
             dtype=torch.int32,
         )
 
     def slot_mapping_for_positions(self, alloc: KvAllocation, num_tokens: int, *, max_tokens: int | None = None) -> torch.Tensor:
+        """Return per-position slot mappings, optionally padded with -1."""
         size = num_tokens if max_tokens is None else max_tokens
         mapping = torch.full((size,), -1, dtype=torch.int32)
         for token_index in range(num_tokens):
@@ -140,6 +153,7 @@ class KvCacheManager:
         keys: torch.Tensor,
         values: torch.Tensor,
     ) -> None:
+        """Write key/value rows for consecutive tokens into paged cache."""
         pool = self._pool(alloc.model_id)
         if keys.shape != values.shape:
             raise ValueError("keys and values must have the same shape")
@@ -162,12 +176,14 @@ class KvCacheManager:
         max_seq: int,
         seq_len: int,
     ) -> None:
+        """Import flattened prefill K/V tensors into the paged cache."""
         pool = self._pool(alloc.model_id)
         keys = keys_flat.view(pool.num_kv_heads, max_seq, pool.head_dim)[:, :seq_len, :].permute(1, 0, 2).contiguous()
         values = values_flat.view(pool.num_kv_heads, max_seq, pool.head_dim)[:, :seq_len, :].permute(1, 0, 2).contiguous()
         self.write_tokens(layer_idx, alloc, 0, keys, values)
 
     def read_context(self, layer_idx: int, alloc: KvAllocation, upto_tokens: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read contiguous K/V context for one request and layer."""
         pool = self._pool(alloc.model_id)
         token_count = alloc.tokens_used if upto_tokens is None else upto_tokens
         keys = torch.empty(
@@ -187,6 +203,7 @@ class KvCacheManager:
         return keys, values
 
     def materialize_decode_cache(self, model_id: str, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return a flat decode-cache view for one model layer."""
         pool = self._pool(model_id)
         return (
             pool.key_pages[layer_idx].reshape(-1, pool.head_dim),
@@ -213,6 +230,7 @@ class KvCacheManager:
         )
 
     def free(self, alloc: KvAllocation) -> None:
+        """Return an allocation's pages to the model pool."""
         pool = self._pool(alloc.model_id)
         pool.free_pages.extend(alloc.page_ids)
         alloc.page_ids.clear()
@@ -220,12 +238,14 @@ class KvCacheManager:
         alloc.tokens_used = 0
 
     def _pool(self, model_id: str) -> _CachePool:
+        """Return the registered cache pool for a model."""
         if model_id not in self._pools:
             raise KeyError(f"Model {model_id} is not registered with the KV cache manager.")
         return self._pools[model_id]
 
     @staticmethod
     def _take_pages(pool: _CachePool, num_pages: int) -> list[int]:
+        """Remove and return free page IDs from a pool."""
         if len(pool.free_pages) < num_pages:
             raise RuntimeError(
                 f"Insufficient KV cache capacity: requested {num_pages} pages, only {len(pool.free_pages)} available."

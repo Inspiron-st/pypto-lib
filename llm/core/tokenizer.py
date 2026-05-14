@@ -14,31 +14,41 @@ from pathlib import Path
 
 
 class TokenizerAdapter:
+    """Minimal tokenizer interface required by the generation engine."""
+
     def encode(self, text: str) -> list[int]:
+        """Encode text into token IDs without adding prompt specials."""
         raise NotImplementedError
 
     def decode(self, token_ids: list[int]) -> str:
+        """Decode token IDs into text."""
         raise NotImplementedError
 
     @property
     def bos_token_id(self) -> int | None:
+        """Return the beginning-of-sequence token ID, if available."""
         return None
 
     @property
     def eos_token_id(self) -> int | None:
+        """Return the end-of-sequence token ID, if available."""
         return None
 
     @property
     def pad_token_id(self) -> int | None:
+        """Return the padding token ID, if available."""
         return None
 
 
 @dataclass
 class TransformersTokenizerAdapter(TokenizerAdapter):
+    """Tokenizer adapter backed by ``transformers.AutoTokenizer``."""
+
     tokenizer: object
 
     @classmethod
     def from_pretrained(cls, model_dir: str, trust_remote_code: bool = False) -> "TransformersTokenizerAdapter":
+        """Load a local Hugging Face tokenizer directory."""
         try:
             from transformers import AutoTokenizer
         except ImportError as exc:
@@ -55,19 +65,24 @@ class TransformersTokenizerAdapter(TokenizerAdapter):
         return cls(tokenizer=tokenizer)
 
     def encode(self, text: str) -> list[int]:
+        """Encode text using the wrapped Hugging Face tokenizer."""
         return list(self.tokenizer.encode(text, add_special_tokens=False))
 
     def decode(self, token_ids: list[int]) -> str:
+        """Decode token IDs without stripping special tokens."""
         return self.tokenizer.decode(token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
 
     @property
     def bos_token_id(self) -> int | None:
+        """Return the wrapped tokenizer BOS token ID."""
         return self.tokenizer.bos_token_id
 
     @property
     def eos_token_id(self) -> int | None:
+        """Return the wrapped tokenizer EOS token ID."""
         return self.tokenizer.eos_token_id
 
     @property
     def pad_token_id(self) -> int | None:
+        """Return the wrapped tokenizer PAD token ID."""
         return self.tokenizer.pad_token_id

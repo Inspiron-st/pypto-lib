@@ -46,7 +46,7 @@ _bootstrap_package_root()
 
 from llm.core import GenerateConfig, LLMEngine, RuntimeConfig
 from llm.core.kv_cache import KvCacheManager
-from llm.core.pypto_executor import PyptoQwen14BExecutor
+from llm.model.qwen3_14b_executor import Qwen314BPyptoExecutor as PyptoExecutor
 from llm.core.types import LoadedModel
 import dataclasses
 
@@ -328,7 +328,7 @@ def main() -> None:
     collector = _TimingCollector() if profile_enabled else None
 
     kv_cache_manager = KvCacheManager()
-    executor = PyptoQwen14BExecutor(
+    executor = PyptoExecutor(
         kv_cache_manager,
         platform=args.platform,
         device_id=args.device_id,

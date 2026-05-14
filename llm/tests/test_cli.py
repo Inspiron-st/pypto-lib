@@ -167,7 +167,7 @@ def test_main_one_shot_cpu_uses_json_config(tmp_path, monkeypatch, capsys):
     assert cli.main(["--config", str(config_path), "--prompt", "hello"]) == 0
 
     engine = _FakeEngine.instances[-1]
-    assert engine.executor is None
+    assert engine.executor is not None
     assert engine.init_calls[0]["model_id"] == "test-model"
     assert engine.init_calls[0]["model_dir"] == str(model_dir.resolve())
     assert engine.result_prompts[0][1] == "hello"
@@ -222,18 +222,16 @@ def test_create_engine_npu_wires_executor_options(tmp_path, monkeypatch):
         "platform": "a5",
         "device_id": 3,
         "save_kernels_dir": "/tmp/kernels",
-        "pypto_root": "/tmp/pypto",
     }
     config_path = _write_config(tmp_path, config_data)
     monkeypatch.setattr(cli, "LLMEngine", _FakeEngine)
-    monkeypatch.setattr(cli, "PyptoQwen14BExecutor", _FakeNpuExecutor)
+    monkeypatch.setattr(cli, "PyptoExecutor", _FakeNpuExecutor)
 
     engine = cli.create_engine(cli.load_serving_config(config_path))
 
     executor = _FakeNpuExecutor.instances[-1]
     assert engine.executor is executor
     assert executor.kwargs == {
-        "pypto_root": "/tmp/pypto",
         "platform": "a5",
         "device_id": 3,
         "save_kernels_dir": "/tmp/kernels",
@@ -252,7 +250,7 @@ def test_create_engine_npu_wires_l3_executor_options(tmp_path, monkeypatch):
     }
     config_path = _write_config(tmp_path, config_data)
     monkeypatch.setattr(cli, "LLMEngine", _FakeEngine)
-    monkeypatch.setattr(cli, "PyptoQwen14BExecutor", _FakeNpuExecutor)
+    monkeypatch.setattr(cli, "PyptoExecutor", _FakeNpuExecutor)
 
     engine = cli.create_engine(cli.load_serving_config(config_path))
 

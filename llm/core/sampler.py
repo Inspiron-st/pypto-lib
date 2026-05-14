@@ -17,7 +17,10 @@ from .types import GenerateConfig, SamplingParams
 
 
 class Sampler:
+    """Token sampler that supports greedy, top-k, and top-p sampling."""
+
     def sample(self, logits: torch.Tensor, params: SamplingParams) -> int:
+        """Sample one token ID from logits using the supplied sampling params."""
         logits = self._sanitize_logits(logits)
         if params.temperature <= 0.0:
             return self._greedy_token(logits)
@@ -53,6 +56,7 @@ class Sampler:
 
     @staticmethod
     def from_generate_config(config: GenerateConfig) -> SamplingParams:
+        """Build sampler parameters from user-facing generation config."""
         return SamplingParams(
             temperature=config.temperature,
             top_p=config.top_p,
@@ -61,6 +65,7 @@ class Sampler:
 
     @staticmethod
     def _sanitize_logits(logits: torch.Tensor) -> torch.Tensor:
+        """Replace non-finite logits with finite fallback values."""
         logits = logits.float()
         finite_mask = torch.isfinite(logits)
         if finite_mask.all():
@@ -74,9 +79,11 @@ class Sampler:
 
     @staticmethod
     def _is_valid_distribution(probs: torch.Tensor) -> bool:
+        """Return whether probabilities can be sampled safely."""
         total = probs.sum()
         return bool(torch.isfinite(probs).all() and torch.all(probs >= 0) and torch.isfinite(total) and total.item() > 0.0)
 
     @staticmethod
     def _greedy_token(logits: torch.Tensor) -> int:
+        """Return the highest-logit token ID."""
         return int(torch.argmax(logits).item())

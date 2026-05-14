@@ -23,7 +23,6 @@
     "platform": "a2a3",
     "device_id": 0,
     "save_kernels_dir": null,
-    "pypto_root": null,
     "l3": true
   }
 }

@@ -22,6 +22,7 @@ from .types import LayerSpec, LayerWeights, LoadedModel, ModelConfig, RuntimeCon
 
 
 def _torch_dtype_from_name(name: str) -> torch.dtype:
+    """Convert a config dtype string into a torch dtype."""
     mapping = {
         "float16": torch.float16,
         "fp16": torch.float16,
@@ -38,6 +39,8 @@ def _torch_dtype_from_name(name: str) -> torch.dtype:
 
 @dataclass(frozen=True)
 class ModelLoadRequest:
+    """Normalized request passed from ``ModelLoader`` to a format loader."""
+
     model_id: str
     model_dir: str
     runtime_config: RuntimeConfig | None = None
@@ -46,19 +49,25 @@ class ModelLoadRequest:
 
 
 class ModelFormatLoader(Protocol):
+    """Protocol implemented by model-format-specific loaders."""
+
     format_names: tuple[str, ...]
 
     def supports_format(self, model_format: str) -> bool:
+        """Return whether this loader handles the explicit format name."""
         raise NotImplementedError
 
     def can_load(self, model_path: Path) -> bool:
+        """Return whether this loader can infer support for a model path."""
         raise NotImplementedError
 
     def load(self, request: ModelLoadRequest) -> LoadedModel:
+        """Load tensors, tokenizer, and metadata for one model request."""
         raise NotImplementedError
 
 
 def _load_safetensors_dir(model_dir: Path) -> dict[str, torch.Tensor]:
+    """Load all safetensors shards from a local Hugging Face directory."""
     try:
         from safetensors.torch import load_file
     except ImportError as exc:
@@ -80,12 +89,14 @@ def _load_safetensors_dir(model_dir: Path) -> dict[str, torch.Tensor]:
 
 
 def _require_tensor(state_dict: dict[str, torch.Tensor], name: str) -> torch.Tensor:
+    """Return a required tensor or raise a key error with its weight name."""
     if name not in state_dict:
         raise KeyError(f"Missing weight tensor: {name}")
     return state_dict[name]
 
 
 def _optional_tensor(state_dict: dict[str, torch.Tensor], names: list[str]) -> torch.Tensor | None:
+    """Return the first available tensor from a list of candidate names."""
     for name in names:
         if name in state_dict:
             return state_dict[name]
@@ -93,6 +104,7 @@ def _optional_tensor(state_dict: dict[str, torch.Tensor], names: list[str]) -> t
 
 
 def _build_model_config(model_id: str, config_data: dict, tokenizer: TokenizerAdapter) -> ModelConfig:
+    """Build internal model metadata from Hugging Face config JSON."""
     hidden_size = int(config_data["hidden_size"])
     num_heads = int(config_data["num_attention_heads"])
     num_kv_heads = int(config_data.get("num_key_value_heads", num_heads))
@@ -118,6 +130,7 @@ def _build_model_config(model_id: str, config_data: dict, tokenizer: TokenizerAd
 
 
 def _build_layer_specs(config: ModelConfig) -> list[LayerSpec]:
+    """Build per-layer shape specs from model metadata."""
     return [
         LayerSpec(
             layer_idx=layer_idx,
@@ -132,17 +145,22 @@ def _build_layer_specs(config: ModelConfig) -> list[LayerSpec]:
 
 
 def _cast_weight(weight: torch.Tensor, runtime: RuntimeConfig) -> torch.Tensor:
+    """Move a weight tensor to the configured runtime device and dtype."""
     dtype = _torch_dtype_from_name(runtime.weight_dtype)
     return weight.to(device=runtime.device, dtype=dtype)
 
 
 class HuggingFaceDirectoryLoader:
+    """Loader for local Hugging Face-style decoder model directories."""
+
     format_names = ("huggingface", "hf")
 
     def supports_format(self, model_format: str) -> bool:
+        """Return whether ``model_format`` names the Hugging Face loader."""
         return model_format.lower() in self.format_names
 
     def can_load(self, model_path: Path) -> bool:
+        """Detect a local directory with config and safetensors weights."""
         config_path = model_path / "config.json"
         if not config_path.exists():
             return False
@@ -153,6 +171,7 @@ class HuggingFaceDirectoryLoader:
         return False
 
     def load(self, request: ModelLoadRequest) -> LoadedModel:
+        """Load a supported Hugging Face directory into runtime tensors."""
         timer = StageTimer(
             enabled=bool(request.loader_options.get("profile_verbose", False)),
             prefix="loader-breakdown",
@@ -160,6 +179,7 @@ class HuggingFaceDirectoryLoader:
         )
 
         def _mark(label: str) -> None:
+            """Record one loader stage when profiling is enabled."""
             timer.mark(label)
 
         model_path = Path(request.model_dir)
@@ -257,10 +277,14 @@ class HuggingFaceDirectoryLoader:
 
 
 class ModelLoader:
+    """Registry that selects a model-format loader and loads models."""
+
     def __init__(self, format_loaders: list[ModelFormatLoader] | None = None) -> None:
+        """Create a loader registry with optional custom format loaders."""
         self._format_loaders = format_loaders or [HuggingFaceDirectoryLoader()]
 
     def register(self, format_loader: ModelFormatLoader) -> None:
+        """Register an additional model format loader."""
         self._format_loaders.append(format_loader)
 
     def load(
@@ -271,6 +295,7 @@ class ModelLoader:
         model_format: str | None = None,
         **loader_options: object,
     ) -> LoadedModel:
+        """Load a model directory using an explicit or inferred format."""
         request = ModelLoadRequest(
             model_id=model_id,
             model_dir=model_dir,
@@ -282,6 +307,7 @@ class ModelLoader:
         return loader.load(request)
 
     def _select_loader(self, request: ModelLoadRequest) -> ModelFormatLoader:
+        """Select the first registered loader that can handle a request."""
         model_path = Path(request.model_dir)
         if request.model_format is not None:
             for loader in self._format_loaders:

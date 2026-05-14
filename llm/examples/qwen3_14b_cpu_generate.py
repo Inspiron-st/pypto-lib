@@ -33,6 +33,8 @@ def _bootstrap_package_root() -> None:
 _bootstrap_package_root()
 
 from llm.core import GenerateConfig, LLMEngine, RuntimeConfig
+from llm.core.kv_cache import KvCacheManager
+from llm.model.cpu_executor import CpuModelExecutor
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,7 +59,11 @@ def main() -> None:
     if not model_dir.is_dir():
         raise FileNotFoundError(f"Model directory does not exist: {model_dir}")
 
-    engine = LLMEngine()
+    kv_cache_manager = KvCacheManager()
+    engine = LLMEngine(
+        kv_cache_manager=kv_cache_manager,
+        executor=CpuModelExecutor(kv_cache_manager),
+    )
     engine.init_model(
         model_id=args.model_id,
         model_dir=str(model_dir),

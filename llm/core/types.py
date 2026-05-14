@@ -19,6 +19,8 @@ from .tokenizer import TokenizerAdapter
 
 @dataclass(frozen=True)
 class GenerateConfig:
+    """User-facing options that control text generation."""
+
     max_new_tokens: int = 256
     temperature: float = 0.8
     top_p: float = 0.95
@@ -29,6 +31,8 @@ class GenerateConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
+    """Static architecture metadata parsed from model config."""
+
     model_id: str
     architecture: str
     vocab_size: int
@@ -49,6 +53,8 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class RuntimeConfig:
+    """Runtime limits and device placement for one loaded model."""
+
     page_size: int = 64
     max_batch_size: int = 1
     max_seq_len: int = 4096
@@ -65,6 +71,8 @@ class RuntimeConfig:
 
 @dataclass(frozen=True)
 class LayerSpec:
+    """Shape metadata for one transformer layer."""
+
     layer_idx: int
     hidden_size: int
     intermediate_size: int
@@ -75,6 +83,8 @@ class LayerSpec:
 
 @dataclass
 class LayerWeights:
+    """Loaded weights for one transformer layer in framework orientation."""
+
     input_rms_weight: torch.Tensor
     wq: torch.Tensor
     wk: torch.Tensor
@@ -90,6 +100,8 @@ class LayerWeights:
 
 @dataclass
 class RuntimeModel:
+    """Loaded model tensors plus runtime and architecture metadata."""
+
     config: ModelConfig
     runtime: RuntimeConfig
     embed_tokens: torch.Tensor
@@ -100,6 +112,8 @@ class RuntimeModel:
 
 @dataclass
 class ModelRecord:
+    """Engine registry entry for one initialized model."""
+
     config: ModelConfig
     runtime: RuntimeConfig
     tokenizer: TokenizerAdapter
@@ -109,6 +123,8 @@ class ModelRecord:
 
 @dataclass
 class LoadedModel:
+    """Model-loader result before registration with the engine."""
+
     model_id: str
     model_dir: str
     config: ModelConfig
@@ -119,6 +135,8 @@ class LoadedModel:
 
 @dataclass
 class SamplingParams:
+    """Internal sampling parameters derived from generation config."""
+
     temperature: float
     top_p: float
     top_k: int | None = None
@@ -126,6 +144,8 @@ class SamplingParams:
 
 @dataclass
 class RequestState:
+    """Mutable per-request state tracked during generation."""
+
     request_id: str
     model_id: str
     prompt: str
@@ -144,6 +164,8 @@ class RequestState:
 
 @dataclass
 class KvAllocation:
+    """Paged KV-cache allocation assigned to one request."""
+
     request_id: str
     model_id: str
     page_ids: list[int]
@@ -153,6 +175,8 @@ class KvAllocation:
 
 @dataclass
 class PrefillBatch:
+    """Inputs for a batched prompt prefill call."""
+
     request_ids: list[str]
     token_ids: torch.Tensor
     input_embeddings: torch.Tensor
@@ -162,12 +186,16 @@ class PrefillBatch:
 
 @dataclass
 class PrefillResult:
+    """Outputs from prompt prefill."""
+
     last_hidden: torch.Tensor
     logits: torch.Tensor
 
 
 @dataclass
 class DecodeBatch:
+    """Inputs for one batched decode step."""
+
     request_ids: list[str]
     token_ids: torch.Tensor
     hidden_states: torch.Tensor
@@ -179,12 +207,16 @@ class DecodeBatch:
 
 @dataclass
 class DecodeResult:
+    """Outputs from one decode step."""
+
     hidden_states: torch.Tensor
     logits: torch.Tensor
 
 
 @dataclass
 class GenerateResult:
+    """Final text, generated IDs, and stop reason for one request."""
+
     text: str
     token_ids: list[int]
     finish_reason: str
