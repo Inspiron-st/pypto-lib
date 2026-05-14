@@ -141,6 +141,28 @@ def _backend_for_platform(platform: str) -> Any:
         ) from None
 
 
+_EXECUTE_COMPILED_KEYS = {"platform", "device_id", "pto_isa_commit", "level"}
+_DFX_FLAG_KEYS = ("enable_l2_swimlane", "enable_dump_tensor", "enable_pmu", "enable_dep_gen")
+
+
+def _execute_compiled_kwargs(runtime: dict[str, Any]) -> dict[str, Any]:
+    """Translate user-facing ``config.runtime`` into ``execute_compiled`` kwargs.
+
+    pypto's ``execute_compiled`` takes the four DFX flags as a single
+    bundled ``dfx: _DfxOpts`` parameter rather than individual kwargs, so
+    flat per-flag keys (``enable_l2_swimlane=True``, ...) supplied via
+    ``RunConfig.runtime`` are folded into ``_DfxOpts`` here. Other keys
+    are filtered to the documented ``execute_compiled`` surface.
+    """
+    out: dict[str, Any] = {k: v for k, v in runtime.items() if k in _EXECUTE_COMPILED_KEYS}
+    dfx_flags = {k: runtime[k] for k in _DFX_FLAG_KEYS if k in runtime}
+    if dfx_flags:
+        from pypto.runtime.runner import _DfxOpts  # noqa: PLC0415
+
+        out["dfx"] = _DfxOpts(**dfx_flags)
+    return out
+
+
 def run(
     program: Any,
     specs: list[TensorSpec | ScalarSpec],
@@ -317,7 +339,7 @@ def run(
                 tensors[s.name] if isinstance(s, TensorSpec) else scalar_specs_eff[s.name].to_ctypes()
                 for s in specs
             ]
-            execute_compiled(work_dir, ordered, **config.runtime)
+            execute_compiled(work_dir, ordered, **_execute_compiled_kwargs(config.runtime))
 
     if golden_fn is None and golden_data is None:
         total = time.time() - start
@@ -570,14 +592,8 @@ def run_jit(
             ]
             # execute_compiled only accepts a subset of pypto.runtime.RunConfig
             # fields — strip the compile-only ones (dump_passes, codegen_only,
-            # rtol, atol, etc.) before forwarding.
-            exec_kwargs = {
-                k: v for k, v in config.runtime.items()
-                if k in {"platform", "device_id", "pto_isa_commit",
-                         "enable_l2_swimlane", "enable_dump_tensor",
-                         "enable_pmu", "enable_dep_gen", "level"}
-            }
-            execute_compiled(work_dir, ordered, **exec_kwargs)
+            # rtol, atol, etc.) and bundle DFX flags via _execute_compiled_kwargs.
+            execute_compiled(work_dir, ordered, **_execute_compiled_kwargs(config.runtime))
         else:
             jit_args: list[Any] = []
             for spec in specs:
