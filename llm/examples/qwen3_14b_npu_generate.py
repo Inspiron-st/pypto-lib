@@ -147,15 +147,46 @@ def InstallProfiling(engine: LLMEngine, model_id: str, collector: _TimingCollect
     executor = engine._executor  # type: ignore[attr-defined]
     compiled = executor._compiled[model_id]  # type: ignore[attr-defined]
 
-    # Per-layer kernel wrappers. compiled.prefill / compiled.decode are invoked
-    # once per transformer layer inside run_prefill / run_decode respectively
-    # (baseline non-L3 path only).
-    compiled.prefill = collector.WrapKernel(compiled.prefill, "kernel.prefill_layer")
-    compiled.decode = collector.WrapKernel(
-        compiled.decode, "kernel.decode_layer", group_by_decode_step=True
-    )
-    compiled.final_rms = collector.WrapKernel(compiled.final_rms, "kernel.final_rms")
-    compiled.lm_head = collector.WrapKernel(compiled.lm_head, "kernel.lm_head")
+    # Non-L3 kernels are either directly callable compiled programs (older
+    # path) or _L2Callable descriptors dispatched by Qwen314BModelRunner.
+    if hasattr(compiled.prefill, "chip_callable"):
+        runner = executor._runners[model_id]  # type: ignore[attr-defined]
+        orig_run_l2 = runner._run_l2_program  # type: ignore[attr-defined]
+        l2_names = {
+            id(compiled.prefill): ("kernel.prefill_layer", False),
+            id(compiled.decode): ("kernel.decode_layer", True),
+            id(compiled.final_rms): ("kernel.final_rms", False),
+            id(compiled.lm_head): ("kernel.lm_head", False),
+        }
+
+        def timed_run_l2(callable_spec, *args, **kwargs):
+            kernel_info = l2_names.get(id(callable_spec))
+            if kernel_info is None:
+                return orig_run_l2(callable_spec, *args, **kwargs)
+            name, group_by_decode_step = kernel_info
+            t0 = time.perf_counter()
+            try:
+                return orig_run_l2(callable_spec, *args, **kwargs)
+            finally:
+                dt = time.perf_counter() - t0
+                collector.kernel_times[name].append(dt)
+                if group_by_decode_step and collector._decode_step_idx >= 0:
+                    bucket = collector.kernel_per_decode_step[name]
+                    while len(bucket) <= collector._decode_step_idx:
+                        bucket.append([])
+                    bucket[collector._decode_step_idx].append(dt)
+
+        runner._run_l2_program = timed_run_l2  # type: ignore[attr-defined]
+    else:
+        # Per-layer kernel wrappers. compiled.prefill / compiled.decode are invoked
+        # once per transformer layer inside run_prefill / run_decode respectively
+        # (baseline non-L3 path only).
+        compiled.prefill = collector.WrapKernel(compiled.prefill, "kernel.prefill_layer")
+        compiled.decode = collector.WrapKernel(
+            compiled.decode, "kernel.decode_layer", group_by_decode_step=True
+        )
+        compiled.final_rms = collector.WrapKernel(compiled.final_rms, "kernel.final_rms")
+        compiled.lm_head = collector.WrapKernel(compiled.lm_head, "kernel.lm_head")
 
     # L3 generate wrapper. run_generate_l3 is invoked once per generate call
     # (replaces run_prefill + run_decode in L3 mode).

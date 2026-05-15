@@ -832,59 +832,43 @@ def build_qwen3_14b_l3_generate_program(
                                 [0, k0],
                             )
 
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="decode_q_proj"):
-                        for ob in pl.parallel(q_out_blocks, chunk=4):
-                            q0 = ob * Q_OUT_CHUNK
-                            tile_a = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, 0])
-                            tile_b = pl.slice(
-                                wq, [SCOPE1_K_CHUNK, Q_OUT_CHUNK], [layer_off_h, q0]
-                            )
-                            q_acc = pl.matmul(tile_a, tile_b, out_dtype=pl.FP32)
-                            for kb in pl.range(1, scope1_hidden_blocks):
-                                k0 = kb * SCOPE1_K_CHUNK
-                                tile_a_i = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, k0])
-                                tile_b_i = pl.slice(
-                                    wq,
-                                    [SCOPE1_K_CHUNK, Q_OUT_CHUNK],
-                                    [layer_off_h + k0, q0],
-                                )
-                                q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
-                            q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
+                    for ob_chunk in pl.parallel(0, q_out_blocks, 4):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_q_proj"):
+                            for ob in pl.range(ob_chunk, ob_chunk + 4):
+                                q0 = ob * Q_OUT_CHUNK
+                                tile_a = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, 0])
+                                tile_b = pl.slice(wq, [SCOPE1_K_CHUNK, Q_OUT_CHUNK], [layer_off_h, q0])
+                                q_acc = pl.matmul(tile_a, tile_b, out_dtype=pl.FP32)
+                                for kb in pl.range(1, scope1_hidden_blocks):
+                                    k0 = kb * SCOPE1_K_CHUNK
+                                    tile_a_i = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, k0])
+                                    tile_b_i = pl.slice(wq, [SCOPE1_K_CHUNK, Q_OUT_CHUNK], [layer_off_h + k0, q0])
+                                    q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
+                                q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
 
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="decode_kv_proj"):
-                        for ob in pl.parallel(kv_out_blocks, chunk=4):
-                            kv0 = ob * KV_OUT_CHUNK
-                            tile_a = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, 0])
-                            tile_wk = pl.slice(
-                                wk, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [layer_off_h, kv0]
-                            )
-                            k_acc = pl.matmul(tile_a, tile_wk, out_dtype=pl.FP32)
-                            for kb in pl.range(1, scope1_hidden_blocks):
-                                k0 = kb * SCOPE1_K_CHUNK
-                                tile_a_i = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, k0])
-                                tile_wk_i = pl.slice(
-                                    wk,
-                                    [SCOPE1_K_CHUNK, KV_OUT_CHUNK],
-                                    [layer_off_h + k0, kv0],
-                                )
-                                k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
-                            k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
+                    for ob_chunk in pl.parallel(0, kv_out_blocks, 4):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_kv_proj"):
+                            for ob in pl.range(ob_chunk, ob_chunk + 4):
+                                kv0 = ob * KV_OUT_CHUNK
+                                tile_a = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, 0])
+                                tile_wk = pl.slice(wk, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [layer_off_h, kv0])
+                                k_acc = pl.matmul(tile_a, tile_wk, out_dtype=pl.FP32)
+                                for kb in pl.range(1, scope1_hidden_blocks):
+                                    k0 = kb * SCOPE1_K_CHUNK
+                                    tile_a_i = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, k0])
+                                    tile_wk_i = pl.slice(wk, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [layer_off_h + k0, kv0])
+                                    k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
+                                k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
 
-                            tile_a = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, 0])
-                            tile_wv = pl.slice(
-                                wv, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [layer_off_h, kv0]
-                            )
-                            v_acc = pl.matmul(tile_a, tile_wv, out_dtype=pl.FP32)
-                            for kb in pl.range(1, scope1_hidden_blocks):
-                                k0 = kb * SCOPE1_K_CHUNK
-                                tile_a_i = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, k0])
-                                tile_wv_i = pl.slice(
-                                    wv,
-                                    [SCOPE1_K_CHUNK, KV_OUT_CHUNK],
-                                    [layer_off_h + k0, kv0],
-                                )
-                                v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
-                            v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
+                                tile_a = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, 0])
+                                tile_wv = pl.slice(wv, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [layer_off_h, kv0])
+                                v_acc = pl.matmul(tile_a, tile_wv, out_dtype=pl.FP32)
+                                for kb in pl.range(1, scope1_hidden_blocks):
+                                    k0 = kb * SCOPE1_K_CHUNK
+                                    tile_a_i = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, k0])
+                                    tile_wv_i = pl.slice(wv, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [layer_off_h + k0, kv0])
+                                    v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
+                                v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
 
                 # HF-style per-head Q/K norm before RoPE.
                 for b0 in pl.parallel(0, batch_padded, BATCH_TILE):

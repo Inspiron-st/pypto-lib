@@ -9,6 +9,11 @@
 
 from __future__ import annotations
 
+import importlib.util
+import tempfile
+from pathlib import Path
+from typing import Any
+
 import torch
 
 
@@ -29,6 +34,7 @@ try:
     from .qwen3_14b_runner import (
         _CompiledKernels,
         _KernelLayerWeights,
+        _L2Callable,
         _LOGITS_BATCH_TILE,
         Qwen314BModelRunner,
     )
@@ -49,6 +55,7 @@ except ImportError:
     from model.qwen3_14b_runner import (
         _CompiledKernels,
         _KernelLayerWeights,
+        _L2Callable,
         _LOGITS_BATCH_TILE,
         Qwen314BModelRunner,
     )
@@ -131,6 +138,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         )
         self._l3_mode = l3_mode
         self._l3_trace = l3_trace
+        self._l2_compile_root: Path | None = None
 
     @property
     def profile_verbose(self) -> bool:
@@ -265,7 +273,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         def _mark(label: str) -> None:
             timer.mark(label)
 
-        from pypto.runtime import run
         try:
             from ..model.qwen3_14b_decode import build_qwen3_decode_program
             from ..model.qwen3_14b_final_rms import build_qwen3_final_rms_program
@@ -321,18 +328,21 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             vocab_size=padded_vocab,
         )
         _mark("build_programs")
-        prefill = run(prefill_program, config=self._run_config(codegen_only=True))
+        prefill = self._compile_l2_callable("prefill", prefill_program)
         _mark("compile_prefill")
-        decode = run(decode_program, config=self._run_config(codegen_only=True))
+        decode = self._compile_l2_callable("decode", decode_program)
         _mark("compile_decode")
-        final_rms = run(final_rms_program, config=self._run_config(codegen_only=True))
-        lm_head = run(lm_head_program, config=self._run_config(codegen_only=True))
+        final_rms = self._compile_l2_callable("final_rms", final_rms_program)
+        lm_head = self._compile_l2_callable("lm_head", lm_head_program)
         _mark("compile_final_rms_lm_head")
-        rope_cos, rope_sin = rope_tables(
+
+        rope_cos_raw, rope_sin_raw = rope_tables(
             model.runtime.max_seq_len,
             model.config.head_dim,
             model.config.rope_theta,
         )
+        rope_cos = self._shared_tensor(rope_cos_raw)
+        rope_sin = self._shared_tensor(rope_sin_raw)
 
         _mark("rope_tables")
 
@@ -466,16 +476,19 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
                 device=lm_head_weight.device,
             )
             lm_head_weight = torch.cat([lm_head_weight, padding], dim=0)
-        padded_lm_head_weight = lm_head_weight.to(torch.bfloat16).contiguous().cpu()
+        padded_lm_head_weight = self._shared_tensor(lm_head_weight.to(torch.bfloat16).contiguous().cpu())
         _mark("pad_lm_head")
         layers = []
         for layer in model.layers:
             layers.append(self._kernel_layer_weights(layer))
             self._release_layer_weights(layer)
-        final_norm_weight = model.final_norm_weight.view(1, -1).float().cpu()
+        final_norm_weight = self._shared_tensor(model.final_norm_weight.view(1, -1).float().cpu())
         _mark("kernel_layer_weights")
 
-        decode_weights = self._stack_decode_weights(layers)
+        decode_weights = {
+            name: self._shared_tensor(tensor)
+            for name, tensor in self._stack_decode_weights(layers).items()
+        }
         _mark("stack_decode_weights")
 
         timer.report()
@@ -501,6 +514,68 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             l3_generate_runtime_name=l3_generate_runtime_name,
             l3_generate_param_infos=l3_generate_param_infos,
         )
+
+    def _compile_l2_callable(self, name: str, program: object) -> _L2Callable:
+        """Compile one non-L3 program and assemble it into a Simpler callable."""
+        from pypto.ir.compiled_program import CompiledProgram  # noqa: PLC0415
+        from pypto.runtime import compile_program  # noqa: PLC0415
+        from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
+
+        config = self._run_config(codegen_only=True)
+        work_dir = self._l2_work_dir(name)
+        compile_program(
+            program,
+            work_dir,
+            strategy=config.strategy,
+            backend_type=config.backend_type,
+            dump_passes=config.dump_passes,
+            diagnostic_phase=config.diagnostic_phase,
+            disabled_diagnostics=config.disabled_diagnostics,
+            profiling=config.compile_profiling,
+        )
+        chip_callable, runtime_name = compile_and_assemble(
+            work_dir,
+            self._platform,
+            pto_isa_commit=config.pto_isa_commit,
+        )
+        runtime_config = self._load_runtime_config(work_dir)
+        compiled_view = CompiledProgram(
+            program,
+            str(work_dir),
+            backend_type=config.backend_type,
+            platform=self._platform,
+        )
+        param_infos, _, _ = compiled_view._get_metadata()
+        return _L2Callable(
+            chip_callable=chip_callable,
+            runtime_name=runtime_name,
+            block_dim=int(runtime_config.get("block_dim", 24)),
+            aicpu_thread_num=int(runtime_config.get("aicpu_thread_num", 4)),
+            param_infos=tuple(param_infos),
+        )
+
+    def _l2_work_dir(self, name: str) -> Path:
+        """Return a dedicated compile directory for one non-L3 program."""
+        if self._save_kernels_dir is not None:
+            root = Path(self._save_kernels_dir)
+        else:
+            if self._l2_compile_root is None:
+                self._l2_compile_root = Path(tempfile.mkdtemp(prefix="qwen3_14b_l2_"))
+            root = self._l2_compile_root
+        work_dir = root / name
+        work_dir.mkdir(parents=True, exist_ok=True)
+        return work_dir
+
+    @staticmethod
+    def _load_runtime_config(output_dir: Path) -> dict[str, Any]:
+        """Load ``RUNTIME_CONFIG`` from a generated ``kernel_config.py``."""
+        config_path = output_dir / "kernel_config.py"
+        spec = importlib.util.spec_from_file_location(f"_qwen_l2_kernel_config_{abs(hash(output_dir))}", config_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load kernel_config.py from {config_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return dict(getattr(module, "RUNTIME_CONFIG", {}))
 
     @staticmethod
     def _stack_decode_weights(layers: list[_KernelLayerWeights]) -> dict[str, torch.Tensor]:
@@ -543,24 +618,31 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
     @staticmethod
     def _kernel_weight(weight: torch.Tensor) -> torch.Tensor:
         """Convert a 2-D model weight into kernel-ready orientation and dtype."""
-        return weight.transpose(0, 1).to(torch.bfloat16).contiguous().cpu()
+        return weight.transpose(0, 1).to(torch.bfloat16).contiguous().cpu().share_memory_()
 
     @classmethod
     def _kernel_layer_weights(cls, layer) -> _KernelLayerWeights:
         """Convert one Hugging Face layer into kernel-ready weight tensors."""
         return _KernelLayerWeights(
-            input_rms_weight=layer.input_rms_weight.view(1, -1).float().cpu(),
+            input_rms_weight=cls._shared_tensor(layer.input_rms_weight.view(1, -1).float().cpu()),
             wq=cls._kernel_weight(layer.wq),
             wk=cls._kernel_weight(layer.wk),
             wv=cls._kernel_weight(layer.wv),
-            q_norm_weight=layer.q_norm_weight.view(1, -1).float().cpu(),
-            k_norm_weight=layer.k_norm_weight.view(1, -1).float().cpu(),
+            q_norm_weight=cls._shared_tensor(layer.q_norm_weight.view(1, -1).float().cpu()),
+            k_norm_weight=cls._shared_tensor(layer.k_norm_weight.view(1, -1).float().cpu()),
             wo=cls._kernel_weight(layer.wo),
-            post_rms_weight=layer.post_rms_weight.view(1, -1).float().cpu(),
+            post_rms_weight=cls._shared_tensor(layer.post_rms_weight.view(1, -1).float().cpu()),
             w_gate=cls._kernel_weight(layer.w_gate),
             w_up=cls._kernel_weight(layer.w_up),
             w_down=cls._kernel_weight(layer.w_down),
         )
+
+    @staticmethod
+    def _shared_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        """Move a CPU tensor into shared memory if needed."""
+        if tensor.device.type == "cpu" and not tensor.is_shared():
+            return tensor.share_memory_()
+        return tensor
 
     @staticmethod
     def _release_layer_weights(layer) -> None:
