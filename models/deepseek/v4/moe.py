@@ -31,11 +31,13 @@ scattered back to tokens.
 import pypto.language as pl
 
 from config import (
-    DEMO as M,
+    FLASH as M,
     DECODE_BATCH,
     DECODE_SEQ,
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
+    EP_WORLD_SIZE,
+    RECV_MAX,
 )
 from hc_pre import hc_pre
 from hc_post import hc_post
@@ -63,9 +65,7 @@ VOCAB = M.vocab_size
 
 # Expert (must match moe_expert.py)
 MOE_INTER = M.moe_intermediate_size
-EP_WORLD_SIZE = 1
 N_LOCAL_EXPERTS = N_EXPERTS // EP_WORLD_SIZE
-RECV_MAX = 32
 
 # Sanity: chosen layout requires RECV_MAX >= T * TOPK.
 assert RECV_MAX >= T * TOPK, "packed layout needs RECV_MAX >= T * TOPK"

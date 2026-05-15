@@ -155,7 +155,7 @@ FLASH = DeepSeekV4Config(
     rms_norm_eps=1e-6,
     vocab_size=129280,
     moe_intermediate_size=2048,
-    n_routed_experts=256,
+    n_routed_experts=256//16, # local experts per EP (total experts = n_routed_experts * EP_WORLD_SIZE)
     n_shared_experts=1,
     num_experts_per_tok=6,
     scoring_func="sqrtsoftplus",
@@ -174,7 +174,7 @@ FLASH = DeepSeekV4Config(
     hc_mult=4,
     hc_sinkhorn_iters=20,
     hc_eps=1e-6,
-    max_position_embeddings=1048576,
+    max_position_embeddings=8192,
     rope_theta=10000.0,
     compress_rope_theta=160000.0,
     rope_factor=16.0,
@@ -239,7 +239,7 @@ PRESETS = {p.name: p for p in (DEMO, FLASH, PRO)}
 
 
 # Deployment constants
-DECODE_BATCH = 16          # B: tokens per decode step
+DECODE_BATCH = 64          # B: tokens per decode step
 DECODE_SEQ = 1             # S: one token per step
 
 # Implementation constants
@@ -249,3 +249,8 @@ BLOCK_SIZE = 128                          # paged-KV page size / weight-quant bl
 INT8_SCALE_MAX = 127.0                    # per-row INT8 quant: clamp scale so |q| <= 127
 INT8_AMAX_EPS = 1e-4                      # amax floor: avoids 127/0 on all-zero rows
 FP32_NEG_INF = -3.4028234663852886e38     # most-negative finite fp32 (softmax masking)
+
+# EP communication constants
+EP_WORLD_SIZE = 1   # demo 1; flash/pro depend on deployment (e.g. pro 16)
+EP_RANK = 0
+RECV_MAX = 384       # per-(local-expert) row upper bound

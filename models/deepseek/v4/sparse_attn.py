@@ -41,7 +41,7 @@ The standalone harness exposes `--compress-ratio {0,4,128}` for testing.
 
 import pypto.language as pl
 
-from config import DEMO as M, DECODE_BATCH, BLOCK_SIZE, INT8_SCALE_MAX, INT8_AMAX_EPS
+from config import FLASH as M, DECODE_BATCH, BLOCK_SIZE, INT8_SCALE_MAX, INT8_AMAX_EPS
 
 
 # model config
@@ -79,7 +79,7 @@ A_K_CHUNK = 128
 A_N_CHUNK = 128
 B_K_CHUNK = 128
 B_N_CHUNK = 256
-QUANT_CHUNK = 256
+QUANT_CHUNK = 128 if T >= 64 else 256
 
 
 def get_standalone_cmp_valid(compress_ratio: int) -> int:

@@ -15,7 +15,7 @@ Tree reduction for softmax+pool. State shift after compression."""
 
 import pypto.language as pl
 
-from config import DEMO as M, DECODE_BATCH, DECODE_SEQ, FP32_NEG_INF
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, FP32_NEG_INF
 
 
 # model config
@@ -46,7 +46,7 @@ SCATTER_SLOT = (COMPRESS_RATIO + APE_ROW) if OVERLAP else APE_ROW
 ROPE_CHUCK = 32
 K_CHUNK = 512
 OUT_CHUNK = 128
-HEAD_CHUNK = 128
+HEAD_CHUNK = 64 if B * S >= 64 else 128
 HEAD_DIM_CHUCK = 128
 K_BLOCKS = D // K_CHUNK
 OUT_BLOCKS = OUT_DIM // OUT_CHUNK

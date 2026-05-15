@@ -16,7 +16,7 @@ Companion files: attention_swa.py (ratio=0, no compressor/indexer)
 
 import pypto.language as pl
 
-from config import DEMO as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE
 
 
 # model config

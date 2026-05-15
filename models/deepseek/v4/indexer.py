@@ -13,7 +13,7 @@ The inner Compressor is invoked via golden_compressor (placeholder)."""
 
 import pypto.language as pl
 
-from config import DEMO as M, DECODE_BATCH, DECODE_SEQ, FP32_NEG_INF, INT8_SCALE_MAX, INT8_AMAX_EPS
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, FP32_NEG_INF, INT8_SCALE_MAX, INT8_AMAX_EPS
 from indexer_compressor import compressor
 
 # model config
@@ -44,7 +44,6 @@ INNER_STATE_LEN = INNER_COFF * COMPRESS_RATIO
 
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
 SCORE_LEN = IDX_KV_LEN
-SORT_LEN = 2048      # standalone-test sort buffer width
 START_POS = 255      # ScalarSpec default; >0 (decode) and (START_POS+1)%COMPRESS_RATIO==0
 
 # tiling
@@ -56,7 +55,7 @@ ROPE_CHUCK = 16
 HEAD_DIM_CHUCK = 32
 D_CHUCK = 32
 HEAD_CHUCK = 16
-QUANT_CHUNK = 256
+QUANT_CHUNK = 128 if T >= 64 else 256
 
 @pl.jit.inline
 def indexer(
@@ -333,10 +332,8 @@ def indexer(
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="topk"):
             offset_i32 = pl.cast(offset, target_type=pl.INT32)
             score_row = score_flat[t : t + 1, :]
-            neg_inf_sort = pl.full([1, SORT_LEN - SCORE_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
-            sort_row = pl.concat(score_row, neg_inf_sort)
-            idx_init = pl.tensor.arange(0, [1, SORT_LEN], dtype=pl.UINT32)
-            sorted_score_tile = pl.tensor.sort32(sort_row, idx_init)
+            idx_init = pl.tensor.arange(0, [1, SCORE_LEN], dtype=pl.UINT32)
+            sorted_score_tile = pl.tensor.sort32(score_row, idx_init)
             sorted_score_tile = pl.tensor.mrgsort(sorted_score_tile, block_len=64)
             sorted_score_tile = pl.tensor.mrgsort(sorted_score_tile, block_len=256)
             sorted_score_tile = pl.tensor.mrgsort(sorted_score_tile, block_len=1024)

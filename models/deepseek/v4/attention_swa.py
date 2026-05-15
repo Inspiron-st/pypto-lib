@@ -17,7 +17,7 @@ Companion files: attention_csa_draft.py (ratio=4)
 
 import pypto.language as pl
 
-from config import DEMO as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, INT8_SCALE_MAX, INT8_AMAX_EPS
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, INT8_SCALE_MAX, INT8_AMAX_EPS
 from hc_pre import hc_pre
 from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope
@@ -63,6 +63,7 @@ Q_PROJ_OUT_CHUNK = 128
 Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
 SPARSE_ROPE_CHUNK = 16
 SPARSE_ROPE_INTERLEAVE_CHUNK = 2 * SPARSE_ROPE_CHUNK
+SWA_BATCH_CHUNK = 16 if T >= 64 else T
 
 
 @pl.jit.inline
@@ -114,20 +115,23 @@ def attention_swa(
 
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_rope_step"):
-        pos = pl.cast(start_pos, pl.INDEX)
-        cos_row = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM], [pos, 0]), target_type=pl.FP32)
-        sin_row = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM], [pos, 0]), target_type=pl.FP32)
-        rope_cos_fp32 = pl.col_expand(
-            pl.full([T, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0),
-            cos_row,
-        )
-        rope_sin_fp32 = pl.col_expand(
-            pl.full([T, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0),
-            sin_row,
-        )
-        rope_cos_t = pl.cast(rope_cos_fp32, target_type=pl.BF16, mode="rint")
-        rope_sin_t = pl.cast(rope_sin_fp32, target_type=pl.BF16, mode="rint")
+    for b0 in pl.range(0, T, SWA_BATCH_CHUNK):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_rope_step"):
+            pos = pl.cast(start_pos, pl.INDEX)
+            cos_row = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM], [pos, 0]), target_type=pl.FP32)
+            sin_row = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM], [pos, 0]), target_type=pl.FP32)
+            rope_cos_fp32 = pl.col_expand(
+                pl.full([SWA_BATCH_CHUNK, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0),
+                cos_row,
+            )
+            rope_sin_fp32 = pl.col_expand(
+                pl.full([SWA_BATCH_CHUNK, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0),
+                sin_row,
+            )
+            rope_cos_tile = pl.cast(rope_cos_fp32, target_type=pl.BF16, mode="rint")
+            rope_sin_tile = pl.cast(rope_sin_fp32, target_type=pl.BF16, mode="rint")
+            rope_cos_t = pl.assemble(rope_cos_t, rope_cos_tile, [b0, 0])
+            rope_sin_t = pl.assemble(rope_sin_t, rope_sin_tile, [b0, 0])
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
@@ -167,19 +171,23 @@ def attention_swa(
     kv_cache = pl.reshape(kv_cache_flat, [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
 
     sparse_topk = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="swa_topk"):
-        idx_row = pl.arange(0, [1, WIN], dtype=pl.INT32)
-        pad_row = pl.full([1, SPARSE_IDX_TOPK], dtype=pl.INT32, value=-1)
-        sparse_topk_row = pl.concat(idx_row, pad_row)
-        sparse_topk = pl.col_expand(
-            pl.full([T, SPARSE_TOPK], dtype=pl.INT32, value=-1),
-            sparse_topk_row,
-        )
+    for b0 in pl.range(0, T, SWA_BATCH_CHUNK):
+        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="swa_topk"):
+            idx_row = pl.arange(0, [1, WIN], dtype=pl.INT32)
+            pad_row = pl.full([1, SPARSE_IDX_TOPK], dtype=pl.INT32, value=-1)
+            sparse_topk_row = pl.concat(idx_row, pad_row)
+            sparse_topk_tile = pl.col_expand(
+                pl.full([SWA_BATCH_CHUNK, SPARSE_TOPK], dtype=pl.INT32, value=-1),
+                sparse_topk_row,
+            )
+            sparse_topk = pl.assemble(sparse_topk, sparse_topk_tile, [b0, 0])
 
     cmp_kv_dummy = pl.create_tensor([SPARSE_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
     cmp_block_table_dummy = pl.create_tensor([B, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="swa_cmp_dummy"):
-        cmp_block_table_dummy = pl.full([B, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, value=-1)
+    for b0 in pl.range(0, B, SWA_BATCH_CHUNK):
+        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="swa_cmp_dummy"):
+            cmp_block_table_dummy_tile = pl.full([SWA_BATCH_CHUNK, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, value=-1)
+            cmp_block_table_dummy = pl.assemble(cmp_block_table_dummy, cmp_block_table_dummy_tile, [b0, 0])
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn(

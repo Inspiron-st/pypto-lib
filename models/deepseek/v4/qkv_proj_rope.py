@@ -12,7 +12,7 @@ attention body, with attn_norm fused at the front to save one GM round-trip."""
 
 import pypto.language as pl
 
-from config import DEMO as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS
 
 
 # model config
@@ -37,9 +37,9 @@ Q_PROJ_OUT_CHUNK = 128
 Q_PROJ_CHUNK = 128
 Q_LORA_TILE = 32
 Q_LORA_CHUNK = Q_LORA_TILE
-D_CHUNK     = 512
+D_CHUNK     = 256 if T >= 64 else 512
 KV_CHUNK    = 32
-QUANT_CHUNK = 256
+QUANT_CHUNK = 128 if T >= 64 else 256
 assert (H * HEAD_DIM) % (HEAD_CHUNK * HEAD_GROUP) == 0, \
     "HEAD_BLOCKS must be divisible by HEAD_GROUP"
 Q_BLOCKS      = Q_LORA // Q_LORA_TILE

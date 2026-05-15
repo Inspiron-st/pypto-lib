@@ -20,7 +20,7 @@ to the per-local-expert layout consumed by ``moe_expert``.
 
 import pypto.language as pl
 
-from config import DEMO as M, DECODE_BATCH, DECODE_SEQ
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, EP_WORLD_SIZE, EP_RANK, RECV_MAX
 
 
 # model config
@@ -32,14 +32,11 @@ TOPK = M.num_experts_per_tok
 N_EXPERTS = M.n_routed_experts
 
 # EP layout / recv buffers
-EP_WORLD_SIZE = 1   # demo 1; flash/pro depend on deployment (e.g. pro 16)
-EP_RANK = 0
 N_LOCAL_EXPERTS = N_EXPERTS // EP_WORLD_SIZE
 EXPERTS_START_IDX = EP_RANK * N_LOCAL_EXPERTS
-RECV_MAX = 32       # per-(local-expert) row upper bound (must match moe_expert)
 
 # tiling
-COL_CHUNK = 512
+COL_CHUNK = 128 if T >= 64 else 512
 
 
 @pl.jit.inline

@@ -11,7 +11,8 @@
 
 import pypto.language as pl
 
-from config import DEMO as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS
+from config import (FLASH as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS,
+                    EP_WORLD_SIZE, EP_RANK, RECV_MAX)
 
 
 # model config
@@ -25,19 +26,16 @@ SWIGLU_LIMIT = M.swiglu_limit
 N_EXPERTS = M.n_routed_experts
 
 # EP layout / recv buffers
-EP_WORLD_SIZE = 1   # demo 1; flash/pro depend on deployment (e.g. pro 16)
-EP_RANK = 0
 N_LOCAL_EXPERTS = N_EXPERTS // EP_WORLD_SIZE
 EXPERTS_START_IDX = EP_RANK * N_LOCAL_EXPERTS
-RECV_MAX = 32       # per-(local-expert) row upper bound
 
 # tiling
 RECV_TILE = 16
 K_CHUNK = 512
 INTER_K = 512
-INTER_CHUNK = 256
-D_OUT_CHUNK = 512
-QUANT_CHUNK = 256   # column chunk for two-pass per-row INT8 quant (vec budget aware)
+INTER_CHUNK = 128 if T >= 64 else 256
+D_OUT_CHUNK = 256 if T >= 64 else 512
+QUANT_CHUNK = 128 if T >= 64 else 256   # column chunk for two-pass per-row INT8 quant (vec budget aware)
 
 
 @pl.jit.inline

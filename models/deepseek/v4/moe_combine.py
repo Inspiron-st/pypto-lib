@@ -16,7 +16,7 @@ Combines local expert rows from ``moe_expert`` back to token-major FFN output:
 
 import pypto.language as pl
 
-from config import DEMO as M, DECODE_BATCH, DECODE_SEQ
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, EP_WORLD_SIZE, RECV_MAX
 
 
 # model config
@@ -27,9 +27,7 @@ D = M.hidden_size
 N_EXPERTS = M.n_routed_experts
 
 # EP layout / recv buffers
-EP_WORLD_SIZE = 1
 N_LOCAL_EXPERTS = N_EXPERTS // EP_WORLD_SIZE
-RECV_MAX = 32
 
 # tiling
 COL_CHUNK = 512

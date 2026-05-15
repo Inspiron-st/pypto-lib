@@ -11,7 +11,7 @@
 
 import pypto.language as pl
 
-from config import DEMO as M, DECODE_BATCH, DECODE_SEQ
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, FP32_NEG_INF
 
 
 # model config
@@ -27,7 +27,7 @@ VOCAB         = M.vocab_size
 N_HASH_LAYERS = M.num_hash_layers
 
 # tiling
-D_CHUNK          = 512
+D_CHUNK          = 256 if T >= 64 else 512
 D_BLOCKS         = D // D_CHUNK
 # SCORE_PAD = padded expert row width. sort32 handles 32-value runs; the
 # 512-wide path uses two mrgsort passes to cover FLASH/PRO expert counts.
@@ -41,9 +41,8 @@ else:
 # the unused tail so padding ranks last.
 PAIR_PAD         = 32
 TOPK_GATHER_PAD  = PAIR_PAD // 2
-FP32_NEG_INF     = -1.0e30
 assert TOPK <= TOPK_GATHER_PAD
-
+RMS_PIPE_STAGE   = 1 if T >= 64 else 4
 
 @pl.jit.inline
 def moe_router(
@@ -63,7 +62,7 @@ def moe_router(
     inv_rms = pl.create_tensor([1, T], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="ffn_norm_rms"):
         sq_sum = pl.full([1, T], dtype=pl.FP32, value=0.0)
-        for db in pl.pipeline(D_BLOCKS, stage=4):
+        for db in pl.pipeline(D_BLOCKS, stage=RMS_PIPE_STAGE):
             d0 = db * D_CHUNK
             x_chunk = pl.cast(x_mixed_flat[:, d0 : d0 + D_CHUNK], target_type=pl.FP32)
             sq_sum = pl.add(

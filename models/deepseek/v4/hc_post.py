@@ -12,7 +12,7 @@ into the next hc-stack via post and comb weights."""
 
 import pypto.language as pl
 
-from config import DEMO as M, DECODE_BATCH, DECODE_SEQ
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ
 
 
 # model config

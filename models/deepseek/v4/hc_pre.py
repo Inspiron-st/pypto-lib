@@ -12,7 +12,7 @@ and produces the post/comb weights used by hc_post."""
 
 import pypto.language as pl
 
-from config import DEMO as M, DECODE_BATCH, DECODE_SEQ
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ
 
 
 # model config
@@ -35,10 +35,11 @@ NEG_INF          = -1e20
 
 # tiling
 T_TILE           = 16
-K_CHUNK          = 512
+K_CHUNK          = 256 if T >= 64 else 512
 D_CHUNK          = 512
 HC_DIM_BLOCKS    = HC_DIM // K_CHUNK
 D_BLOCKS         = D // D_CHUNK
+RMS_PIPE_STAGE   = 1 if T >= 64 else 4
 
 
 @pl.jit.inline
@@ -70,7 +71,7 @@ def hc_pre(
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="rms"):
         sq_sum = pl.full([1, T], dtype=pl.FP32, value=0.0)
-        for kb in pl.pipeline(HC_DIM_BLOCKS, stage=4):
+        for kb in pl.pipeline(HC_DIM_BLOCKS, stage=RMS_PIPE_STAGE):
             k0 = kb * K_CHUNK
             x_chunk = pl.slice(x_flat_fp32, [T, K_CHUNK], [0, k0])
             sq_sum = pl.add(

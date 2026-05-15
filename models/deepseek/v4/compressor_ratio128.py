@@ -13,7 +13,7 @@ Online softmax+pool over all slots. No state shift needed."""
 
 import pypto.language as pl
 
-from config import DEMO as M, DECODE_BATCH, DECODE_SEQ
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ
 
 # model config
 B = DECODE_BATCH
@@ -41,7 +41,7 @@ ROPE_CHUNK = 32
 K_CHUNK = 512
 OUT_CHUNK = 128
 
-HEAD_CHUNK = 128
+HEAD_CHUNK = 64 if B * S >= 64 else 128
 K_BLOCKS = D // K_CHUNK            # 8
 OUT_BLOCKS = OUT_DIM // OUT_CHUNK  # 4
 HEAD_BLOCKS = HEAD_DIM // HEAD_CHUNK  # 4
