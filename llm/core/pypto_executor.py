@@ -697,15 +697,13 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
         # Pre-allocate all shared-memory tensors for the full generate loop.
         prefill_out = torch.zeros_like(prefill_inputs.hidden).share_memory_()
-        # decode_out and rms_x share one padded buffer so no CPU copy is needed
-        # between them.  l3_generate writes to decode_out (the first actual_batch
-        # rows); final_rms reads rms_x (all _LOGITS_BATCH_TILE rows).  The padding
-        # rows stay zero throughout, satisfying the zero-pad contract of final_rms.
-        _decode_out_storage = torch.zeros(
-            (_LOGITS_BATCH_TILE, hidden_size), dtype=torch.bfloat16
+        # Fused qwen3_decode_all reads the final-layer hidden state from its
+        # own scratch tensor, so decode_out no longer needs a [_LOGITS_BATCH_TILE,
+        # hidden] view aliased to it.  Allocate decode_out at the user batch
+        # shape; final-RMS / LM-head intermediates use independent buffers.
+        decode_out = torch.zeros(
+            (actual_batch, hidden_size), dtype=torch.bfloat16
         ).share_memory_()
-        decode_out = _decode_out_storage[:actual_batch, :]   # [actual_batch, hidden_size]
-        rms_x = _decode_out_storage                          # [_LOGITS_BATCH_TILE, hidden_size]
         # final_rms / lm_head intermediates.
         rms_gamma = model.final_norm_weight.view(1, hidden_size).float().cpu().share_memory_()
         rms_normed = torch.zeros((_LOGITS_BATCH_TILE, hidden_size), dtype=torch.bfloat16).share_memory_()
@@ -920,7 +918,6 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 _has_prefill_tensor,      # has_prefill = True
                 prefill_out,              # prefill_out
                 decode_out,               # decode_out
-                rms_x,                    # rms_x  (shares storage with decode_out)
                 rms_gamma,                # final_norm_weight
                 rms_normed,               # rms_normed
                 lm_head_weight,           # lm_head_weight_t

@@ -726,7 +726,12 @@ def build_qwen3_14b_l3_generate_program(
 
             return out
 
-        # ── L2: all-layers decode ──────────────────────────────────────────────
+        # ── L2: all-layers decode + final-RMS + LM-head (fused) ───────────────
+        # After the per-layer loop completes, this kernel additionally applies
+        # the final RMSNorm to ``current_hidden`` and projects through
+        # ``lm_head_weight_t`` to produce ``logits_padded``.  Fusion saves one
+        # full chip-task dispatch (~20 ms validate + ~1 ms prepare_ctx) per
+        # decode step versus the previous decode → rms_lmhead 2-task pipeline.
         @pl.function(type=pl.FunctionType.Opaque)
         def qwen3_decode_all(
             self,
@@ -749,8 +754,16 @@ def build_qwen3_14b_l3_generate_program(
             w_gate: pl.Tensor[[num_layers * hidden, inter], pl.BF16],
             w_up: pl.Tensor[[num_layers * hidden, inter], pl.BF16],
             w_down: pl.Tensor[[num_layers * inter, hidden], pl.BF16],
+            final_norm_weight: pl.Tensor[[1, hidden], pl.FP32],
+            lm_head_weight_t: pl.Tensor[[padded_vocab, hidden], pl.BF16],
             out: pl.Out[pl.Tensor[[USER_BATCH_DYN, hidden], pl.BF16]],
-        ) -> pl.Tensor[[USER_BATCH_DYN, hidden], pl.BF16]:
+            rms_normed: pl.Out[pl.Tensor[[BATCH_TILE, hidden], pl.BF16]],
+            logits_padded: pl.Out[pl.Tensor[[BATCH_TILE, padded_vocab], pl.FP32]],
+        ) -> pl.Tuple[
+            pl.Tensor[[USER_BATCH_DYN, hidden], pl.BF16],
+            pl.Tensor[[BATCH_TILE, hidden], pl.BF16],
+            pl.Tensor[[BATCH_TILE, padded_vocab], pl.FP32],
+        ]:
             user_batch = pl.tensor.dim(hidden_states, 0)
             batch_padded = ((user_batch + BATCH_TILE - 1) // BATCH_TILE) * BATCH_TILE
 
@@ -1294,155 +1307,69 @@ def build_qwen3_14b_l3_generate_program(
                         )
                         out = pl.assemble(out, chunk, [b0, k0])
 
-            return out
-
-        # ── L2: final RMSNorm ──────────────────────────────────────────────────
-        # Applied to the padded decode output [BATCH_TILE, hidden] before lm_head.
-        # BATCH_TILE == 16 == _LOGITS_BATCH_TILE; rows beyond actual_batch stay
-        # zero (padding contract satisfied by the executor).
-        @pl.function(type=pl.FunctionType.Opaque)
-        def qwen3_final_rms(
-            self,
-            x: pl.Tensor[[BATCH_TILE, hidden], pl.BF16],
-            gamma: pl.Tensor[[1, hidden], pl.FP32],
-            out: pl.Out[pl.Tensor[[BATCH_TILE, hidden], pl.BF16]],
-        ) -> pl.Tensor[[BATCH_TILE, hidden], pl.BF16]:
+            # ── Final RMSNorm (formerly qwen3_final_rms / Phase 1 of rms_lmhead) ──
+            # Reads current_hidden ([batch=BATCH_TILE, hidden] BF16); the padded
+            # rows beyond user_batch carry zeros from the create_tensor init, so
+            # the zero-pad contract of final_rms is naturally satisfied.
+            # Local names are suffixed `_fin` to avoid SSA-type collisions with
+            # the same-named tensors used earlier (e.g. x_chunk at SCOPE1_K_CHUNK).
             with pl.at(level=pl.Level.CORE_GROUP):
                 for b0 in pl.range(0, BATCH_TILE, BATCH_TILE):
-                    sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
+                    sq_sum_fin = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
                     for kb in pl.range(hidden_blocks):
                         k0 = kb * K_CHUNK
-                        x_chunk = pl.cast(
-                            pl.slice(x, [BATCH_TILE, K_CHUNK], [b0, k0]),
+                        x_chunk_fin = pl.cast(
+                            pl.slice(current_hidden, [BATCH_TILE, K_CHUNK], [b0, k0]),
                             target_type=pl.FP32,
                         )
-                        sq_sum = pl.add(
-                            sq_sum,
+                        sq_sum_fin = pl.add(
+                            sq_sum_fin,
                             pl.reshape(
-                                pl.row_sum(pl.mul(x_chunk, x_chunk)),
+                                pl.row_sum(pl.mul(x_chunk_fin, x_chunk_fin)),
                                 [1, BATCH_TILE],
                             ),
                         )
-                    inv_rms = pl.reshape(
-                        pl.rsqrt(pl.add(pl.mul(sq_sum, hidden_inv), EPS)),
+                    final_inv_rms = pl.reshape(
+                        pl.rsqrt(pl.add(pl.mul(sq_sum_fin, hidden_inv), EPS)),
                         [BATCH_TILE, 1],
                     )
                     for kb in pl.range(hidden_blocks):
                         k0 = kb * K_CHUNK
-                        x_chunk = pl.cast(
-                            pl.slice(x, [BATCH_TILE, K_CHUNK], [b0, k0]),
+                        x_chunk_fin = pl.cast(
+                            pl.slice(current_hidden, [BATCH_TILE, K_CHUNK], [b0, k0]),
                             target_type=pl.FP32,
                         )
-                        g = pl.slice(gamma, [1, K_CHUNK], [0, k0])
-                        normed = pl.col_expand_mul(
-                            pl.row_expand_mul(x_chunk, inv_rms),
-                            g,
-                        )
-                        out = pl.assemble(
-                            out, pl.cast(normed, target_type=pl.BF16), [b0, k0]
-                        )
-            return out
-
-        # ── L2: LM-head projection ──────────────────────────────────────────────
-        # Projects the RMS-normed hidden state to vocabulary logits.
-        # Weight layout: [padded_vocab, hidden] BF16 (HuggingFace nn.Linear).
-        @pl.function(type=pl.FunctionType.Opaque)
-        def qwen3_lm_head(
-            self,
-            hidden_in: pl.Tensor[[BATCH_TILE, hidden], pl.BF16],
-            lm_head_weight: pl.Tensor[[padded_vocab, hidden], pl.BF16],
-            out: pl.Out[pl.Tensor[[BATCH_TILE, padded_vocab], pl.FP32]],
-        ) -> pl.Tensor[[BATCH_TILE, padded_vocab], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
-                for b0 in pl.range(0, BATCH_TILE, BATCH_TILE):
-                    for ob in pl.parallel(vocab_blocks, chunk=8):
-                        o0 = ob * VOCAB_CHUNK
-                        h0 = pl.slice(hidden_in, [BATCH_TILE, K_CHUNK], [b0, 0])
-                        w0 = pl.slice(lm_head_weight, [VOCAB_CHUNK, K_CHUNK], [o0, 0])
-                        acc = pl.matmul(h0, w0, out_dtype=pl.FP32, b_trans=True)
-                        for kb in pl.range(1, hidden_blocks):
-                            k0 = kb * K_CHUNK
-                            h_chunk = pl.slice(hidden_in, [BATCH_TILE, K_CHUNK], [b0, k0])
-                            w_chunk = pl.slice(
-                                lm_head_weight, [VOCAB_CHUNK, K_CHUNK], [o0, k0]
-                            )
-                            acc = pl.matmul_acc(acc, h_chunk, w_chunk, b_trans=True)
-                        out = pl.assemble(out, acc, [b0, o0])
-            return out
-
-        # ── L2: fused final-RMSNorm + LM-head (single chip task) ───────────────
-        # Combines qwen3_final_rms and qwen3_lm_head into one dispatch, saving
-        # one full init_runtime + validate cycle (~20 ms at PTO2_RING_HEAP=512 MB).
-        # rms_normed acts as an HBM scratch buffer between the two compute phases;
-        # it is passed from host_orch but its post-call value is never read
-        # externally (write-only scratch, InOutUseDiscipline satisfied).
-        @pl.function(type=pl.FunctionType.Opaque)
-        def qwen3_rms_lmhead(
-            self,
-            x: pl.Tensor[[BATCH_TILE, hidden], pl.BF16],
-            gamma: pl.Tensor[[1, hidden], pl.FP32],
-            lm_head_weight: pl.Tensor[[padded_vocab, hidden], pl.BF16],
-            rms_normed: pl.Out[pl.Tensor[[BATCH_TILE, hidden], pl.BF16]],
-            out: pl.Out[pl.Tensor[[BATCH_TILE, padded_vocab], pl.FP32]],
-        ) -> pl.Tuple[
-            pl.Tensor[[BATCH_TILE, hidden], pl.BF16],
-            pl.Tensor[[BATCH_TILE, padded_vocab], pl.FP32],
-        ]:
-            # Phase 1 – RMSNorm: identical body to qwen3_final_rms.
-            with pl.at(level=pl.Level.CORE_GROUP):
-                for b0 in pl.range(0, BATCH_TILE, BATCH_TILE):
-                    sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
-                    for kb in pl.range(hidden_blocks):
-                        k0 = kb * K_CHUNK
-                        x_chunk = pl.cast(
-                            pl.slice(x, [BATCH_TILE, K_CHUNK], [b0, k0]),
-                            target_type=pl.FP32,
-                        )
-                        sq_sum = pl.add(
-                            sq_sum,
-                            pl.reshape(
-                                pl.row_sum(pl.mul(x_chunk, x_chunk)),
-                                [1, BATCH_TILE],
-                            ),
-                        )
-                    inv_rms = pl.reshape(
-                        pl.rsqrt(pl.add(pl.mul(sq_sum, hidden_inv), EPS)),
-                        [BATCH_TILE, 1],
-                    )
-                    for kb in pl.range(hidden_blocks):
-                        k0 = kb * K_CHUNK
-                        x_chunk = pl.cast(
-                            pl.slice(x, [BATCH_TILE, K_CHUNK], [b0, k0]),
-                            target_type=pl.FP32,
-                        )
-                        g = pl.slice(gamma, [1, K_CHUNK], [0, k0])
-                        normed = pl.col_expand_mul(
-                            pl.row_expand_mul(x_chunk, inv_rms),
-                            g,
+                        g_fin = pl.slice(final_norm_weight, [1, K_CHUNK], [0, k0])
+                        normed_fin = pl.col_expand_mul(
+                            pl.row_expand_mul(x_chunk_fin, final_inv_rms),
+                            g_fin,
                         )
                         rms_normed = pl.assemble(
-                            rms_normed, pl.cast(normed, target_type=pl.BF16), [b0, k0]
+                            rms_normed, pl.cast(normed_fin, target_type=pl.BF16), [b0, k0]
                         )
-            # Phase 2 – LM-head GEMM: reads rms_normed written above (HBM).
-            # Body identical to qwen3_lm_head with hidden_in → rms_normed.
+
+            # ── LM-head GEMM (formerly qwen3_lm_head / Phase 2 of rms_lmhead) ──
+            # Reads rms_normed (written above, HBM-resident); produces
+            # logits_padded.
             with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                 for b0 in pl.range(0, BATCH_TILE, BATCH_TILE):
                     for ob in pl.parallel(vocab_blocks, chunk=8):
                         o0 = ob * VOCAB_CHUNK
-                        h0 = pl.slice(rms_normed, [BATCH_TILE, K_CHUNK], [b0, 0])
-                        w0 = pl.slice(lm_head_weight, [VOCAB_CHUNK, K_CHUNK], [o0, 0])
-                        acc = pl.matmul(h0, w0, out_dtype=pl.FP32, b_trans=True)
+                        h0_lm = pl.slice(rms_normed, [BATCH_TILE, K_CHUNK], [b0, 0])
+                        w0_lm = pl.slice(lm_head_weight_t, [VOCAB_CHUNK, K_CHUNK], [o0, 0])
+                        lm_acc = pl.matmul(h0_lm, w0_lm, out_dtype=pl.FP32, b_trans=True)
                         for kb in pl.range(1, hidden_blocks):
                             k0 = kb * K_CHUNK
-                            h_chunk = pl.slice(
+                            h_chunk_lm = pl.slice(
                                 rms_normed, [BATCH_TILE, K_CHUNK], [b0, k0]
                             )
-                            w_chunk = pl.slice(
-                                lm_head_weight, [VOCAB_CHUNK, K_CHUNK], [o0, k0]
+                            w_chunk_lm = pl.slice(
+                                lm_head_weight_t, [VOCAB_CHUNK, K_CHUNK], [o0, k0]
                             )
-                            acc = pl.matmul_acc(acc, h_chunk, w_chunk, b_trans=True)
-                        out = pl.assemble(out, acc, [b0, o0])
-            return rms_normed, out
+                            lm_acc = pl.matmul_acc(lm_acc, h_chunk_lm, w_chunk_lm, b_trans=True)
+                        logits_padded = pl.assemble(logits_padded, lm_acc, [b0, o0])
+
+            return out, rms_normed, logits_padded
 
         # ── HOST SubWorker: sample & prepare next decode inputs ─────────────────
         # Placeholder body — the actual implementation (closure over shared-memory
@@ -1509,25 +1436,25 @@ def build_qwen3_14b_l3_generate_program(
             # Output buffers.
             prefill_out: pl.Out[pl.Tensor[[USER_BATCH_DYN, max_seq, hidden], pl.BF16]],
             decode_out: pl.Out[pl.Tensor[[USER_BATCH_DYN, hidden], pl.BF16]],
-            # Final-RMS + LM-head tensors (shared with decode_out storage).
-            # rms_x is the padded [BATCH_TILE, hidden] view of the same buffer as
-            # decode_out; BATCH_TILE == 16 == _LOGITS_BATCH_TILE; no copy needed.
-            rms_x: pl.Tensor[[BATCH_TILE, hidden], pl.BF16],
+            # Final-RMS + LM-head tensors.  The fused qwen3_decode_all reads
+            # the last-layer hidden state directly from its internal scratch
+            # tensor, so no aliased rms_x view of decode_out is required here.
             final_norm_weight: pl.Tensor[[1, hidden], pl.FP32],
             rms_normed: pl.Out[pl.Tensor[[BATCH_TILE, hidden], pl.BF16]],
             lm_head_weight_t: pl.Tensor[[padded_vocab, hidden], pl.BF16],
             logits_padded: pl.Out[pl.Tensor[[BATCH_TILE, padded_vocab], pl.FP32]],
         ) -> pl.Tensor[[USER_BATCH_DYN, hidden], pl.BF16]:
-            # ── Step 0: optional prefill + first decode + RMS + LM-head + sample ──
+            # ── Step 0: optional prefill + first fused decode + sample ─────────
             # pypto InOutUseDiscipline: once a variable is passed as Out/InOut,
             # its "post-call" return value must be used for all subsequent reads.
             # Convention used here:
-            #   out_d      — post-call decode_out    (updated by qwen3_decode_all)
-            #   out_rms    — post-call rms_normed    (returned by qwen3_rms_lmhead[0])
-            #   out_lm     — post-call logits_padded (returned by qwen3_rms_lmhead[1])
+            #   out_d      — post-call decode_out    (updated by qwen3_decode_all[0])
+            #   out_rms    — post-call rms_normed    (updated by qwen3_decode_all[1])
+            #   out_lm     — post-call logits_padded (updated by qwen3_decode_all[2])
             #   upd_hidden — post-call decode_hidden (updated by sample_and_prepare)
-            # qwen3_rms_lmhead returns (rms_normed, logits) as a pl.Tuple so that
-            # both Out params satisfy InOutUseDiscipline at the call site.
+            # qwen3_decode_all is fused with final-RMS + LM-head and returns
+            # (decode_out, rms_normed, logits_padded) as a pl.Tuple so all three
+            # Out params satisfy InOutUseDiscipline at the call site.
             if has_prefill:
                 self.qwen3_prefill_all(
                     prefill_hidden, prefill_seq_lens,
@@ -1540,7 +1467,7 @@ def build_qwen3_14b_l3_generate_program(
                     w_gate, w_up, w_down,
                     prefill_out,
                 )
-            out_d = self.qwen3_decode_all(
+            out_d, out_rms, out_lm = self.qwen3_decode_all(
                 decode_hidden,
                 input_rms_weight, wq, wk, wv,
                 q_norm_weight, k_norm_weight,
@@ -1549,10 +1476,8 @@ def build_qwen3_14b_l3_generate_program(
                 k_cache_all, v_cache_all,
                 wo, post_rms_weight,
                 w_gate, w_up, w_down,
-                decode_out,
-            )
-            out_rms, out_lm = self.qwen3_rms_lmhead(
-                rms_x, final_norm_weight, lm_head_weight_t, rms_normed, logits_padded
+                final_norm_weight, lm_head_weight_t,
+                decode_out, rms_normed, logits_padded,
             )
             # sample_and_prepare returns the updated decode_hidden (upd_hidden).
             # All subsequent decode_all calls use upd_hidden (not decode_hidden)
@@ -1573,12 +1498,11 @@ def build_qwen3_14b_l3_generate_program(
             # InOutUseDiscipline: each iteration reads the previous Out return
             # value and passes it as the next Out argument.
             # RAW chain per step:
-            #   decode_N     (writes out_d)
-            #   → rms_lmhead_N (reads rms_x, returns out_rms + out_lm)
-            #   → sample_N     (reads out_lm, writes upd_hidden)
-            #   → decode_{N+1} (reads upd_hidden) [explicit RAW dependency]
+            #   decode_N        (writes out_d + out_rms + out_lm)
+            #   → sample_N      (reads out_lm, writes upd_hidden)
+            #   → decode_{N+1}  (reads upd_hidden) [explicit RAW dependency]
             for _ in pl.range(max_new_tokens - 1):
-                out_d = self.qwen3_decode_all(
+                out_d, out_rms, out_lm = self.qwen3_decode_all(
                     upd_hidden,
                     input_rms_weight, wq, wk, wv,
                     q_norm_weight, k_norm_weight,
@@ -1587,10 +1511,8 @@ def build_qwen3_14b_l3_generate_program(
                     k_cache_all, v_cache_all,
                     wo, post_rms_weight,
                     w_gate, w_up, w_down,
-                    out_d,
-                )
-                out_rms, out_lm = self.qwen3_rms_lmhead(
-                    rms_x, final_norm_weight, lm_head_weight_t, out_rms, out_lm
+                    final_norm_weight, lm_head_weight_t,
+                    out_d, out_rms, out_lm,
                 )
                 upd_hidden = self.sample_and_prepare(
                     out_lm, decode_seq_lens, decode_slot_mapping, upd_hidden,
