@@ -168,10 +168,10 @@ def build_qwen3_decode_program():
                 ctx_len = pl.read(seq_lens, [b])
                 pos = ctx_len - 1
                 ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
-                cos_lo = rope_cos[pos, 0 : HALF_DIM]
-                cos_hi = rope_cos[pos, HALF_DIM : HEAD_DIM]
-                sin_lo = rope_sin[pos, 0 : HALF_DIM]
-                sin_hi = rope_sin[pos, HALF_DIM : HEAD_DIM]
+                cos_lo = rope_cos[pos : pos + 1, 0 : HALF_DIM]
+                cos_hi = rope_cos[pos : pos + 1, HALF_DIM : HEAD_DIM]
+                sin_lo = rope_sin[pos : pos + 1, 0 : HALF_DIM]
+                sin_hi = rope_sin[pos : pos + 1, HALF_DIM : HEAD_DIM]
 
                 # Stage 1: K RoPE + cache update + V cache + Q RoPE + pad.
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_kv_cache"):
