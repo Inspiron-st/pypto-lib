@@ -387,7 +387,7 @@ def build_tensor_specs(layer_id=0):
 if __name__ == "__main__":
     import argparse
     import torch
-    from golden import RunConfig, data_compare, run_jit
+    from golden import RunConfig, ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3sim",
@@ -413,7 +413,7 @@ if __name__ == "__main__":
                 enable_l2_swimlane=args.enable_l2_swimlane,
             ),
             compare_fn={
-                "x_next": data_compare(diff_thd=0.01, pct_thd=0.05),
+                "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
             },
         ),
     )

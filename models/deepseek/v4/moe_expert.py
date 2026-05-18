@@ -460,7 +460,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, data_compare, run_jit
+    from golden import RunConfig, ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -481,8 +481,8 @@ if __name__ == "__main__":
                 device_id=args.device,
             ),
             compare_fn={
-                "recv_y": data_compare(diff_thd=0.01, pct_thd=0.05),
-                "sh": data_compare(diff_thd=0.01, pct_thd=0.05),
+                "recv_y": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+                "sh": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
             },
         ),
     )

@@ -108,68 +108,6 @@ def validate_golden(
         )
 
 
-def bf16_allclose_or_ulp(max_ulp: int = 1) -> Callable:
-    """Return a BF16 comparator that allows a bounded ULP difference.
-
-    The comparator first applies the normal ``torch.isclose`` tolerance. Values
-    outside that tolerance are accepted only when their raw BF16 encodings differ
-    by at most ``max_ulp``.
-    """
-    if max_ulp < 0:
-        raise ValueError(f"max_ulp must be non-negative, got {max_ulp}")
-
-    def cmp(
-        actual: torch.Tensor,
-        expected: torch.Tensor,
-        *,
-        actual_outputs: dict[str, torch.Tensor],
-        expected_outputs: dict[str, torch.Tensor],
-        inputs: dict[str, torch.Tensor],
-        rtol: float,
-        atol: float,
-    ) -> tuple[bool, str]:
-        if actual.dtype != torch.bfloat16 or expected.dtype != torch.bfloat16:
-            return False, (
-                f"    bf16_allclose_or_ulp requires BF16 tensors, "
-                f"got actual={actual.dtype} expected={expected.dtype}"
-            )
-
-        actual_f = actual.cpu().to(torch.float32)
-        expected_f = expected.cpu().to(torch.float32)
-        close_mask = torch.isclose(actual_f, expected_f, rtol=rtol, atol=atol)
-        finite_mask = torch.isfinite(actual_f) & torch.isfinite(expected_f)
-
-        actual_bits = actual.cpu().contiguous().view(torch.int16).to(torch.int32)
-        expected_bits = expected.cpu().contiguous().view(torch.int16).to(torch.int32)
-        ulp_diff = torch.abs(actual_bits - expected_bits)
-        ok_mask = close_mask | (finite_mask & (ulp_diff <= max_ulp))
-        if bool(ok_mask.all()):
-            return True, ""
-
-        mismatch_indices = torch.where(~ok_mask.flatten())[0]
-        flat_actual = actual_f.flatten()
-        flat_expected = expected_f.flatten()
-        flat_ulp = ulp_diff.flatten()
-        n_show = min(20, mismatch_indices.numel())
-        idx = mismatch_indices[:n_show]
-        lines = [
-            (
-                f"    [{i.item()}] actual={flat_actual[i].item()}, "
-                f"expected={flat_expected[i].item()}, ulp_diff={flat_ulp[i].item()}"
-            )
-            for i in idx
-        ]
-        detail = (
-            f"    Mismatched elements after {max_ulp}-ULP allowance: "
-            f"{mismatch_indices.numel()}/{actual.numel()}  rtol={rtol} atol={atol}\n"
-            f"    first {n_show} mismatches:\n" + "\n".join(lines)
-        )
-        return False, detail
-
-    cmp.__name__ = f"bf16_allclose_or_ulp(max_ulp={max_ulp})"
-    return cmp
-
-
 def topk_pair_compare(vals_name: str) -> Callable:
     """Return a comparator for top-k outputs that is robust to score ties.
 
@@ -253,6 +191,8 @@ def ratio_allclose(
     stays within a tight per-point tolerance.
 
     NaN / Inf in ``actual`` always fail (hard check, independent of the ratio).
+
+    Upstream reference: ``compare()`` in cann-recipes-infer ``ops/pypto_python/example/compare.py``.
 
     Args:
         atol: Absolute tolerance. If ``None``, falls back to ``validate_golden``'s atol.
@@ -341,7 +281,7 @@ def ratio_allclose(
     return cmp
 
 
-def data_compare(
+def ratio_reldiff(
     diff_thd: float = 0.01,
     pct_thd: float = 0.05,
     max_diff_hd: float = float("inf"),
@@ -361,6 +301,8 @@ def data_compare(
     The denominator floor ``(1 / 2^14) / diff_thd`` keeps rdiff well-defined
     for near-zero values (capped via the ``a < diff_thd`` early-return).
     NaN / Inf in ``actual`` always fail.
+
+    Upstream reference: ``data_compare()`` in cann-recipes-infer.
 
     Args:
         diff_thd: Per-point relative-difference threshold.
@@ -448,13 +390,13 @@ def data_compare(
                 f"worst rdiff={worst_rdiff:.4g} >= max_diff_hd={max_diff_hd:.4g}"
             )
         return False, (
-            f"    data_compare fail: {' AND '.join(reasons)}\n"
+            f"    ratio_reldiff fail: {' AND '.join(reasons)}\n"
             f"    diff_thd={diff_thd} pct_thd={pct_thd} max_diff_hd={max_diff_hd}\n"
             f"    first {n_show} mismatches:\n" + "\n".join(lines)
         )
 
     cmp.__name__ = (
-        f"data_compare(diff_thd={diff_thd}, pct_thd={pct_thd}, "
+        f"ratio_reldiff(diff_thd={diff_thd}, pct_thd={pct_thd}, "
         f"max_diff_hd={max_diff_hd})"
     )
     return cmp

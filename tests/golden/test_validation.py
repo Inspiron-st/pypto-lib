@@ -12,7 +12,7 @@
 import pytest
 
 import torch
-from golden.validation import bf16_allclose_or_ulp, topk_pair_compare, validate_golden
+from golden.validation import ratio_allclose, ratio_reldiff, topk_pair_compare, validate_golden
 
 
 class TestValidateGolden:
@@ -191,69 +191,6 @@ class TestCompareFnDispatch:
         validate_golden({"a": ok}, {"a": ok.clone()})
 
 
-class TestBf16AllcloseOrUlp:
-    """Tests for the BF16 ULP comparator helper."""
-
-    def test_default_one_ulp_passes(self):
-        """Adjacent BF16 values pass even when normal tolerance fails."""
-        actual = torch.tensor([1.0078125], dtype=torch.bfloat16)
-        expected = torch.tensor([1.0], dtype=torch.bfloat16)
-        validate_golden(
-            {"out": actual},
-            {"out": expected},
-            rtol=0.0,
-            atol=0.0,
-            compare_fn={"out": bf16_allclose_or_ulp()},
-        )
-
-    def test_max_ulp_parameter_controls_allowance(self):
-        """A two-ULP difference fails with max_ulp=1 and passes with max_ulp=2."""
-        actual = torch.tensor([1.015625], dtype=torch.bfloat16)
-        expected = torch.tensor([1.0], dtype=torch.bfloat16)
-        with pytest.raises(AssertionError, match="after 1-ULP allowance"):
-            validate_golden(
-                {"out": actual},
-                {"out": expected},
-                rtol=0.0,
-                atol=0.0,
-                compare_fn={"out": bf16_allclose_or_ulp(max_ulp=1)},
-            )
-        validate_golden(
-            {"out": actual},
-            {"out": expected},
-            rtol=0.0,
-            atol=0.0,
-            compare_fn={"out": bf16_allclose_or_ulp(max_ulp=2)},
-        )
-
-    def test_non_bf16_tensors_fail_with_clear_message(self):
-        """The helper is only for BF16 tensors."""
-        actual = torch.tensor([1.0], dtype=torch.float32)
-        expected = torch.tensor([1.0], dtype=torch.float32)
-        with pytest.raises(AssertionError, match="requires BF16 tensors"):
-            validate_golden(
-                {"out": actual},
-                {"out": expected},
-                compare_fn={"out": bf16_allclose_or_ulp()},
-            )
-
-    def test_nan_values_do_not_pass_via_ulp_fallback(self):
-        """NaN bit patterns should not bypass torch.isclose semantics."""
-        actual = torch.tensor([float("nan")], dtype=torch.bfloat16)
-        expected = torch.tensor([float("nan")], dtype=torch.bfloat16)
-        with pytest.raises(AssertionError, match="after 1-ULP allowance"):
-            validate_golden(
-                {"out": actual},
-                {"out": expected},
-                compare_fn={"out": bf16_allclose_or_ulp()},
-            )
-
-    def test_negative_max_ulp_rejected(self):
-        """Negative ULP allowance is invalid."""
-        with pytest.raises(ValueError, match="max_ulp must be non-negative"):
-            bf16_allclose_or_ulp(max_ulp=-1)
-
-
 class TestTopkPairCompare:
     """Tests for the topk_pair_compare helper."""
 
@@ -387,6 +324,153 @@ class TestTopkPairCompare:
             rtol=1e-3, atol=1e-3,
         )
         assert ok
+
+
+class TestRatioAllclose:
+    """Tests for the ratio_allclose comparator."""
+
+    @staticmethod
+    def _call(cmp, actual, expected, rtol=1e-5, atol=1e-5):
+        return cmp(
+            actual, expected,
+            actual_outputs={"out": actual},
+            expected_outputs={"out": expected},
+            inputs={},
+            rtol=rtol, atol=atol,
+        )
+
+    def test_within_tolerance_passes(self):
+        """All points within atol+rtol*|expected| pass."""
+        actual = torch.tensor([1.0, 2.0, 3.0])
+        expected = torch.tensor([1.001, 2.002, 3.003])
+        cmp = ratio_allclose(atol=1e-2, rtol=1e-2)
+        ok, _ = self._call(cmp, actual, expected)
+        assert ok
+
+    def test_outliers_within_ratio_pass(self):
+        """A small fraction of outliers is tolerated up to max_error_ratio."""
+        # 1 outlier out of 100 = 1% ; max_error_ratio=0.05 allows it.
+        actual = torch.zeros(100)
+        expected = torch.zeros(100)
+        actual[0] = 10.0  # one big outlier
+        cmp = ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.05)
+        ok, _ = self._call(cmp, actual, expected)
+        assert ok
+
+    def test_outliers_exceed_ratio_fail(self):
+        """Too many outliers fail and the message names ratio_allclose."""
+        actual = torch.zeros(100)
+        expected = torch.zeros(100)
+        actual[:10] = 10.0  # 10% outliers, threshold is 5%
+        cmp = ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.05)
+        ok, detail = self._call(cmp, actual, expected)
+        assert not ok
+        assert "ratio_allclose fail" in detail
+        assert "error_count=10/100" in detail
+
+    def test_nan_inf_in_actual_always_fails(self):
+        """NaN or Inf in actual is a hard fail, independent of ratio."""
+        cmp = ratio_allclose(atol=1.0, rtol=1.0, max_error_ratio=1.0)
+        actual = torch.tensor([float("nan"), 0.0])
+        expected = torch.tensor([0.0, 0.0])
+        ok, detail = self._call(cmp, actual, expected)
+        assert not ok
+        assert "illegal values" in detail and "NaN=1" in detail
+
+    def test_invalid_max_error_ratio_rejected(self):
+        """max_error_ratio outside [0, 1] raises at factory time."""
+        with pytest.raises(ValueError, match="max_error_ratio"):
+            ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=1.5)
+
+    def test_atol_rtol_override(self):
+        """Factory-supplied atol/rtol override validate_golden's defaults."""
+        # validate_golden defaults rtol=atol=1e-5 would fail this, but the
+        # comparator's own atol=1.0 should allow it.
+        actual = torch.tensor([1.0])
+        expected = torch.tensor([1.5])
+        cmp = ratio_allclose(atol=1.0, rtol=0.0)
+        ok, _ = self._call(cmp, actual, expected, rtol=1e-5, atol=1e-5)
+        assert ok
+
+
+class TestRatioReldiff:
+    """Tests for the ratio_reldiff comparator."""
+
+    @staticmethod
+    def _call(cmp, actual, expected):
+        return cmp(
+            actual, expected,
+            actual_outputs={"out": actual},
+            expected_outputs={"out": expected},
+            inputs={},
+            rtol=1e-5, atol=1e-5,
+        )
+
+    def test_within_thd_passes(self):
+        """Relative diff below diff_thd passes."""
+        actual = torch.tensor([100.0, 200.0])
+        expected = torch.tensor([100.5, 201.0])  # rel diff ~0.005
+        cmp = ratio_reldiff(diff_thd=0.01, pct_thd=0.0)
+        ok, _ = self._call(cmp, actual, expected)
+        assert ok
+
+    def test_small_abs_diff_shortcircuits(self):
+        """Points with |a-e|<diff_thd pass even with large relative diff (near zero)."""
+        # |a-e|=0.005 < diff_thd=0.01, but |a-e|/max(|a|,|e|) would be huge.
+        actual = torch.tensor([1e-6])
+        expected = torch.tensor([5e-3])
+        cmp = ratio_reldiff(diff_thd=0.01, pct_thd=0.0)
+        ok, _ = self._call(cmp, actual, expected)
+        assert ok
+
+    def test_outliers_exceed_pct_fail(self):
+        """Too many bad points fail; message names ratio_reldiff."""
+        actual = torch.full((100,), 100.0)
+        expected = torch.full((100,), 100.0)
+        actual[:10] = 200.0  # 10 bad points; pct_thd=0.05 allows 5
+        cmp = ratio_reldiff(diff_thd=0.01, pct_thd=0.05)
+        ok, detail = self._call(cmp, actual, expected)
+        assert not ok
+        assert "ratio_reldiff fail" in detail
+        assert "error_count=10/100" in detail
+
+    def test_max_diff_hd_caps_single_point(self):
+        """A single point exceeding max_diff_hd fails even when count is fine."""
+        actual = torch.full((100,), 100.0)
+        expected = torch.full((100,), 100.0)
+        actual[0] = 10000.0  # 1 bad point, rdiff ~0.99 > max_diff_hd=0.1
+        cmp = ratio_reldiff(diff_thd=0.01, pct_thd=0.05, max_diff_hd=0.1)
+        ok, detail = self._call(cmp, actual, expected)
+        assert not ok
+        assert "max_diff_hd" in detail
+
+    def test_symmetric_denominator(self):
+        """Denominator uses max(|a|,|e|): tolerates actual >> expected."""
+        # a=2, e=1: |a-e|/max(|a|,|e|) = 0.5 ; |a-e|/|e| would be 1.0.
+        # diff_thd=0.6 passes only under symmetric-max denominator.
+        actual = torch.tensor([2.0])
+        expected = torch.tensor([1.0])
+        cmp = ratio_reldiff(diff_thd=0.6, pct_thd=0.0)
+        ok, _ = self._call(cmp, actual, expected)
+        assert ok
+
+    def test_nan_inf_in_actual_always_fails(self):
+        """NaN/Inf in actual is a hard fail."""
+        cmp = ratio_reldiff(diff_thd=1.0, pct_thd=1.0)
+        actual = torch.tensor([float("inf"), 0.0])
+        expected = torch.tensor([0.0, 0.0])
+        ok, detail = self._call(cmp, actual, expected)
+        assert not ok
+        assert "illegal values" in detail and "Inf=1" in detail
+
+    def test_invalid_params_rejected(self):
+        """Out-of-range factory params raise immediately."""
+        with pytest.raises(ValueError, match="diff_thd"):
+            ratio_reldiff(diff_thd=0.0)
+        with pytest.raises(ValueError, match="pct_thd"):
+            ratio_reldiff(diff_thd=0.01, pct_thd=1.5)
+        with pytest.raises(ValueError, match="max_diff_hd"):
+            ratio_reldiff(diff_thd=0.01, max_diff_hd=0.0)
 
 
 if __name__ == "__main__":
