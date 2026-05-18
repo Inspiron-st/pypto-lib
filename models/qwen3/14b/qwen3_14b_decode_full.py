@@ -73,7 +73,7 @@ SB_BATCH = 64
 BLOCK_SIZE = SEQ_TILE
 
 # Scope 3 tiling constants.
-K_CHUNK = 128
+K_CHUNK = 256
 MLP_OUT_CHUNK = 256
 
 
