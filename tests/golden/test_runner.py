@@ -620,6 +620,7 @@ class TestScalarMixedSpecs:
             r = run(program=object(), specs=mixed_specs, golden_fn=golden_fn)
 
         assert r.passed, f"unexpected failure: {r.error}"
+        assert r.work_dir == compiled_dir
         # Spec order: x (input tensor), alpha (scalar), y (output tensor)
         assert isinstance(observed["arg0"], torch.Tensor)
         assert isinstance(observed["arg1"], ctypes.c_float)

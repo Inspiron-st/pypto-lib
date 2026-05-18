@@ -33,6 +33,7 @@ result = run(
 | `-p` / `--platform` | Target backend. `a2a3` is Ascend 910B/C; `a5` is Ascend 950 — both run on real NPU. `a2a3sim` / `a5sim` are the matching simulators. |
 | `-d` / `--device` | Device ID for multi-card hosts. |
 | `--enable-l2-swimlane` | Forwarded to the runtime; collects per-task L2 perf records into the build_output (see [Runtime DFX flags](#runtime-dfx-flags)). |
+| `--export-kernel-insight` | Qwen3-14B decode helper: after a successful run, invokes `tools/export_all_kernel_insight.py` for the generated kernels and writes Insight exports under the same `build_output/<ProgramName>_<ts>/`. |
 
 `a2a3*` maps to `BackendType.Ascend910B`; `a5*` maps to
 `BackendType.Ascend950`.
@@ -174,6 +175,19 @@ For L2 swimlane: open the generated `merged_swimlane_*.json` at
 [ui.perfetto.dev](https://ui.perfetto.dev/) to visualize per-task
 execution on each AICPU / AIC / AIV lane and inspect kernel duration,
 gaps, and dependency stalls.
+
+For kernel-internal swimlane / MindStudio Insight traces, use the repo tool
+directly on an existing build:
+
+```bash
+python tools/export_all_kernel_insight.py --build-dir build_output/<ProgramName>_<ts>
+```
+
+or, for `models/qwen3/14b/qwen3_14b_decode.py`, append
+`--export-kernel-insight` to the normal run. The export root is written under
+`build_output/<ProgramName>_<ts>/kernel_insight_all_funcs_<ts>/`, and the build
+directory also gets `latest_all_funcs_kernel_insight_export_root.txt` pointing
+at the latest export.
 
 See pypto's `docs/en/dev/03-runtime-dfx.md` and the simpler reference at
 `runtime/docs/dfx/{l2-swimlane,tensor-dump,pmu-profiling,dep_gen}.md` for

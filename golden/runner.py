@@ -60,6 +60,7 @@ class RunResult:
     passed: bool
     error: str | None = None
     execution_time: float | None = None
+    work_dir: Path | None = None
 
     def __str__(self) -> str:
         time_str = f" ({self.execution_time:.2f}s)" if self.execution_time is not None else ""
@@ -217,8 +218,15 @@ def run(
     start = time.time()
     _stage = _Stage  # local alias so the with-statement reads `_stage(...)`
 
+    work_dir: Path | None = None
+
     def _fail(error: str) -> RunResult:
-        return RunResult(passed=False, error=error, execution_time=time.time() - start)
+        return RunResult(
+            passed=False,
+            error=error,
+            execution_time=time.time() - start,
+            work_dir=work_dir,
+        )
 
     # Compile
     if runtime_dir is not None:
@@ -235,13 +243,12 @@ def run(
             if platform is not None:
                 compile_kwargs.setdefault("backend_type", _backend_for_platform(platform))
             compiled = ir.compile(program, **compile_kwargs)
+            work_dir = Path(compiled.output_dir)
 
         if config.compile_only:
             total = time.time() - start
             print(f"[RUN] PASS ({total:.2f}s)", flush=True)
-            return RunResult(passed=True, execution_time=total)
-
-        work_dir = compiled.output_dir
+            return RunResult(passed=True, execution_time=total, work_dir=work_dir)
 
     # Generate Inputs
     input_snapshot: dict[str, torch.Tensor] = {}
@@ -350,7 +357,7 @@ def run(
     if golden_fn is None and golden_data is None:
         total = time.time() - start
         print(f"[RUN] PASS ({total:.2f}s, validation skipped: no golden_fn or golden_data)", flush=True)
-        return RunResult(passed=True, execution_time=total)
+        return RunResult(passed=True, execution_time=total, work_dir=work_dir)
 
     device_outputs = {spec.name: tensors[spec.name] for spec in tensor_specs if spec.is_output}
 
@@ -390,7 +397,7 @@ def run(
 
     total = time.time() - start
     print(f"[RUN] PASS ({total:.2f}s)", flush=True)
-    return RunResult(passed=True, execution_time=total)
+    return RunResult(passed=True, execution_time=total, work_dir=work_dir)
 
 
 def _resolve_jit_work_dir(fn: Any) -> Path:
@@ -497,8 +504,15 @@ def run_jit(
     start = time.time()
     _stage = _Stage
 
+    work_dir: Path | None = None
+
     def _fail(error: str) -> RunResult:
-        return RunResult(passed=False, error=error, execution_time=time.time() - start)
+        return RunResult(
+            passed=False,
+            error=error,
+            execution_time=time.time() - start,
+            work_dir=work_dir,
+        )
 
     # Compile (or pick runtime_dir) — done first so stage order matches run().
     # We feed JIT a set of zero-cost dummy tensors derived from the specs, just
@@ -531,7 +545,7 @@ def run_jit(
     if config.compile_only:
         total = time.time() - start
         print(f"[RUN] PASS ({total:.2f}s)", flush=True)
-        return RunResult(passed=True, execution_time=total)
+        return RunResult(passed=True, execution_time=total, work_dir=work_dir)
 
     # Generate Inputs
     input_snapshot: dict[str, torch.Tensor] = {}
@@ -615,7 +629,7 @@ def run_jit(
             f"[RUN] PASS ({total:.2f}s, validation skipped: no golden_fn or golden_data)",
             flush=True,
         )
-        return RunResult(passed=True, execution_time=total)
+        return RunResult(passed=True, execution_time=total, work_dir=work_dir)
 
     device_outputs = {spec.name: tensors[spec.name] for spec in tensor_specs if spec.is_output}
 
@@ -657,4 +671,4 @@ def run_jit(
 
     total = time.time() - start
     print(f"[RUN] PASS ({total:.2f}s)", flush=True)
-    return RunResult(passed=True, execution_time=total)
+    return RunResult(passed=True, execution_time=total, work_dir=work_dir)
