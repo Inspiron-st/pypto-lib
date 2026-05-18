@@ -37,10 +37,14 @@ COFF = 1 + int(OVERLAP)
 OUT_DIM = COFF * HEAD_DIM
 STATE_LEN = COFF * COMPRESS_RATIO
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
-START_POS = 3        # ScalarSpec default; (START_POS+1)%COMPRESS_RATIO==0
-SHOULD_COMPRESS = COMPRESS_RATIO != 0 and ((START_POS + 1) % COMPRESS_RATIO) == 0
+START_POS = COMPRESS_RATIO - S       # ScalarSpec default; (START_POS+S)%COMPRESS_RATIO==0
+SHOULD_COMPRESS = COMPRESS_RATIO != 0 and ((START_POS + S) % COMPRESS_RATIO) == 0
 APE_ROW = START_POS % COMPRESS_RATIO if COMPRESS_RATIO != 0 else 0
 SCATTER_SLOT = (COMPRESS_RATIO + APE_ROW) if OVERLAP else APE_ROW
+# S-aware decode contract: each call writes S consecutive tokens to state slots
+# [SCATTER_SLOT, SCATTER_SLOT + S). ape_row + S must not exceed COMPRESS_RATIO,
+# i.e. start_pos must be aligned so the S tokens fall in a single window. For
+# even-step decode (start_pos += S), this holds when S divides COMPRESS_RATIO.
 
 # tiling
 ROPE_CHUCK = 32
@@ -76,12 +80,15 @@ def compressor(
     kv_proj = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
     score_proj = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
     ape_row = pl.cast(start_pos % COMPRESS_RATIO, target_type=pl.INDEX)
-    compress_rem = (start_pos + 1) % COMPRESS_RATIO
-    score_ape = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
+    compress_rem = (start_pos + S) % COMPRESS_RATIO
     scatter_slot = COMPRESS_RATIO + ape_row
-    state_col0 = scatter_slot * OUT_DIM
     kv_state_flat = pl.reshape(kv_state, [B, STATE_LEN * OUT_DIM])
     score_state_flat = pl.reshape(score_state, [B, STATE_LEN * OUT_DIM])
+
+    # 3D views (read-only) for per-token slicing of the projection outputs.
+    kv_proj_3d = pl.reshape(kv_proj, [B, S, OUT_DIM])
+    score_proj_3d = pl.reshape(score_proj, [B, S, OUT_DIM])
+
     for o0 in pl.parallel(0, OUT_DIM, OUT_CHUNK):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_score_proj"):
             x_tile = x_flat[:, 0 : K_CHUNK]
@@ -100,21 +107,25 @@ def compressor(
             kv_proj = pl.assemble(kv_proj, kv_acc, [0, o0])
             score_proj = pl.assemble(score_proj, score_acc, [0, o0])
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="score_ape"):
-            score_tile = score_proj[:, o0 : o0 + OUT_CHUNK]
-            ape_tile = ape[ape_row : ape_row + 1, o0 : o0 + OUT_CHUNK]
-            ape_base = pl.full([B * S, OUT_CHUNK], dtype=pl.FP32, value=0.0)
-            score_tile = pl.add(score_tile, pl.col_expand(ape_base, ape_tile))
-            score_ape = pl.assemble(score_ape, score_tile, [0, o0])
+        # Per-token: read 3D slice, add ape, write directly to state slot s.
+        for s in pl.range(S):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter"):
+                kv_tile = pl.reshape(kv_proj_3d[:, s : s + 1, o0 : o0 + OUT_CHUNK], [B, OUT_CHUNK])
+                score_tile = pl.reshape(score_proj_3d[:, s : s + 1, o0 : o0 + OUT_CHUNK], [B, OUT_CHUNK])
+                ape_tile = ape[ape_row + s : ape_row + s + 1, o0 : o0 + OUT_CHUNK]
+                ape_base = pl.full([B, OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                score_tile = pl.add(score_tile, pl.col_expand(ape_base, ape_tile))
+                slot_col0_s = (scatter_slot + s) * OUT_DIM
+                kv_state_flat = pl.assemble(kv_state_flat, kv_tile, [0, slot_col0_s + o0])
+                score_state_flat = pl.assemble(score_state_flat, score_tile, [0, slot_col0_s + o0])
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter"):
-            kv_tile = kv_proj[:, o0 : o0 + OUT_CHUNK]
-            score_tile = score_ape[:, o0 : o0 + OUT_CHUNK]
-            kv_state_flat = pl.assemble(kv_state_flat, kv_tile, [0, state_col0 + o0])
-            score_state_flat = pl.assemble(score_state_flat, score_tile, [0, state_col0 + o0])
-
-    pooled_kv = pl.create_tensor([B * S, HEAD_DIM], dtype=pl.FP32)
-    normed_kv = pl.create_tensor([B * S, HEAD_DIM], dtype=pl.BF16)
+    # Pool / norm / rope buffers are per-batch (one compressed kv per batch when
+    # compression fires); kv output is still [B, S, HEAD_DIM] with only the
+    # b,0,: row populated, matching attention_csa's read of cmp_out[b, 0, :].
+    # kv_flat = reshape(kv, [B*S, HEAD_DIM]) maps kv[b, s, :] -> row b*S + s.
+    pooled_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
+    normed_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.BF16)
+    kv_final = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
     kv_flat = pl.reshape(kv, [B * S, HEAD_DIM])
 
     if compress_rem == 0:
@@ -168,7 +179,7 @@ def compressor(
 
         norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm"):
-            partial_sq = pl.full([1, B * S], dtype=pl.FP32, value=0.0)
+            partial_sq = pl.full([1, B], dtype=pl.FP32, value=0.0)
             for k0 in pl.range(0, HEAD_DIM, HEAD_CHUNK):
                 # Golden applies rmsnorm to kv.to(torch.bfloat16), then casts to FP32 inside rmsnorm.
                 kv_rms_chunk = pl.cast(
@@ -177,10 +188,10 @@ def compressor(
                 )
                 partial_sq = pl.add(
                     partial_sq,
-                    pl.reshape(pl.row_sum(pl.mul(kv_rms_chunk, kv_rms_chunk)), [1, B * S]),
+                    pl.reshape(pl.row_sum(pl.mul(kv_rms_chunk, kv_rms_chunk)), [1, B]),
                 )
 
-            variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [B * S, 1])
+            variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [B, 1])
             inv_rms = pl.recip(pl.sqrt(variance))
             for k0 in pl.range(0, HEAD_DIM, HEAD_CHUNK):
                 kv_norm_chunk = pl.cast(
@@ -191,11 +202,11 @@ def compressor(
                 normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
                 normed_kv = pl.assemble(normed_kv, pl.cast(normed_chunk, target_type=pl.BF16, mode="rint"), [0, k0])
 
-        kv_rope = pl.create_tensor([B * S, ROPE_HEAD_DIM], dtype=pl.BF16)
-        kv_proj_even = pl.create_tensor([B * S, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-        kv_proj_odd = pl.create_tensor([B * S, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-        rope_even = pl.create_tensor([B * S, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
-        rope_odd = pl.create_tensor([B * S, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
+        kv_rope = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.BF16)
+        kv_proj_even = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+        kv_proj_odd = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+        rope_even = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
+        rope_odd = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_rope_slice"):
             kv_rope = pl.assemble(kv_rope, normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM], [0, 0])
@@ -243,26 +254,36 @@ def compressor(
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_write"):
             normed_kv = pl.assemble(normed_kv, pl.cast(rope_acc, target_type=pl.BF16, mode="rint"), [0, NOPE_HEAD_DIM])
 
+        # Build a [B, HEAD_DIM] FP32 kv_final tile (hadamard-rotated or plain).
         if rotate:
             for o0 in pl.range(0, HEAD_DIM, OUT_CHUNK):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_hadamard"):
                     kv_proj_tile = normed_kv[:, 0 : HEAD_DIM]
                     hadamard_tile = hadamard[0 : HEAD_DIM, o0 : o0 + OUT_CHUNK]
                     kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
-                    kv_flat = pl.assemble(kv_flat, kv_hadamard_acc, [0, o0])
+                    kv_final = pl.assemble(kv_final, kv_hadamard_acc, [0, o0])
         else:
             for o0 in pl.parallel(0, HEAD_DIM, OUT_CHUNK):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_write"):
                     kv_out_tile = normed_kv[:, o0 : o0 + OUT_CHUNK]
-                    kv_flat = pl.assemble(kv_flat, pl.cast(kv_out_tile, target_type=pl.FP32), [0, o0])
+                    kv_final = pl.assemble(kv_final, pl.cast(kv_out_tile, target_type=pl.FP32), [0, o0])
 
+        # Per-batch fan-out: write kv_final[b] to kv[b, 0, :] (row b*S of kv_flat)
+        # and to kv_cache[b, cache_col, :]. With S>=2, kv[b, 1:, :] stays at its
+        # initial value (zero-init in the test fixture; garbage on hot path —
+        # downstream attention only reads kv[b, 0, :]).
         kv_cache_flat = pl.reshape(kv_cache, [B * IDX_KV_LEN, HEAD_DIM])
         cache_col = start_pos // COMPRESS_RATIO
         for b_idx in pl.parallel(B):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_cache_write"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_and_cache_write"):
+                kv_row_fp32 = kv_final[b_idx : b_idx + 1, 0 : HEAD_DIM]
+                kv_flat = pl.assemble(kv_flat, kv_row_fp32, [b_idx * S, 0])
                 cache_row = b_idx * IDX_KV_LEN + cache_col
-                cache_kv_row = kv_flat[b_idx : b_idx + 1, 0 : HEAD_DIM]
-                kv_cache_flat = pl.assemble(kv_cache_flat, pl.cast(cache_kv_row, target_type=pl.BF16, mode="rint"), [cache_row, 0])
+                kv_cache_flat = pl.assemble(
+                    kv_cache_flat,
+                    pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint"),
+                    [cache_row, 0],
+                )
         kv_cache = pl.reshape(kv_cache_flat, [B, IDX_KV_LEN, HEAD_DIM])
 
     kv_state = pl.reshape(kv_state_flat, [B, STATE_LEN, OUT_DIM])
@@ -316,18 +337,22 @@ def golden_compressor(tensors):
     bsz, _, _ = x.shape
     ratio, d, rd = COMPRESS_RATIO, hadamard.shape[0], tensors["even_select"].shape[0]
 
-    kv = x @ wkv
-    score = x @ wgate
+    kv = x @ wkv                        # [B, S, OUT_DIM]
+    score = x @ wgate                   # [B, S, OUT_DIM]
 
-    should_compress = (start_pos + 1) % ratio == 0
-    score = score + ape[start_pos % ratio]
+    should_compress = (start_pos + S) % ratio == 0
 
-    kv_state[:bsz, ratio + start_pos % ratio] = kv.squeeze(1)
-    score_state[:bsz, ratio + start_pos % ratio] = score.squeeze(1)
+    # Per-token ape add + state scatter; tokens [s] go to slot (ratio + ape_row + s).
+    ape_row_g = start_pos % ratio
+    for s in range(S):
+        score[:, s, :] = score[:, s, :] + ape[ape_row_g + s]
+        kv_state[:bsz, ratio + ape_row_g + s] = kv[:, s, :]
+        score_state[:bsz, ratio + ape_row_g + s] = score[:, s, :]
+
     if should_compress:
         kvs = torch.cat([kv_state[:bsz, :ratio, :d], kv_state[:bsz, ratio:, d:]], dim=1)
         scs = torch.cat([score_state[:bsz, :ratio, :d], score_state[:bsz, ratio:, d:]], dim=1)
-        kv = (kvs * scs.softmax(dim=1)).sum(dim=1, keepdim=True)
+        kv = (kvs * scs.softmax(dim=1)).sum(dim=1, keepdim=True)   # [B, 1, HEAD_DIM]
         kv_state[:bsz, :ratio] = kv_state[:bsz, ratio:]
         score_state[:bsz, :ratio] = score_state[:bsz, ratio:]
 
@@ -355,7 +380,9 @@ def golden_compressor(tensors):
 
     if rotate:
         kv = kv @ hadamard
-    tensors["kv"][:] = kv
+    # Kernel writes pooled result only to kv[:, 0, :]; leave kv[:, 1:, :] = 0
+    # so the golden matches its [B, S, HEAD_DIM] zero-init.
+    tensors["kv"][:, 0:1, :] = kv
 
     kv_cache[:bsz, start_pos // ratio] = kv.squeeze(1)
 

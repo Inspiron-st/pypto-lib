@@ -11,7 +11,7 @@ Composes ``attention_hca`` (hc_pre + qkv_proj + main compressor + sparse_attn + 
 with the MoE stack, matching ``Block.forward`` (model.py:688-700) for layers whose
 ``compress_ratio == 128`` (e.g. layers 3/5 in the demo). Inherits the HCA
 caller contract: runtime ``start_pos`` MUST equal compile-time ``START_POS``
-AND ``(START_POS + 1) % COMPRESS_RATIO`` MUST be 0 — see attention_hca.py."""
+AND ``(START_POS + S) % COMPRESS_RATIO`` MUST be 0 — see attention_hca.py."""
 
 
 import pypto.language as pl
@@ -60,13 +60,13 @@ CMP_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
 SPARSE_IDX_TOPK = M.index_topk
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
-START_POS = 127
+START_POS = COMPRESS_RATIO - S       # (START_POS + S) % COMPRESS_RATIO == 0 triggers compression
 
 # Caller contract — same as attention_hca.py.
-SHOULD_COMPRESS = COMPRESS_RATIO != 0 and ((START_POS + 1) % COMPRESS_RATIO) == 0
+SHOULD_COMPRESS = COMPRESS_RATIO != 0 and ((START_POS + S) % COMPRESS_RATIO) == 0
 assert SHOULD_COMPRESS, (
-    f"Test fixture: START_POS={START_POS}, COMPRESS_RATIO={COMPRESS_RATIO}; "
-    "need (START_POS+1) % COMPRESS_RATIO == 0."
+    f"Test fixture: START_POS={START_POS}, COMPRESS_RATIO={COMPRESS_RATIO}, S={S}; "
+    "need (START_POS+S) % COMPRESS_RATIO == 0."
 )
 
 Q_PROJ_OUT_CHUNK = 128

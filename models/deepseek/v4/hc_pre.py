@@ -35,7 +35,7 @@ NEG_INF          = -1e20
 
 # tiling
 T_TILE           = 16
-K_CHUNK          = 256 if T >= 64 else 512
+K_CHUNK          = 128 if T >= 128 else (256 if T >= 64 else 512)
 D_CHUNK          = 512
 HC_DIM_BLOCKS    = HC_DIM // K_CHUNK
 D_BLOCKS         = D // D_CHUNK

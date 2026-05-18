@@ -158,16 +158,18 @@ def attention_swa(
 
     kv_cache_flat = pl.reshape(kv_cache, [BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     block_table_flat = pl.reshape(block_table, [B * MAX_BLOCKS])
-    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="swa_scatter_kv"):
-        ori_slot = start_pos % WIN
-        for b in pl.parallel(0, B, 1, chunk=16):
-            blk_id = pl.cast(pl.read(block_table_flat, [b]), pl.INDEX)
-            dst_row = blk_id * BLOCK_SIZE + ori_slot
-            kv_cache_flat = pl.assemble(
-                kv_cache_flat,
-                kv[b:b + 1, 0:HEAD_DIM],
-                [dst_row, 0],
-            )
+    # Per-batch per-token KV scatter: token s of batch b -> slot (start_pos + s) % WIN.
+    for s_idx in pl.range(S):
+        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="swa_scatter_kv"):
+            ori_slot = (start_pos + s_idx) % WIN
+            for b in pl.parallel(0, B, 1, chunk=16):
+                blk_id = pl.cast(pl.read(block_table_flat, [b]), pl.INDEX)
+                dst_row = blk_id * BLOCK_SIZE + ori_slot
+                kv_cache_flat = pl.assemble(
+                    kv_cache_flat,
+                    kv[b * S + s_idx : b * S + s_idx + 1, 0:HEAD_DIM],
+                    [dst_row, 0],
+                )
     kv_cache = pl.reshape(kv_cache_flat, [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
 
     sparse_topk = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
@@ -338,14 +340,17 @@ def golden_attention_swa(tensors):
     topk_idxs = torch.full((T, TOPK), -1, dtype=torch.int32)
     topk_idxs[:, :win] = torch.arange(win, dtype=torch.int32)
 
-    # ori_kv scatter (model.py:530)
+    # ori_kv scatter (model.py:530) — per-batch per-token: token s of batch b
+    # goes to slot (start_pos + s) % win.
     kv_cache = tensors["kv_cache"]
     block_table = tensors["block_table"]
-    ori_slot = start_pos % win
-    for b in range(B):
+    for t in range(T):
+        b = t // S
+        s = t % S
+        ori_slot = (start_pos + s) % win
         blk_id = int(block_table[b, ori_slot // BLOCK_SIZE].item())
         intra = ori_slot % BLOCK_SIZE
-        kv_cache[blk_id, intra, 0] = kv[b]
+        kv_cache[blk_id, intra, 0] = kv[t]
 
     # sparse_attn (model.py:533); window-only uses the full sparse_attn topk contract with an empty cmp tail.
     sparse_topk = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
@@ -471,7 +476,7 @@ def build_tensor_specs():
     def init_attn_sink():
         return torch.zeros(H)
     def init_seqused_kv():
-        return torch.full((B,), min(WIN, START_POS + 1), dtype=torch.int32)
+        return torch.full((B,), min(WIN, START_POS + S), dtype=torch.int32)
     def init_wo_a():
         return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
     def init_wo_b():

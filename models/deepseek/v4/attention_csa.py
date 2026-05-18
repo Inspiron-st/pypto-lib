@@ -104,7 +104,7 @@ ROTATE_INNER = True
 # Keep the default fixture on a full-window compression step so sparse_attn
 # exercises both the window and compressed paths. Warmup positions before the
 # first compressed slot are also supported when START_POS is lowered.
-START_POS = 127
+START_POS = 126      # (START_POS + S) % COMPRESS_RATIO == 0 triggers compression
 
 @pl.jit.inline
 def attention_csa(
@@ -156,7 +156,7 @@ def attention_csa(
     x_out: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
     start_pos: pl.Scalar[pl.INT32],
 ):
-    compress_rem = (start_pos + 1) % COMPRESS_RATIO
+    compress_rem = (start_pos + S) % COMPRESS_RATIO
 
     x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
     post_t = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
@@ -239,12 +239,14 @@ def attention_csa(
 
     kv_cache_flat = pl.reshape(kv_cache, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     ori_block_table_flat = pl.reshape(ori_block_table, [B * ORI_MAX_BLOCKS])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_scatter_ori"):
-        ori_slot = start_pos % WIN
-        for b in pl.parallel(B):
-            blk_id = pl.cast(pl.read(ori_block_table_flat, [b]), pl.INDEX)
-            dst_row = blk_id * BLOCK_SIZE + ori_slot
-            kv_cache_flat = pl.assemble(kv_cache_flat, kv[b:b + 1, 0:HEAD_DIM], [dst_row, 0])
+    # Per-batch per-token KV scatter: token s of batch b -> slot (start_pos + s) % WIN.
+    for s_idx in pl.range(S):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_scatter_ori"):
+            ori_slot = (start_pos + s_idx) % WIN
+            for b in pl.parallel(B):
+                blk_id = pl.cast(pl.read(ori_block_table_flat, [b]), pl.INDEX)
+                dst_row = blk_id * BLOCK_SIZE + ori_slot
+                kv_cache_flat = pl.assemble(kv_cache_flat, kv[b * S + s_idx : b * S + s_idx + 1, 0:HEAD_DIM], [dst_row, 0])
     kv_cache = pl.reshape(kv_cache_flat, [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
 
     cmp_out = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
@@ -519,14 +521,16 @@ def golden_attention_csa(tensors):
         wo_b_scale = local_tensors["wo_b_scale"].float()
 
         attn_stage = torch.zeros(T, H, HEAD_DIM, dtype=torch.float32)
-        for b in range(B):
+        # Per-token gather + attention; token t belongs to batch t // S.
+        for t in range(T):
+            b = t // S
             seq_used = int(seqused_kv[b].item())
             window_valid = min(WIN, seq_used)
             cmp_valid = max(seq_used - window_valid, 0)
             cmp_topk_valid = min(IDX_TOPK, cmp_valid)
             gathered = []
 
-            for raw in sparse_indices[b, :window_valid + cmp_topk_valid].tolist():
+            for raw in sparse_indices[t, :window_valid + cmp_topk_valid].tolist():
                 if raw < 0:
                     continue
                 if raw < WIN:
@@ -544,22 +548,22 @@ def golden_attention_csa(tensors):
             if not gathered:
                 continue
 
-            kv_b = torch.stack(gathered, dim=0)
+            kv_t = torch.stack(gathered, dim=0)
             for h in range(H):
-                q_h = q_local[b, h]
-                mi = (q_h * kv_b[0]).sum() * M.softmax_scale
+                q_h = q_local[t, h]
+                mi = (q_h * kv_t[0]).sum() * M.softmax_scale
                 li = torch.exp(mi - mi)
-                oi = kv_b[0].clone()
-                for kk in range(1, kv_b.shape[0]):
-                    cur_mi = (q_h * kv_b[kk]).sum() * M.softmax_scale
+                oi = kv_t[0].clone()
+                for kk in range(1, kv_t.shape[0]):
+                    cur_mi = (q_h * kv_t[kk]).sum() * M.softmax_scale
                     mi_new = torch.maximum(mi, cur_mi)
                     alpha = torch.exp(mi - mi_new)
                     beta = torch.exp(cur_mi - mi_new)
                     li = alpha * li + beta
-                    oi = alpha * oi + beta * kv_b[kk]
+                    oi = alpha * oi + beta * kv_t[kk]
                     mi = mi_new
                 denom = li + torch.exp(attn_sink[h] - mi)
-                attn_stage[b, h] = oi / denom
+                attn_stage[t, h] = oi / denom
 
         # The device stores attn_stage as BF16 before inverse RoPE.
         attn_stage_bf16 = attn_stage.to(torch.bfloat16)
@@ -637,11 +641,14 @@ def golden_attention_csa(tensors):
     cmp_kv = tensors["cmp_kv"]
     cmp_block_table = tensors["cmp_block_table"]
 
-    ori_slot = start_pos % WIN
-    for b in range(B):
+    # Per-batch per-token ori_kv scatter: token s of batch b -> slot (start_pos + s) % WIN.
+    for t in range(T):
+        b = t // S
+        s = t % S
+        ori_slot = (start_pos + s) % WIN
         blk_id = int(ori_block_table[b, ori_slot // BLOCK_SIZE].item())
         intra = ori_slot % BLOCK_SIZE
-        kv_cache[blk_id, intra, 0] = kv[b]
+        kv_cache[blk_id, intra, 0] = kv[t]
 
     cmp_out = torch.zeros(B, S, HEAD_DIM, dtype=torch.float32)
     cmp_dense = torch.zeros(B, IDX_KV_LEN, HEAD_DIM, dtype=torch.bfloat16)
@@ -663,7 +670,7 @@ def golden_attention_csa(tensors):
         "start_pos": tensors["start_pos"],
         "rotate": False,
     })
-    if (start_pos + 1) % COMPRESS_RATIO == 0:
+    if (start_pos + S) % COMPRESS_RATIO == 0:
         cmp_slot_rel = start_pos // COMPRESS_RATIO
         for b in range(B):
             blk_id = int(cmp_block_table[b, cmp_slot_rel // BLOCK_SIZE].item())
@@ -918,8 +925,8 @@ def build_tensor_specs():
         return torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
 
     def init_seqused_kv():
-        win_valid = min(WIN, START_POS + 1)
-        cmp_valid = (START_POS + 1) // COMPRESS_RATIO
+        win_valid = min(WIN, START_POS + S)
+        cmp_valid = (START_POS + S) // COMPRESS_RATIO
         return torch.full((B,), win_valid + cmp_valid, dtype=torch.int32)
 
     def init_wo_a():

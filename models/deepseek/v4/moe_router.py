@@ -27,7 +27,7 @@ VOCAB         = M.vocab_size
 N_HASH_LAYERS = M.num_hash_layers
 
 # tiling
-D_CHUNK          = 256 if T >= 64 else 512
+D_CHUNK          = 128 if T >= 128 else (256 if T >= 64 else 512)
 D_BLOCKS         = D // D_CHUNK
 # SCORE_PAD = padded expert row width. sort32 handles 32-value runs; the
 # 512-wide path uses two mrgsort passes to cover FLASH/PRO expert counts.

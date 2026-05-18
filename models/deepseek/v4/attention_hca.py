@@ -62,6 +62,7 @@ CMP_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO   # demo 32; flash/pro 8192 (= 1048576/
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO  # matches compressor_ratio128 kv_cache 2nd-dim contract
 SPARSE_IDX_TOPK = M.index_topk             # sparse_attn module's IDX_TOPK (static shape contract)
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK        # sparse_attn module's TOPK (= 640 for demo)
+HCA_TOPK_CHUNK = 16 if DECODE_BATCH * DECODE_SEQ >= 64 else DECODE_BATCH * DECODE_SEQ
 # Non-compression-step fixture: (START_POS + 1) % COMPRESS_RATIO != 0.
 # Warmup positions before the first compressed slot are supported; seqused_kv
 # bounds the valid compressed topk range.
@@ -122,7 +123,7 @@ def attention_hca(
     """HCA decode orchestration for compress_ratio=128. Caller contract:
     runtime ``start_pos`` MUST equal compile-time ``START_POS``.
     """
-    compress_rem = (start_pos + 1) % COMPRESS_RATIO
+    compress_rem = (start_pos + S) % COMPRESS_RATIO
 
     x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
     post_t = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
@@ -202,19 +203,20 @@ def attention_hca(
         qr_scale,
     )
 
-    # ori_kv scatter at slot = start_pos % WIN.
+    # ori_kv scatter at slot = (start_pos + s) % WIN per token s of each batch.
     kv_cache_flat = pl.reshape(kv_cache, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     ori_block_table_flat = pl.reshape(ori_block_table, [B * ORI_MAX_BLOCKS])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_scatter_ori"):
-        ori_slot = start_pos % WIN
-        for b in pl.parallel(0, B, 1):
-            blk_id = pl.cast(pl.read(ori_block_table_flat, [b]), pl.INDEX)
-            dst_row = blk_id * BLOCK_SIZE + ori_slot
-            kv_cache_flat = pl.assemble(
-                kv_cache_flat,
-                kv[b:b + 1, 0:HEAD_DIM],
-                [dst_row, 0],
-            )
+    for s_idx in pl.range(S):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_scatter_ori"):
+            ori_slot = (start_pos + s_idx) % WIN
+            for b in pl.parallel(0, B, 1):
+                blk_id = pl.cast(pl.read(ori_block_table_flat, [b]), pl.INDEX)
+                dst_row = blk_id * BLOCK_SIZE + ori_slot
+                kv_cache_flat = pl.assemble(
+                    kv_cache_flat,
+                    kv[b * S + s_idx : b * S + s_idx + 1, 0:HEAD_DIM],
+                    [dst_row, 0],
+                )
     kv_cache = pl.reshape(kv_cache_flat, [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
 
     # Main compressor (ratio=128, rotate=False).
@@ -268,19 +270,22 @@ def attention_hca(
     # topk_idxs: [0..WIN) window plus deterministic compressed slots.
     # sparse_attn's static TOPK contract is SPARSE_TOPK (= WIN+IDX_TOPK = 640 in demo);
     # The actual valid count is bounded by seqused_kv inside sparse_attn.
+    # Chunk over T so [T, SPARSE_TOPK] INT32 (T=128 * 640 * 4 = 320KB) doesn't blow Vec budget.
     topk_idxs = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_topk"):
-        win_idx = pl.arange(0, [1, WIN], dtype=pl.INT32)
-        cmp_idx = pl.add(
-            pl.arange(0, [1, CMP_TOPK], dtype=pl.INT32),
-            pl.full([1, CMP_TOPK], dtype=pl.INT32, value=WIN),
-        )
-        pad_idx = pl.full([1, SPARSE_IDX_TOPK - CMP_TOPK], dtype=pl.INT32, value=-1)
-        topk_row = pl.concat(pl.concat(win_idx, cmp_idx), pad_idx)
-        topk_idxs = pl.col_expand(
-            pl.full([T, SPARSE_TOPK], dtype=pl.INT32, value=-1),
-            topk_row,
-        )
+    for t0 in pl.range(0, T, HCA_TOPK_CHUNK):
+        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="hca_topk"):
+            win_idx = pl.arange(0, [1, WIN], dtype=pl.INT32)
+            cmp_idx = pl.add(
+                pl.arange(0, [1, CMP_TOPK], dtype=pl.INT32),
+                pl.full([1, CMP_TOPK], dtype=pl.INT32, value=WIN),
+            )
+            pad_idx = pl.full([1, SPARSE_IDX_TOPK - CMP_TOPK], dtype=pl.INT32, value=-1)
+            topk_row = pl.concat(pl.concat(win_idx, cmp_idx), pad_idx)
+            topk_tile = pl.col_expand(
+                pl.full([HCA_TOPK_CHUNK, SPARSE_TOPK], dtype=pl.INT32, value=-1),
+                topk_row,
+            )
+            topk_idxs = pl.assemble(topk_idxs, topk_tile, [t0, 0])
 
     # sparse_attn + fused o_proj.
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -460,11 +465,14 @@ def golden_attention_hca(tensors):
     ori_block_table = tensors["ori_block_table"]
     cmp_kv = tensors["cmp_kv"]
     cmp_block_table = tensors["cmp_block_table"]
-    ori_slot = start_pos % win
-    for b in range(B):
+    # Per-batch per-token ori_kv scatter: token s of batch b -> slot (start_pos + s) % win.
+    for t in range(T):
+        b = t // S
+        s = t % S
+        ori_slot = (start_pos + s) % win
         blk_id = int(ori_block_table[b, ori_slot // BLOCK_SIZE].item())
         intra = ori_slot % BLOCK_SIZE
-        kv_cache[blk_id, intra, 0] = kv[b]
+        kv_cache[blk_id, intra, 0] = kv[t]
 
     # main compressor (writes cmp_kv via the orchestration scatter below on should_compress)
     # New golden_compressor contract: requires `kv` / `kv_cache` / `rotate` / `even_select` / `odd_select`,
@@ -647,10 +655,10 @@ def build_tensor_specs():
         return torch.zeros(H)
     def init_seqused_kv():
         # sparse_attn uses: window_valid = min(WIN, seq_used); cmp_valid = seq_used - window_valid.
-        # HCA at start_pos: window has min(WIN, start_pos+1) valid entries,
-        # cmp pool has (start_pos+1)//ratio compressed slots written.
-        win_valid = min(WIN, START_POS + 1)
-        cmp_valid = (START_POS + 1) // COMPRESS_RATIO
+        # HCA at start_pos with S new tokens: window has min(WIN, start_pos+S) valid entries,
+        # cmp pool has (start_pos+S)//ratio compressed slots written.
+        win_valid = min(WIN, START_POS + S)
+        cmp_valid = (START_POS + S) // COMPRESS_RATIO
         return torch.full((B,), win_valid + cmp_valid, dtype=torch.int32)
     def init_wo_a():
         return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5

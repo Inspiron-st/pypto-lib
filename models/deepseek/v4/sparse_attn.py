@@ -41,12 +41,13 @@ The standalone harness exposes `--compress-ratio {0,4,128}` for testing.
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, BLOCK_SIZE, INT8_SCALE_MAX, INT8_AMAX_EPS
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, INT8_SCALE_MAX, INT8_AMAX_EPS
 
 
 # model config
 B = DECODE_BATCH
-T = B
+S = DECODE_SEQ
+T = B * S
 D = M.hidden_size
 H = M.num_attention_heads
 HEAD_DIM = M.head_dim
@@ -78,8 +79,8 @@ ROPE_INTERLEAVE_CHUNK = 2 * ROPE_CHUNK
 A_K_CHUNK = 128
 A_N_CHUNK = 128
 B_K_CHUNK = 128
-B_N_CHUNK = 256
-QUANT_CHUNK = 128 if T >= 64 else 256
+B_N_CHUNK = 128 if T >= 128 else 256
+QUANT_CHUNK = 32 if T >= 128 else (128 if T >= 64 else 256)
 
 
 def get_standalone_cmp_valid(compress_ratio: int) -> int:
@@ -134,7 +135,8 @@ def sparse_attn(
     o_rope_interleave = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.BF16)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
 
-    for b in pl.range(B):
+    for t in pl.range(T):
+        b = t // S
         seq_used = pl.read(seqused_kv, [b])
         window_valid = pl.min(WIN, seq_used)
         cmp_valid = seq_used - window_valid
@@ -148,7 +150,7 @@ def sparse_attn(
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_gather_kv_topk"):
             raw_idx = pl.read(cmp_sparse_indices_flat, [raw_idx_pos])
             for kk in pl.range(window_valid):
-                raw_idx_pos = b * TOPK + kk
+                raw_idx_pos = t * TOPK + kk
                 raw_idx = pl.read(cmp_sparse_indices_flat, [raw_idx_pos])
                 ori_slot = raw_idx // BLOCK_SIZE
                 ori_block_pos = ori_block_base + ori_slot
@@ -162,7 +164,7 @@ def sparse_attn(
                 )
 
             for kk in pl.range(cmp_topk_valid):
-                raw_idx_pos = b * TOPK + window_valid + kk
+                raw_idx_pos = t * TOPK + window_valid + kk
                 raw_idx = pl.read(cmp_sparse_indices_flat, [raw_idx_pos])
                 cmp_slot = raw_idx - WIN
                 cmp_block_slot = cmp_slot // BLOCK_SIZE
@@ -177,7 +179,7 @@ def sparse_attn(
                 )
 
         for h0 in pl.parallel(0, H, MATMUL_ROW_PAD):
-            attn_head_row = b * H + h0
+            attn_head_row = t * H + h0
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_sparse_attn_init"):
                 q_batch = pl.cast(
                     q_flat[attn_head_row : attn_head_row + MATMUL_ROW_PAD, 0 : HEAD_DIM],
@@ -226,8 +228,8 @@ def sparse_attn(
                     [attn_head_row, 0],
                 )
 
-    for b in pl.range(B):
-        rope_head_row = b * H
+    for t in pl.range(T):
+        rope_head_row = t * H
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_rope_slice"):
             for r0 in pl.range(0, HALF_ROPE, ROPE_CHUNK):
@@ -242,8 +244,8 @@ def sparse_attn(
                 o_proj_odd = pl.assemble(o_proj_odd, odd_chunk, [rope_head_row, r0])
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_rope_apply"):
-            cos_tile = pl.cast(freqs_cos[b : b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
-            sin_tile = pl.cast(freqs_sin[b : b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
+            cos_tile = pl.cast(freqs_cos[t : t + 1, 0 : HALF_ROPE], target_type=pl.FP32)
+            sin_tile = pl.cast(freqs_sin[t : t + 1, 0 : HALF_ROPE], target_type=pl.FP32)
             even_tile = o_proj_even[rope_head_row : rope_head_row + H, :]
             odd_tile = o_proj_odd[rope_head_row : rope_head_row + H, :]
             rope_even_acc = pl.add(
@@ -297,12 +299,12 @@ def sparse_attn(
                 [rope_head_row, 0],
             )
 
-    for b in pl.range(B):
+    for t in pl.range(T):
         for h in pl.parallel(0, H, 1):
-            pack_head_row = b * H + h
+            pack_head_row = t * H + h
             pack_group_idx = h // HEADS_PER_GROUP
             pack_head_in_group = h % HEADS_PER_GROUP
-            pack_row = pack_group_idx * T + b
+            pack_row = pack_group_idx * T + t
             pack_col = pack_head_in_group * HEAD_DIM
 
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_pack_o_packed"):
@@ -467,13 +469,16 @@ def golden_sparse_attn(tensors):
 
     o = torch.zeros(T, H, HEAD_DIM)
 
-    for b in range(B):
+    # Per-query-token attention. Each token has its own cmp_sparse_indices row;
+    # seqused_kv / block tables are per-batch (token t belongs to batch t // S).
+    for t in range(T):
+        b = t // S
         seq_used = int(seqused_kv[b].item())
         window_valid = min(WIN, seq_used)
         cmp_valid = max(seq_used - window_valid, 0)
         gathered = []
 
-        for raw in cmp_sparse_indices[b].tolist():
+        for raw in cmp_sparse_indices[t].tolist():
             if raw < 0:
                 continue
             if raw < WIN:
@@ -493,15 +498,15 @@ def golden_sparse_attn(tensors):
         if not gathered:
             continue
 
-        kv_b = torch.stack(gathered, dim=0)
-        q_b = q[b]
-        scores = (q_b @ kv_b.T) * SOFTMAX_SCALE
+        kv_t = torch.stack(gathered, dim=0)
+        q_t = q[t]
+        scores = (q_t @ kv_t.T) * SOFTMAX_SCALE
         score_max = scores.max(dim=-1, keepdim=True).values
         exp_scores = torch.exp(scores - score_max)
-        oi_num = exp_scores @ kv_b
+        oi_num = exp_scores @ kv_t
         li = exp_scores.sum(dim=-1, keepdim=True)
         denom = li + torch.exp(attn_sink.unsqueeze(-1) - score_max)
-        o[b] = oi_num / denom
+        o[t] = oi_num / denom
 
     rope_pair = o[..., NOPE_DIM:].unflatten(-1, (-1, 2))
     rope_even = rope_pair[..., 0]

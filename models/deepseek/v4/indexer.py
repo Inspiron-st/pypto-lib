@@ -44,7 +44,7 @@ INNER_STATE_LEN = INNER_COFF * COMPRESS_RATIO
 
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
 SCORE_LEN = IDX_KV_LEN
-START_POS = 255      # ScalarSpec default; >0 (decode) and (START_POS+1)%COMPRESS_RATIO==0
+START_POS = 254      # ScalarSpec default; >0 (decode) and (START_POS+S)%COMPRESS_RATIO==0
 
 # tiling
 CACHE_TILE = 32
@@ -240,7 +240,9 @@ def indexer(
     )
 
     kv_cache_flat = pl.reshape(idx_kv_cache, [B * IDX_KV_LEN, IDX_HEAD_DIM])
-    score_logits = pl.create_tensor([B * MAX_CACHE_BLOCKS * CACHE_TILE, IDX_N_HEADS], dtype=pl.FP32)
+    # score_logits width is S * IDX_N_HEADS because score_accum matmuls
+    # qr_hadamard for all S query tokens of the batch at once.
+    score_logits = pl.create_tensor([B * MAX_CACHE_BLOCKS * CACHE_TILE, S * IDX_N_HEADS], dtype=pl.FP32)
     score_kv_scale = pl.create_tensor([B * MAX_CACHE_BLOCKS * CACHE_TILE, 1], dtype=pl.FP32)
     weighted_score_tiles = pl.create_tensor([B * MAX_CACHE_BLOCKS * S, CACHE_TILE], dtype=pl.FP32)
     score_flat = pl.reshape(score, [T, SCORE_LEN])
@@ -292,22 +294,26 @@ def indexer(
                 score_tile = pl.col_expand_mul(pl.row_expand_mul(score_tile, kv_cache_scale_dq), qh_scale)
                 score_logits = pl.assemble(score_logits, score_tile, [score_row0, 0])
 
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="score_weighted_reduce"):
-                logits_row0 = (b * MAX_CACHE_BLOCKS + cb) * CACHE_TILE
-                score_tile = score_logits[logits_row0 : logits_row0 + CACHE_TILE, :]
-                relu_score = pl.maximum(score_tile, pl.mul(score_tile, 0.0))
-                weights_tile = weights[t0 : t0 + S, :]
-                weighted_score_t = pl.col_expand_mul(relu_score, weights_tile)
-                weighted_score = pl.reshape(pl.row_sum(weighted_score_t), [S, CACHE_TILE])
-                score_row0 = (b * MAX_CACHE_BLOCKS + cb) * S
-                weighted_score_tiles = pl.assemble(weighted_score_tiles, weighted_score, [score_row0, 0])
-                weighted_score_valid = pl.slice(
-                    weighted_score_tiles,
-                    [S, CACHE_TILE],
-                    [score_row0, 0],
-                    valid_shape=[S, valid_len],
-                )
-                score_flat = pl.assemble(score_flat, weighted_score_valid, [t0, cache0])
+            # Per-query-token weighted reduce (each token has its own head-weights).
+            # col_expand_mul requires the right-hand "row" dim to be 1, so we
+            # cannot collapse the S tokens into a single multi-row weights_tile.
+            for s in pl.range(S):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="score_weighted_reduce"):
+                    logits_row0 = (b * MAX_CACHE_BLOCKS + cb) * CACHE_TILE
+                    score_tile_s = score_logits[logits_row0 : logits_row0 + CACHE_TILE, s * IDX_N_HEADS : (s + 1) * IDX_N_HEADS]
+                    relu_score_s = pl.maximum(score_tile_s, pl.mul(score_tile_s, 0.0))
+                    weights_row_s = pl.reshape(weights[t0 + s : t0 + s + 1, :], [1, IDX_N_HEADS])
+                    weighted_score_s_t = pl.col_expand_mul(relu_score_s, weights_row_s)
+                    weighted_score_s = pl.reshape(pl.row_sum(weighted_score_s_t), [1, CACHE_TILE])
+                    score_row0_s = (b * MAX_CACHE_BLOCKS + cb) * S + s
+                    weighted_score_tiles = pl.assemble(weighted_score_tiles, weighted_score_s, [score_row0_s, 0])
+                    weighted_score_valid_s = pl.slice(
+                        weighted_score_tiles,
+                        [1, CACHE_TILE],
+                        [score_row0_s, 0],
+                        valid_shape=[1, valid_len],
+                    )
+                    score_flat = pl.assemble(score_flat, weighted_score_valid_s, [t0 + s, cache0])
 
     topk_idxs_flat = pl.reshape(topk_idxs, [T, SCORE_LEN])
     for t in pl.parallel(T):

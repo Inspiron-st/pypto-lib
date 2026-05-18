@@ -240,7 +240,7 @@ PRESETS = {p.name: p for p in (DEMO, FLASH, PRO)}
 
 # Deployment constants
 DECODE_BATCH = 64          # B: tokens per decode step
-DECODE_SEQ = 1             # S: one token per step
+DECODE_SEQ = 2             # S: 2 tokens per step (MTP)
 
 # Implementation constants
 BLOCK_SIZE = 128                          # paged-KV page size / weight-quant block size
@@ -253,4 +253,4 @@ FP32_NEG_INF = -3.4028234663852886e38     # most-negative finite fp32 (softmax m
 # EP communication constants
 EP_WORLD_SIZE = 1   # demo 1; flash/pro depend on deployment (e.g. pro 16)
 EP_RANK = 0
-RECV_MAX = 384       # per-(local-expert) row upper bound
+RECV_MAX = 768       # per-(local-expert) row upper bound (B*S*TOPK = 64*2*6)

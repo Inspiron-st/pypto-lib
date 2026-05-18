@@ -40,8 +40,8 @@ N_LOCAL_EXPERTS = N_EXPERTS // EP_WORLD_SIZE
 EXPERTS_START_IDX = EP_RANK * N_LOCAL_EXPERTS
 
 # tiling
-COL_CHUNK = 128 if T >= 64 else 512
-QUANT_CHUNK = 128 if T >= 64 else 256  # column chunk for two-pass per-token INT8 quant
+COL_CHUNK = 64 if T >= 128 else (128 if T >= 64 else 512)
+QUANT_CHUNK = 32 if T >= 128 else (128 if T >= 64 else 256)  # column chunk for two-pass per-token INT8 quant
 
 
 @pl.jit.inline

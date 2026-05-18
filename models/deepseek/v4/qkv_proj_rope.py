@@ -37,9 +37,9 @@ Q_PROJ_OUT_CHUNK = 128
 Q_PROJ_CHUNK = 128
 Q_LORA_TILE = 32
 Q_LORA_CHUNK = Q_LORA_TILE
-D_CHUNK     = 256 if T >= 64 else 512
+D_CHUNK     = 128 if T >= 128 else (256 if T >= 64 else 512)
 KV_CHUNK    = 32
-QUANT_CHUNK = 128 if T >= 64 else 256
+QUANT_CHUNK = 32 if T >= 128 else (128 if T >= 64 else 256)
 assert (H * HEAD_DIM) % (HEAD_CHUNK * HEAD_GROUP) == 0, \
     "HEAD_BLOCKS must be divisible by HEAD_GROUP"
 Q_BLOCKS      = Q_LORA // Q_LORA_TILE

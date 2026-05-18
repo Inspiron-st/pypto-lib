@@ -12,7 +12,7 @@ sparse_attn + hc_post) with the MoE stack, matching ``Block.forward``
 (model.py:688-700) for layers whose ``compress_ratio == 4`` (the ratio=4
 layers in the demo / flash compress_ratios tuple). Inherits the CSA caller
 contract: runtime ``start_pos`` MUST equal compile-time ``START_POS`` AND
-``(START_POS + 1) % COMPRESS_RATIO == 0`` AND ``START_POS >= WIN - 1`` —
+``(START_POS + S) % COMPRESS_RATIO == 0`` AND ``START_POS >= WIN - S`` —
 see attention_csa.py."""
 
 
@@ -73,16 +73,16 @@ ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
 CMP_MAX_BLOCKS = 64
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
-START_POS = 127
+START_POS = 126      # (START_POS + S) % COMPRESS_RATIO == 0 AND START_POS >= WIN - S
 
 Q_PROJ_OUT_CHUNK = 128
 Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
 
 # Caller contract — same as attention_csa.py.
-SHOULD_COMPRESS = ((START_POS + 1) % COMPRESS_RATIO) == 0
-assert SHOULD_COMPRESS and START_POS >= WIN - 1, (
+SHOULD_COMPRESS = ((START_POS + S) % COMPRESS_RATIO) == 0
+assert SHOULD_COMPRESS and START_POS >= WIN - S, (
     f"CSA fixture requires a full-window compression step; got START_POS={START_POS}, "
-    f"COMPRESS_RATIO={COMPRESS_RATIO}, WIN={WIN}."
+    f"COMPRESS_RATIO={COMPRESS_RATIO}, WIN={WIN}, S={S}."
 )
 
 # ---- moe-local constants ----

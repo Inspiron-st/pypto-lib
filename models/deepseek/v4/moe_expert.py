@@ -32,9 +32,9 @@ EXPERTS_START_IDX = EP_RANK * N_LOCAL_EXPERTS
 RECV_TILE = 16
 K_CHUNK = 512
 INTER_K = 512
-INTER_CHUNK = 128 if T >= 64 else 256
-D_OUT_CHUNK = 256 if T >= 64 else 512
-QUANT_CHUNK = 128 if T >= 64 else 256   # column chunk for two-pass per-row INT8 quant (vec budget aware)
+INTER_CHUNK = 64 if T >= 128 else (128 if T >= 64 else 256)
+D_OUT_CHUNK = 128 if T >= 128 else (256 if T >= 64 else 512)
+QUANT_CHUNK = 32 if T >= 128 else (128 if T >= 64 else 256)   # column chunk for two-pass per-row INT8 quant (vec budget aware)
 
 
 @pl.jit.inline
