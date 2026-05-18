@@ -1040,11 +1040,7 @@ if __name__ == "__main__":
                 enable_l2_swimlane=args.enable_l2_swimlane,
             ),
             compare_fn={
-                "x_out": ratio_allclose(
-                    atol=1e-2 if START_POS < WIN - 1 else 3e-3,
-                    rtol=2.0 / 128,
-                    max_error_ratio=0.08 if START_POS < WIN - 1 else 0.005,
-                ),
+                "x_out": ratio_allclose(atol=3e-3, rtol=2.0 / 128),
             },
         ),
     )

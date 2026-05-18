@@ -725,11 +725,7 @@ if __name__ == "__main__":
             rtol=1e-2,
             atol=1e-2,
             compare_fn={
-                "x_out": ratio_allclose(
-                    atol=1e-2 if START_POS < WIN - 1 else 3e-3,
-                    rtol=2.0 / 128,
-                    max_error_ratio=0.08 if START_POS < WIN - 1 else 0.005,
-                ),
+                "x_out": ratio_allclose(atol=3e-3, rtol=2.0 / 128),
             },
             compile=dict(dump_passes=True),
             runtime=dict(
