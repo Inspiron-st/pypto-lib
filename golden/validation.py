@@ -339,3 +339,122 @@ def ratio_allclose(
         f"max_error_ratio={max_error_ratio})"
     )
     return cmp
+
+
+def data_compare(
+    diff_thd: float = 0.01,
+    pct_thd: float = 0.05,
+    max_diff_hd: float = float("inf"),
+    max_show: int = 10,
+) -> Callable:
+    """Relative-diff comparator with bad-point ratio and single-point cap.
+
+    Algorithm::
+
+        a = |actual - expected|
+        b = max(|actual|, |expected|, (1 / 2^14) / diff_thd) + 1e-9
+        rdiff = a if a < diff_thd else a / b
+        error_count = count(rdiff > diff_thd)
+        pass iff error_count / numel <= pct_thd
+                 AND max(rdiff over bad points) < max_diff_hd
+
+    The denominator floor ``(1 / 2^14) / diff_thd`` keeps rdiff well-defined
+    for near-zero values (capped via the ``a < diff_thd`` early-return).
+    NaN / Inf in ``actual`` always fail.
+
+    Args:
+        diff_thd: Per-point relative-difference threshold.
+        pct_thd: Allowed fraction of points exceeding ``diff_thd``.
+        max_diff_hd: Hard cap on worst per-point rdiff. Defaults to ``+inf``
+            (no cap); pass an explicit value for a single-point catastrophic
+            failure check.
+        max_show: Maximum mismatched points to print on failure.
+    """
+    if not 0.0 < diff_thd:
+        raise ValueError(f"diff_thd must be > 0, got {diff_thd}")
+    if not 0.0 <= pct_thd <= 1.0:
+        raise ValueError(f"pct_thd must be in [0, 1], got {pct_thd}")
+    if not 0.0 < max_diff_hd:
+        raise ValueError(f"max_diff_hd must be > 0, got {max_diff_hd}")
+
+    def cmp(
+        actual: torch.Tensor,
+        expected: torch.Tensor,
+        *,
+        actual_outputs: dict[str, torch.Tensor],
+        expected_outputs: dict[str, torch.Tensor],
+        inputs: dict[str, torch.Tensor],
+        rtol: float,
+        atol: float,
+    ) -> tuple[bool, str]:
+        actual_f = actual.cpu().to(torch.float32)
+        expected_f = expected.cpu().to(torch.float32)
+
+        nan_count = int(torch.isnan(actual_f).sum().item())
+        inf_count = int(torch.isinf(actual_f).sum().item())
+        if nan_count or inf_count:
+            return False, (
+                f"    illegal values in actual: NaN={nan_count} Inf={inf_count}"
+            )
+
+        diff_abs = (actual_f - expected_f).abs()
+        small_value_floor = (1.0 / (1 << 14)) / diff_thd
+        denom = torch.maximum(
+            torch.maximum(actual_f.abs(), expected_f.abs()),
+            torch.full_like(actual_f, small_value_floor),
+        ) + 1e-9
+        rdiff = torch.where(diff_abs < diff_thd, diff_abs, diff_abs / denom)
+
+        bad_mask = rdiff > diff_thd
+        error_count = int(bad_mask.sum().item())
+        numel = actual_f.numel()
+        pct_threshold = round(pct_thd * numel)
+
+        # Worst single-point rdiff among bad points (0 if no bad points).
+        if error_count > 0:
+            worst_rdiff = float(rdiff[bad_mask].max().item())
+        else:
+            worst_rdiff = 0.0
+
+        passed = (error_count <= pct_threshold) and (worst_rdiff < max_diff_hd)
+        if passed:
+            return True, ""
+
+        bad_indices = torch.where(bad_mask.flatten())[0]
+        flat_actual = actual_f.flatten()
+        flat_expected = expected_f.flatten()
+        flat_abs = diff_abs.flatten()
+        flat_rdiff = rdiff.flatten()
+        n_show = min(max_show, bad_indices.numel())
+        idx = bad_indices[:n_show]
+        lines = [
+            (
+                f"    [{i.item()}] actual={flat_actual[i].item():.8g}, "
+                f"expected={flat_expected[i].item():.8g}, "
+                f"abs_diff={flat_abs[i].item():.4g}, "
+                f"rdiff={flat_rdiff[i].item():.4g}"
+            )
+            for i in idx
+        ]
+        reasons = []
+        if error_count > pct_threshold:
+            reasons.append(
+                f"error_count={error_count}/{numel} "
+                f"(ratio={error_count / numel:.4%}, allowed<={pct_thd:.4%}, "
+                f"threshold={pct_threshold} pts)"
+            )
+        if worst_rdiff >= max_diff_hd:
+            reasons.append(
+                f"worst rdiff={worst_rdiff:.4g} >= max_diff_hd={max_diff_hd:.4g}"
+            )
+        return False, (
+            f"    data_compare fail: {' AND '.join(reasons)}\n"
+            f"    diff_thd={diff_thd} pct_thd={pct_thd} max_diff_hd={max_diff_hd}\n"
+            f"    first {n_show} mismatches:\n" + "\n".join(lines)
+        )
+
+    cmp.__name__ = (
+        f"data_compare(diff_thd={diff_thd}, pct_thd={pct_thd}, "
+        f"max_diff_hd={max_diff_hd})"
+    )
+    return cmp

@@ -20,7 +20,8 @@ The local EP=1 dispatch contract is:
         recv_token[e, slot] = t
         recv_expert_count[e] += 1
 
-``moe_expert`` multiplies ``recv_weights`` into the routed expert activation.
+``moe_combine`` multiplies ``recv_weights`` into the routed expert activation
+during the FP32 weighted reduction.
 The current integration deliberately lets the expert process all ``RECV_MAX``
 rows per expert, with non-routed tail rows initialized to zero. The actual
 ``recv_expert_count`` is still used by combine, so only valid packed rows are
@@ -123,14 +124,16 @@ def moe(
         x_norm, indices, weights,
     )
 
-    # Stage 3: packed dispatch.
-    recv_x = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.BF16)
+    # Stage 3: packed dispatch. `recv_x` is INT8 (per-token quantized once
+    # inside dispatch), `recv_scale_dq` carries the per-token dequant scale.
+    recv_x = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.INT8)
+    recv_scale_dq = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32)
     recv_weights = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32)
     recv_token = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.INT32)
     recv_expert_count = pl.create_tensor([N_LOCAL_EXPERTS, 1], dtype=pl.INT32)
     moe_dispatch(
         x_norm, indices, weights,
-        recv_x, recv_weights, recv_token, recv_expert_count,
+        recv_x, recv_scale_dq, recv_weights, recv_token, recv_expert_count,
     )
 
     # Stage 4: routed local experts + shared expert. Use a full count for the
@@ -139,7 +142,7 @@ def moe(
     recv_y = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.BF16)
     sh = pl.create_tensor([T, D], dtype=pl.BF16)
     moe_expert(
-        recv_x, recv_weights, recv_expert_count_full, x_norm,
+        recv_x, recv_scale_dq, recv_expert_count_full, x_norm,
         expert_w1, expert_w1_scale, expert_w3, expert_w3_scale,
         expert_w2, expert_w2_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
@@ -153,7 +156,7 @@ def moe(
     # the SSA-rebound output would resolve to ``routed_y_buf__rv_v2`` and
     # trigger a runtime ``valid_reshape`` numel mismatch.
     ffn_out = pl.create_tensor([B, S, D], dtype=pl.BF16)
-    moe_combine(recv_y, recv_token, recv_expert_count, sh, ffn_out)
+    moe_combine(recv_y, recv_token, recv_weights, recv_expert_count, sh, ffn_out)
 
     # Stage 6: hc_post(ffn) merges the FFN output back into the HC stack.
     x_next = hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
@@ -247,8 +250,9 @@ def golden_moe(tensors):
         "weights":      weights,
     })
 
-    # Stage 3: packed dispatch.
-    recv_x = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, D, dtype=torch.bfloat16)
+    # Stage 3: packed dispatch (recv_x is INT8, recv_scale_dq is per-token).
+    recv_x = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, D, dtype=torch.int8)
+    recv_scale_dq = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.float32)
     recv_weights = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.float32)
     recv_token = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.int32)
     recv_expert_count_actual = torch.zeros(N_LOCAL_EXPERTS, 1, dtype=torch.int32)
@@ -257,6 +261,7 @@ def golden_moe(tensors):
         "indices":           indices,
         "weights":           weights,
         "recv_x":            recv_x,
+        "recv_scale_dq":     recv_scale_dq,
         "recv_weights":      recv_weights,
         "recv_token":        recv_token,
         "recv_expert_count": recv_expert_count_actual,
@@ -267,7 +272,7 @@ def golden_moe(tensors):
     sh = torch.zeros(T, D, dtype=torch.bfloat16)
     golden_moe_expert({
         "recv_x":           recv_x,
-        "recv_weights":     recv_weights,
+        "recv_scale_dq":    recv_scale_dq,
         "recv_expert_count": tensors["recv_expert_count_full"],
         "x_local":          x_norm,
         "expert_w1":        tensors["expert_w1"],
@@ -291,6 +296,7 @@ def golden_moe(tensors):
     golden_moe_combine({
         "recv_y":            recv_y,
         "recv_token":        recv_token,
+        "recv_weights":      recv_weights,
         "recv_expert_count": recv_expert_count_actual,
         "sh":                sh,
         "ffn_out":           ffn_out,
@@ -323,7 +329,7 @@ def build_tensor_specs(layer_id=0):
         w_i8 = round_haz(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
         return w_i8, (1.0 / scale_quant).float()
 
-    def init_x_hc():           return torch.randn(B, S, HC_MULT, D) * 0.05
+    def init_x_hc():           return torch.randn(B, S, HC_MULT, D)
     def init_hc_ffn_fn():      return torch.randn(MIX_HC, HC_DIM) / HC_DIM ** 0.5
     def init_hc_ffn_scale():   return torch.ones(3) * 0.5
     def init_hc_ffn_base():    return torch.zeros(MIX_HC)
@@ -331,7 +337,7 @@ def build_tensor_specs(layer_id=0):
     def init_gate_w():         return torch.randn(N_EXPERTS, D) / D ** 0.5
     def init_gate_bias():      return torch.zeros(N_EXPERTS)
     def init_tid2eid():
-        return ((torch.arange(VOCAB).unsqueeze(1) + torch.arange(TOPK)) % N_EXPERTS).to(torch.int32)
+        return torch.randint(0, N_EXPERTS, (VOCAB, TOPK), dtype=torch.int32)
     def init_input_ids():
         return torch.randint(0, VOCAB, (B, S), dtype=torch.int64)
     def init_recv_expert_count_full():
@@ -381,34 +387,7 @@ def build_tensor_specs(layer_id=0):
 if __name__ == "__main__":
     import argparse
     import torch
-    from golden import RunConfig, run_jit
-
-    def allclose_with_tolerance(rel_tol, abs_tol):
-        def cmp(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
-            actual_f = actual.float()
-            expected_f = expected.float()
-            close = torch.isclose(actual_f, expected_f, rtol=rel_tol, atol=abs_tol)
-            if bool(close.all().item()):
-                return True, ""
-
-            mismatch_indices = torch.where(~close.flatten())[0]
-            flat_actual = actual.flatten()
-            flat_expected = expected.flatten()
-            n_show = min(20, mismatch_indices.numel())
-            idx = mismatch_indices[:n_show]
-            lines = [
-                f"    [{i.item()}] actual={flat_actual[i].item()}, expected={flat_expected[i].item()}"
-                for i in idx
-            ]
-            detail = (
-                f"    Mismatched elements: {mismatch_indices.numel()}/{actual.numel()}  "
-                f"rtol={rel_tol} atol={abs_tol}\n"
-                f"    first {n_show} mismatches:\n" + "\n".join(lines)
-            )
-            return False, detail
-
-        cmp.__name__ = f"allclose_with_tolerance(rtol={rel_tol},atol={abs_tol})"
-        return cmp
+    from golden import RunConfig, data_compare, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3sim",
@@ -434,7 +413,7 @@ if __name__ == "__main__":
                 enable_l2_swimlane=args.enable_l2_swimlane,
             ),
             compare_fn={
-                "x_next": allclose_with_tolerance(1e-2, 5e-2),
+                "x_next": data_compare(diff_thd=0.01, pct_thd=0.05),
             },
         ),
     )

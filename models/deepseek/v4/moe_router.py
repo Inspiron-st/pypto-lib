@@ -69,7 +69,7 @@ def moe_router(
                 sq_sum,
                 pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T]),
             )
-        inv_rms_val = pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS)))
+        inv_rms_val = pl.rsqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS), high_precision=True)
         inv_rms[:, :] = inv_rms_val
 
     # Stage 1: ffn_norm apply. Doubles as the gate-dot input and as the
@@ -262,7 +262,8 @@ def golden_moe_router_core(tensors):
         indices = tid2eid[input_ids.flatten().long()]
     else:
         biased = scores + gate_bias
-        indices = biased.topk(TOPK, dim=-1).indices
+        # Stable sort: deterministic tie-break to match the NPU sort32 order.
+        indices = torch.argsort(-biased, dim=-1, stable=True)[..., :TOPK]
 
     weights = original_scores.gather(1, indices.long())
     weights = weights / weights.sum(dim=-1, keepdim=True)
@@ -278,7 +279,8 @@ def build_tensor_specs(layer_id=0):
     from golden import ScalarSpec, TensorSpec
 
     def init_x_mixed():
-        return torch.randn(B, S, D) * 0.1
+        # Mirror post-RMSNorm activation magnitude (~ N(0, 1)).
+        return torch.randn(B, S, D)
     def init_norm_w():
         return torch.ones(D)
     def init_gate_w():
@@ -286,7 +288,7 @@ def build_tensor_specs(layer_id=0):
     def init_gate_bias():
         return torch.randn(N_EXPERTS) * 0.1
     def init_tid2eid():
-        return ((torch.arange(VOCAB).unsqueeze(1) + torch.arange(TOPK)) % N_EXPERTS).to(torch.int32)
+        return torch.randint(0, N_EXPERTS, (VOCAB, TOPK), dtype=torch.int32)
     def init_input_ids():
         return torch.randint(0, VOCAB, (B, S), dtype=torch.int64)
     return [
@@ -306,7 +308,7 @@ def build_tensor_specs(layer_id=0):
 if __name__ == "__main__":
     import argparse
     import torch
-    from golden import RunConfig, run_jit, topk_pair_compare
+    from golden import RunConfig, run_jit
 
     def bf16_allclose(rtol, atol):
         """Loosened comparator for BF16 outputs whose kernel reduction order
@@ -327,14 +329,8 @@ if __name__ == "__main__":
         specs=build_tensor_specs(layer_id=args.layer_id),
         golden_fn=golden_moe_router_core,
         config=RunConfig(
-            # `x_norm` is BF16 (1-ULP drift from reduction order); `indices`
-            # uses topk_pair_compare to tolerate sort32-vs-torch.topk tie-break.
-            rtol=1e-3,
-            atol=1e-3,
-            compare_fn={
-                "x_norm":  bf16_allclose(1e-2, 1e-2),
-                "indices": topk_pair_compare("weights"),
-            },
+            rtol=1e-5,
+            atol=1e-5,
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,
