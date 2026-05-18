@@ -12,11 +12,11 @@ Connects ``hc_pre`` + router + dispatch + expert + combine + ``hc_post`` inside
 one ``@pl.jit`` orchestration.
 The local EP=1 dispatch contract is:
 
-    for p = t * TOPK + k:
-        e = indices_flat[p]
+    for t, k:
+        e = indices[t, k]
         slot = recv_expert_count[e]
         recv_x[e, slot, :] = x_norm[t, :]
-        recv_weights[e, slot] = weights_flat[p]
+        recv_weights[e, slot] = weights[t, k]
         recv_token[e, slot] = t
         recv_expert_count[e] += 1
 

@@ -140,8 +140,7 @@ def moe_router(
         topk_vals_pad_flat = pl.reshape(topk_vals_pad, [T * SCORE_PAD])
         topk_idx_pad_flat = pl.reshape(topk_idx_pad, [T * SCORE_PAD])
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_hash_indices_and_scores"):
-            for p in pl.range(T * SCORE_PAD):
-                pl.write(topk_vals_pad_flat, [p], 0.0)
+            topk_vals_pad[:, :] = pl.full([T, SCORE_PAD], dtype=pl.FP32, value=0.0)
             for t in pl.unroll(T):
                 token_id = pl.cast(pl.read(input_ids_flat, [t]), pl.INDEX)
                 src_base = token_id * TOPK
