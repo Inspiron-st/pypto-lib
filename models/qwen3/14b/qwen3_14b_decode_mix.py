@@ -46,7 +46,7 @@ BLOCK_TABLE_FLAT_DYN = pl.dynamic("BLOCK_TABLE_FLAT_DYN")
 
 BATCH = 16
 MAX_SEQ = 4096
-NUM_HEADS = 40
+NUM_HEADS = 32
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
 HIDDEN = NUM_HEADS * HEAD_DIM  # 5120
@@ -64,9 +64,9 @@ BATCH_TILE = 16
 
 # Scope 2 tiling constants.
 # Qwen3-14B uses 40 Q heads and 8 KV heads, so q_per_kv = 5.
-Q_HEAD_BATCH = 5
+Q_HEAD_BATCH = 4
 Q_HEAD_PAD = 16
-SEQ_TILE = 256
+SEQ_TILE = 128
 SB_BATCH = 128
 BLOCK_SIZE = SEQ_TILE
 
@@ -454,13 +454,27 @@ def build_qwen3_decode_program(
                     all_cur_mi = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, 1], dtype=pl.FP32)
                     all_cur_li = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, 1], dtype=pl.FP32)
                     all_raw_scores = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, BLOCK_SIZE], dtype=pl.FP32)
+                    all_oi_tmp = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, head_dim], dtype=pl.FP32)
 
+                    # fa_fused: single mixed root covering qk_matmul + softmax +
+                    # sv_matmul + online_softmax. No chunk mechanism (auto_chunk
+                    # or chunk=N) is used. The kernel is structured as three
+                    # back-to-back phases inside one pl.at scope:
+                    #   1. qk_softmax loop: per-block QK matmul (cube) + tail-
+                    #      masked softmax (vec). Stashes exp_scores / mi / li.
+                    #   2. sv_matmul loop: per-block SV matmul (cube). Stashes
+                    #      per-block oi_tmp to GM scratch.
+                    #   3. online_softmax loop: vec-only recurrence reading
+                    #      per-block oi_tmp / mi / li back from GM. Stashing
+                    #      oi_tmp avoids the trowexpandmul output-layout issue
+                    #      that arises if SV matmul output feeds row_expand_mul
+                    #      directly without auto_chunk.
                     with pl.at(
                         level=pl.Level.CORE_GROUP,
-                        optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)],
+                        optimizations=[pl.split(pl.SplitMode.UP_DOWN)],
                         name_hint="fa_fused",
                     ):
-                        for sb in pl.parallel(ctx_blocks, chunk=1):
+                        for sb in pl.range(ctx_blocks):
                             s0 = sb * BLOCK_SIZE
                             valid_len = pl.min(BLOCK_SIZE, ctx_len - s0)
                             block_table_idx = block_table_base + sb
@@ -469,13 +483,18 @@ def build_qwen3_decode_program(
                             cache_row = (pbid * num_kv_heads + kvh) * BLOCK_SIZE
                             k_tile = k_cache[cache_row : cache_row + BLOCK_SIZE, :]
                             raw_scores = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
+                            # Stash QK matmul output to GM scratch, then read back
+                            # via bracket slicing so the AIV softmax lane sees a vec
+                            # tile, and attach the dynamic tail mask via
+                            # pl.set_validshape (replacing the disallowed
+                            # pl.slice(..., valid_shape=...) pattern).
                             all_raw_scores = pl.assemble(all_raw_scores, raw_scores, [sb * Q_HEAD_PAD, 0])
-                            scores_valid = pl.slice(
-                                all_raw_scores,
-                                [Q_HEAD_PAD, BLOCK_SIZE],
-                                [sb * Q_HEAD_PAD, 0],
-                                valid_shape=[Q_HEAD_PAD, valid_len],
-                            )
+                            scores_chunk = all_raw_scores[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
+                            # SplitVectorKernel halves the tile's row dim (UP_DOWN
+                            # halves rows from Q_HEAD_PAD to Q_HEAD_PAD//2) but
+                            # does not adjust set_validshape's row operand, so we
+                            # feed the post-split row count directly.
+                            scores_valid = pl.set_validshape(scores_chunk, Q_HEAD_PAD // 2, valid_len)
                             scores_padded = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
                             scores = pl.mul(scores_padded, attn_scale)
                             cur_mi = pl.row_max(scores)
@@ -487,28 +506,33 @@ def build_qwen3_decode_program(
                             all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [sb * Q_HEAD_PAD, 0])
                             all_cur_li = pl.assemble(all_cur_li, cur_li, [sb * Q_HEAD_PAD, 0])
 
-                        block_table_idx = block_table_base
-                        pbid = pl.cast(pl.tensor.read(block_table, [block_table_idx]), pl.INDEX)
+                        # SV matmul over all blocks, results stashed to GM so the
+                        # subsequent online-update loop loads each oi_tmp as a
+                        # fresh vec tile (row_major) and trowexpandmul on it has a
+                        # well-formed output layout. Sequential pl.range to make
+                        # the AIC SV matmul lane wait for the AIV softmax lane's
+                        # writes to all_exp_padded — without this serialisation
+                        # the two parallel loops in the same mixed root race on
+                        # the GM scratch and produce slightly wrong outputs.
+                        for sb in pl.range(ctx_blocks):
+                            block_table_idx = block_table_base + sb
+                            pbid = pl.cast(pl.tensor.read(block_table, [block_table_idx]), pl.INDEX)
+                            cache_row = (pbid * num_kv_heads + kvh) * BLOCK_SIZE
+                            exp_tile = all_exp_padded[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
+                            v_tile = v_cache[cache_row : cache_row + BLOCK_SIZE, :]
+                            oi_tmp = pl.matmul(exp_tile, v_tile, out_dtype=pl.FP32)
+                            all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [sb * Q_HEAD_PAD, 0])
 
-                        cache_row = (pbid * num_kv_heads + kvh) * BLOCK_SIZE
-                        exp_tile = all_exp_padded[0:Q_HEAD_PAD, :]
-                        v_tile = v_cache[cache_row : cache_row + BLOCK_SIZE, :]
-                        # Keeps the SV matmul result in the layout required by
-                        # the following row_expand_mul online update.
-                        oi = pl.mul(pl.matmul(exp_tile, v_tile, out_dtype=pl.FP32), 1.0)
+                        # Online softmax recurrence runs inside the same mixed
+                        # root, reading per-block oi_tmp / mi / li back from GM
+                        # so each row_expand_mul source is a freshly loaded vec
+                        # tile with row_major base layout.
+                        oi = all_oi_tmp[0:Q_HEAD_PAD, :]
                         mi = all_cur_mi[0:Q_HEAD_PAD, :]
                         li = all_cur_li[0:Q_HEAD_PAD, :]
 
                         for sb in pl.range(1, ctx_blocks):
-                            block_table_idx = block_table_base + sb
-                            pbid = pl.cast(pl.tensor.read(block_table, [block_table_idx]), pl.INDEX)
-
-                            cache_row = (pbid * num_kv_heads + kvh) * BLOCK_SIZE
-                            exp_tile = all_exp_padded[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
-                            v_tile = v_cache[cache_row : cache_row + BLOCK_SIZE, :]
-                            # Keeps the SV matmul result in the layout required by
-                            # the following row_expand_mul online update.
-                            oi_tmp = pl.mul(pl.matmul(exp_tile, v_tile, out_dtype=pl.FP32), 1.0)
+                            oi_tmp = all_oi_tmp[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
                             cur_mi = all_cur_mi[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
                             cur_li = all_cur_li[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
                             mi_new = pl.maximum(mi, cur_mi)
