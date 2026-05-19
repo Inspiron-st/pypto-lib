@@ -30,11 +30,15 @@ N_HASH_LAYERS = M.num_hash_layers
 D_CHUNK          = 128 if T >= 128 else (256 if T >= 64 else 512)
 D_BLOCKS         = D // D_CHUNK
 GATE_D_CHUNK     = 512
-GATE_D_BLOCKS    = D // GATE_D_CHUNK
 GATE_N_CHUNK     = N_EXPERTS if N_EXPERTS <= 32 else 16
+if D % GATE_D_CHUNK != 0:
+    raise ValueError(f"moe_router requires D ({D}) to be divisible by GATE_D_CHUNK ({GATE_D_CHUNK})")
+if N_EXPERTS % GATE_N_CHUNK != 0:
+    raise ValueError(
+        f"moe_router requires N_EXPERTS ({N_EXPERTS}) to be divisible by GATE_N_CHUNK ({GATE_N_CHUNK})"
+    )
+GATE_D_BLOCKS    = D // GATE_D_CHUNK
 GATE_N_BLOCKS    = N_EXPERTS // GATE_N_CHUNK
-assert D % GATE_D_CHUNK == 0
-assert N_EXPERTS % GATE_N_CHUNK == 0
 # SCORE_PAD = padded expert row width. sort32 handles 32-value runs; the
 # 512-wide path uses two mrgsort passes to cover FLASH/PRO expert counts.
 if N_EXPERTS <= 32:
