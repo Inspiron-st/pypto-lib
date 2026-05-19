@@ -78,6 +78,8 @@ OUT_PROJ_N_CHUNK = 256
 MLP_OUT_CHUNK = 256
 DOWN_MLP_CHUNK = 256
 DOWN_OUT_CHUNK = 256
+MLP_SPMD_INNER = 2
+MLP_GROUP_CHUNK = MLP_SPMD_INNER * MLP_OUT_CHUNK
 
 
 def build_qwen3_decode_program(
@@ -113,6 +115,7 @@ def build_qwen3_decode_program(
     total_q_groups = num_kv_heads * q_groups
     attn_scale = 1.0 / (head_dim ** 0.5)
     max_ctx_blocks = max_blocks_per_seq
+    assert mlp_out_blocks % MLP_SPMD_INNER == 0
 
     @pl.program
     class Qwen3Decode:
@@ -291,8 +294,10 @@ def build_qwen3_decode_program(
             # writes valid rows). all_q_padded is sized similarly; each
             # Q_HEAD_PAD block is padded inside rope_kv_cache.
             attn_out = pl.create_tensor([batch_padded, hidden], dtype=pl.BF16)
+            # Keep all_q_padded on a static upper bound to avoid dynamic-shape
+            # lowering issues in downstream SPMD cube codegen.
             all_q_padded = pl.create_tensor(
-                [batch_padded * total_q_groups * Q_HEAD_PAD, head_dim], dtype=pl.BF16,
+                [batch * total_q_groups * Q_HEAD_PAD, head_dim], dtype=pl.BF16,
             )
 
             # Outer loop iterates user_batch sequentially (one row per iter).
@@ -381,10 +386,13 @@ def build_qwen3_decode_program(
                         )
 
                 attn_row = pl.create_tensor([1, hidden], dtype=pl.BF16)
-                for gi in pl.parallel(0, total_q_groups, 2):
-                    gi0 = gi
-                    gi1 = gi + 1
-
+                all_raw_scores = pl.create_tensor(
+                    [total_q_groups * max_ctx_blocks * Q_HEAD_PAD, BLOCK_SIZE],
+                    dtype=pl.FP32,
+                )
+                for gi in pl.spmd(total_q_groups // 2, name_hint="qk_matmul"):
+                    gi0 = gi * 2
+                    gi1 = gi * 2 + 1
                     kvh0 = gi0 // q_groups
                     qg0 = gi0 - kvh0 * q_groups
                     q_base0 = kvh0 * q_per_kv + qg0 * Q_HEAD_BATCH
@@ -397,124 +405,182 @@ def build_qwen3_decode_program(
                     q_padded_row1 = b * total_q_groups * Q_HEAD_PAD + gi1 * Q_HEAD_PAD
                     q_padded1 = all_q_padded[q_padded_row1 : q_padded_row1 + Q_HEAD_PAD, :]
 
-                    all_raw_scores0 = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, BLOCK_SIZE], dtype=pl.FP32)
-                    all_raw_scores1 = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, BLOCK_SIZE], dtype=pl.FP32)
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_matmul"):
-                        for sb in pl.range(ctx_blocks):
-                            block_table_idx = block_table_base + sb
-                            pbid = pl.cast(pl.tensor.read(block_table, [block_table_idx]), pl.INDEX)
+                    for sb in pl.range(ctx_blocks):
+                        block_table_idx = block_table_base + sb
+                        pbid = pl.cast(pl.tensor.read(block_table, [block_table_idx]), pl.INDEX)
 
-                            cache_row0 = (pbid * num_kv_heads + kvh0) * BLOCK_SIZE
-                            k_tile0 = k_cache[cache_row0 : cache_row0 + BLOCK_SIZE, :]
-                            raw_scores0 = pl.matmul(q_padded0, k_tile0, b_trans=True, out_dtype=pl.FP32)
-                            all_raw_scores0 = pl.assemble(all_raw_scores0, raw_scores0, [sb * Q_HEAD_PAD, 0])
+                        cache_row0 = (pbid * num_kv_heads + kvh0) * BLOCK_SIZE
+                        k_tile0 = k_cache[cache_row0 : cache_row0 + BLOCK_SIZE, :]
+                        raw_scores0 = pl.matmul(q_padded0, k_tile0, b_trans=True, out_dtype=pl.FP32)
+                        cache_row1 = (pbid * num_kv_heads + kvh1) * BLOCK_SIZE
+                        k_tile1 = k_cache[cache_row1 : cache_row1 + BLOCK_SIZE, :]
+                        raw_scores1 = pl.matmul(q_padded1, k_tile1, b_trans=True, out_dtype=pl.FP32)
+                        all_raw_scores = pl.assemble(
+                            all_raw_scores,
+                            raw_scores0,
+                            [gi0 * max_ctx_blocks * Q_HEAD_PAD + sb * Q_HEAD_PAD, 0],
+                        )
+                        all_raw_scores = pl.assemble(
+                            all_raw_scores,
+                            raw_scores1,
+                            [gi1 * max_ctx_blocks * Q_HEAD_PAD + sb * Q_HEAD_PAD, 0],
+                        )
 
-                            cache_row1 = (pbid * num_kv_heads + kvh1) * BLOCK_SIZE
-                            k_tile1 = k_cache[cache_row1 : cache_row1 + BLOCK_SIZE, :]
-                            raw_scores1 = pl.matmul(q_padded1, k_tile1, b_trans=True, out_dtype=pl.FP32)
-                            all_raw_scores1 = pl.assemble(all_raw_scores1, raw_scores1, [sb * Q_HEAD_PAD, 0])
+                all_exp_padded = pl.create_tensor(
+                    [total_q_groups * max_ctx_blocks * Q_HEAD_PAD, BLOCK_SIZE],
+                    dtype=pl.BF16,
+                )
+                all_cur_mi = pl.create_tensor([total_q_groups * max_ctx_blocks * Q_HEAD_PAD, 1], dtype=pl.FP32)
+                all_cur_li = pl.create_tensor([total_q_groups * max_ctx_blocks * Q_HEAD_PAD, 1], dtype=pl.FP32)
 
-                    all_exp_padded0 = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, BLOCK_SIZE], dtype=pl.BF16)
-                    all_exp_padded1 = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, BLOCK_SIZE], dtype=pl.BF16)
-                    all_cur_mi0 = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, 1], dtype=pl.FP32)
-                    all_cur_mi1 = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, 1], dtype=pl.FP32)
-                    all_cur_li0 = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, 1], dtype=pl.FP32)
-                    all_cur_li1 = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, 1], dtype=pl.FP32)
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="softmax"):
-                        for sb in pl.range(ctx_blocks):
-                            s0 = sb * BLOCK_SIZE
-                            valid_len = pl.min(BLOCK_SIZE, ctx_len - s0)
+                for gi in pl.spmd(total_q_groups // 2, name_hint="softmax"):
+                    gi0 = gi * 2
+                    gi1 = gi * 2 + 1
+                    for sb in pl.range(ctx_blocks):
+                        s0 = sb * BLOCK_SIZE
+                        valid_len = pl.min(BLOCK_SIZE, ctx_len - s0)
 
-                            scores_valid0 = pl.slice(
-                                all_raw_scores0,
-                                [Q_HEAD_PAD, BLOCK_SIZE],
-                                [sb * Q_HEAD_PAD, 0],
-                                valid_shape=[Q_HEAD_PAD, valid_len],
-                            )
-                            scores_padded0 = pl.fillpad(scores_valid0, pad_value=pl.PadValue.min)
-                            scores0 = pl.mul(scores_padded0, attn_scale)
-                            cur_mi0 = pl.row_max(scores0)
-                            exp_scores0 = pl.exp(pl.row_expand_sub(scores0, cur_mi0))
-                            exp_scores_bf16_0 = pl.cast(exp_scores0, target_type=pl.BF16)
-                            exp_scores_fp32_0 = pl.cast(exp_scores_bf16_0, target_type=pl.FP32)
-                            cur_li0 = pl.row_sum(exp_scores_fp32_0)
-                            all_exp_padded0 = pl.assemble(all_exp_padded0, exp_scores_bf16_0, [sb * Q_HEAD_PAD, 0])
-                            all_cur_mi0 = pl.assemble(all_cur_mi0, cur_mi0, [sb * Q_HEAD_PAD, 0])
-                            all_cur_li0 = pl.assemble(all_cur_li0, cur_li0, [sb * Q_HEAD_PAD, 0])
+                        scores_valid0 = pl.slice(
+                            all_raw_scores,
+                            [Q_HEAD_PAD, BLOCK_SIZE],
+                            [gi0 * max_ctx_blocks * Q_HEAD_PAD + sb * Q_HEAD_PAD, 0],
+                            valid_shape=[Q_HEAD_PAD, valid_len],
+                        )
+                        scores_padded0 = pl.fillpad(scores_valid0, pad_value=pl.PadValue.min)
+                        scores0 = pl.mul(scores_padded0, attn_scale)
+                        cur_mi0 = pl.row_max(scores0)
+                        exp_scores0 = pl.exp(pl.row_expand_sub(scores0, cur_mi0))
+                        exp_scores_bf16_0 = pl.cast(exp_scores0, target_type=pl.BF16)
+                        exp_scores_fp32_0 = pl.cast(exp_scores_bf16_0, target_type=pl.FP32)
+                        cur_li0 = pl.row_sum(exp_scores_fp32_0)
+                        all_exp_padded = pl.assemble(
+                            all_exp_padded,
+                            exp_scores_bf16_0,
+                            [gi0 * max_ctx_blocks * Q_HEAD_PAD + sb * Q_HEAD_PAD, 0],
+                        )
+                        all_cur_mi = pl.assemble(
+                            all_cur_mi,
+                            cur_mi0,
+                            [gi0 * max_ctx_blocks * Q_HEAD_PAD + sb * Q_HEAD_PAD, 0],
+                        )
+                        all_cur_li = pl.assemble(
+                            all_cur_li,
+                            cur_li0,
+                            [gi0 * max_ctx_blocks * Q_HEAD_PAD + sb * Q_HEAD_PAD, 0],
+                        )
 
-                            scores_valid1 = pl.slice(
-                                all_raw_scores1,
-                                [Q_HEAD_PAD, BLOCK_SIZE],
-                                [sb * Q_HEAD_PAD, 0],
-                                valid_shape=[Q_HEAD_PAD, valid_len],
-                            )
-                            scores_padded1 = pl.fillpad(scores_valid1, pad_value=pl.PadValue.min)
-                            scores1 = pl.mul(scores_padded1, attn_scale)
-                            cur_mi1 = pl.row_max(scores1)
-                            exp_scores1 = pl.exp(pl.row_expand_sub(scores1, cur_mi1))
-                            exp_scores_bf16_1 = pl.cast(exp_scores1, target_type=pl.BF16)
-                            exp_scores_fp32_1 = pl.cast(exp_scores_bf16_1, target_type=pl.FP32)
-                            cur_li1 = pl.row_sum(exp_scores_fp32_1)
-                            all_exp_padded1 = pl.assemble(all_exp_padded1, exp_scores_bf16_1, [sb * Q_HEAD_PAD, 0])
-                            all_cur_mi1 = pl.assemble(all_cur_mi1, cur_mi1, [sb * Q_HEAD_PAD, 0])
-                            all_cur_li1 = pl.assemble(all_cur_li1, cur_li1, [sb * Q_HEAD_PAD, 0])
+                        scores_valid1 = pl.slice(
+                            all_raw_scores,
+                            [Q_HEAD_PAD, BLOCK_SIZE],
+                            [gi1 * max_ctx_blocks * Q_HEAD_PAD + sb * Q_HEAD_PAD, 0],
+                            valid_shape=[Q_HEAD_PAD, valid_len],
+                        )
+                        scores_padded1 = pl.fillpad(scores_valid1, pad_value=pl.PadValue.min)
+                        scores1 = pl.mul(scores_padded1, attn_scale)
+                        cur_mi1 = pl.row_max(scores1)
+                        exp_scores1 = pl.exp(pl.row_expand_sub(scores1, cur_mi1))
+                        exp_scores_bf16_1 = pl.cast(exp_scores1, target_type=pl.BF16)
+                        exp_scores_fp32_1 = pl.cast(exp_scores_bf16_1, target_type=pl.FP32)
+                        cur_li1 = pl.row_sum(exp_scores_fp32_1)
+                        all_exp_padded = pl.assemble(
+                            all_exp_padded,
+                            exp_scores_bf16_1,
+                            [gi1 * max_ctx_blocks * Q_HEAD_PAD + sb * Q_HEAD_PAD, 0],
+                        )
+                        all_cur_mi = pl.assemble(
+                            all_cur_mi,
+                            cur_mi1,
+                            [gi1 * max_ctx_blocks * Q_HEAD_PAD + sb * Q_HEAD_PAD, 0],
+                        )
+                        all_cur_li = pl.assemble(
+                            all_cur_li,
+                            cur_li1,
+                            [gi1 * max_ctx_blocks * Q_HEAD_PAD + sb * Q_HEAD_PAD, 0],
+                        )
 
-                    all_oi_tmp0 = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, head_dim], dtype=pl.FP32)
-                    all_oi_tmp1 = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, head_dim], dtype=pl.FP32)
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sv_matmul"):
-                        for sb in pl.range(ctx_blocks):
-                            block_table_idx = block_table_base + sb
-                            pbid = pl.cast(pl.tensor.read(block_table, [block_table_idx]), pl.INDEX)
+                all_oi_tmp = pl.create_tensor([total_q_groups * max_ctx_blocks * Q_HEAD_PAD, head_dim], dtype=pl.FP32)
+                for gi in pl.spmd(total_q_groups // 2, name_hint="sv_matmul"):
+                    gi0 = gi * 2
+                    gi1 = gi * 2 + 1
+                    kvh0 = gi0 // q_groups
+                    kvh1 = gi1 // q_groups
+                    for sb in pl.range(ctx_blocks):
+                        block_table_idx = block_table_base + sb
+                        pbid = pl.cast(pl.tensor.read(block_table, [block_table_idx]), pl.INDEX)
 
-                            cache_row0 = (pbid * num_kv_heads + kvh0) * BLOCK_SIZE
-                            exp_tile0 = all_exp_padded0[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
-                            v_tile0 = v_cache[cache_row0 : cache_row0 + BLOCK_SIZE, :]
-                            oi_tmp0 = pl.matmul(exp_tile0, v_tile0, out_dtype=pl.FP32)
-                            all_oi_tmp0 = pl.assemble(all_oi_tmp0, oi_tmp0, [sb * Q_HEAD_PAD, 0])
+                        cache_row0 = (pbid * num_kv_heads + kvh0) * BLOCK_SIZE
+                        exp_start0 = gi0 * max_ctx_blocks * Q_HEAD_PAD + sb * Q_HEAD_PAD
+                        exp_tile0 = all_exp_padded[exp_start0 : exp_start0 + Q_HEAD_PAD, :]
+                        v_tile0 = v_cache[cache_row0 : cache_row0 + BLOCK_SIZE, :]
+                        oi_tmp0 = pl.matmul(exp_tile0, v_tile0, out_dtype=pl.FP32)
+                        all_oi_tmp = pl.assemble(
+                            all_oi_tmp,
+                            oi_tmp0,
+                            [gi0 * max_ctx_blocks * Q_HEAD_PAD + sb * Q_HEAD_PAD, 0],
+                        )
 
-                            cache_row1 = (pbid * num_kv_heads + kvh1) * BLOCK_SIZE
-                            exp_tile1 = all_exp_padded1[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
-                            v_tile1 = v_cache[cache_row1 : cache_row1 + BLOCK_SIZE, :]
-                            oi_tmp1 = pl.matmul(exp_tile1, v_tile1, out_dtype=pl.FP32)
-                            all_oi_tmp1 = pl.assemble(all_oi_tmp1, oi_tmp1, [sb * Q_HEAD_PAD, 0])
+                        cache_row1 = (pbid * num_kv_heads + kvh1) * BLOCK_SIZE
+                        exp_start1 = gi1 * max_ctx_blocks * Q_HEAD_PAD + sb * Q_HEAD_PAD
+                        exp_tile1 = all_exp_padded[exp_start1 : exp_start1 + Q_HEAD_PAD, :]
+                        v_tile1 = v_cache[cache_row1 : cache_row1 + BLOCK_SIZE, :]
+                        oi_tmp1 = pl.matmul(exp_tile1, v_tile1, out_dtype=pl.FP32)
+                        all_oi_tmp = pl.assemble(
+                            all_oi_tmp,
+                            oi_tmp1,
+                            [gi1 * max_ctx_blocks * Q_HEAD_PAD + sb * Q_HEAD_PAD, 0],
+                        )
 
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="online_softmax"):
-                        oi0 = all_oi_tmp0[0:Q_HEAD_PAD, :]
-                        mi0 = all_cur_mi0[0:Q_HEAD_PAD, :]
-                        li0 = all_cur_li0[0:Q_HEAD_PAD, :]
-                        oi1 = all_oi_tmp1[0:Q_HEAD_PAD, :]
-                        mi1 = all_cur_mi1[0:Q_HEAD_PAD, :]
-                        li1 = all_cur_li1[0:Q_HEAD_PAD, :]
-                        for sb in pl.range(1, ctx_blocks):
-                            oi_tmp_valid0 = all_oi_tmp0[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
-                            cur_mi0 = all_cur_mi0[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
-                            cur_li0 = all_cur_li0[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
-                            mi_new0 = pl.maximum(mi0, cur_mi0)
-                            alpha0 = pl.exp(pl.sub(mi0, mi_new0))
-                            beta0 = pl.exp(pl.sub(cur_mi0, mi_new0))
-                            li0 = pl.add(pl.mul(alpha0, li0), pl.mul(beta0, cur_li0))
-                            oi0 = pl.add(pl.row_expand_mul(oi0, alpha0), pl.row_expand_mul(oi_tmp_valid0, beta0))
-                            mi0 = mi_new0
 
-                            oi_tmp_valid1 = all_oi_tmp1[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
-                            cur_mi1 = all_cur_mi1[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
-                            cur_li1 = all_cur_li1[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
-                            mi_new1 = pl.maximum(mi1, cur_mi1)
-                            alpha1 = pl.exp(pl.sub(mi1, mi_new1))
-                            beta1 = pl.exp(pl.sub(cur_mi1, mi_new1))
-                            li1 = pl.add(pl.mul(alpha1, li1), pl.mul(beta1, cur_li1))
-                            oi1 = pl.add(pl.row_expand_mul(oi1, alpha1), pl.row_expand_mul(oi_tmp_valid1, beta1))
-                            mi1 = mi_new1
+                for gi in pl.spmd(total_q_groups // 2, name_hint="online_softmax"):
+                    gi0 = gi * 2
+                    gi1 = gi * 2 + 1
+                    kvh0 = gi0 // q_groups
+                    qg0 = gi0 - kvh0 * q_groups
+                    q_base0 = kvh0 * q_per_kv + qg0 * Q_HEAD_BATCH
+                    kvh1 = gi1 // q_groups
+                    qg1 = gi1 - kvh1 * q_groups
+                    q_base1 = kvh1 * q_per_kv + qg1 * Q_HEAD_BATCH
 
-                        ctx0 = pl.row_expand_div(oi0, li0)
-                        ctx_valid0 = ctx0[0:Q_HEAD_BATCH, :]
-                        ctx_flat_bf16_0 = pl.cast(pl.reshape(ctx_valid0, [1, Q_HEAD_BATCH * head_dim]), target_type=pl.BF16)
-                        attn_row = pl.assemble(attn_row, ctx_flat_bf16_0, [0, q_base0 * head_dim])
+                    g0_start = gi0 * max_ctx_blocks * Q_HEAD_PAD
+                    g1_start = gi1 * max_ctx_blocks * Q_HEAD_PAD
+                    oi0 = all_oi_tmp[g0_start : g0_start + Q_HEAD_PAD, :]
+                    mi0 = all_cur_mi[g0_start : g0_start + Q_HEAD_PAD, 0:1]
+                    li0 = all_cur_li[g0_start : g0_start + Q_HEAD_PAD, 0:1]
+                    oi1 = all_oi_tmp[g1_start : g1_start + Q_HEAD_PAD, :]
+                    mi1 = all_cur_mi[g1_start : g1_start + Q_HEAD_PAD, 0:1]
+                    li1 = all_cur_li[g1_start : g1_start + Q_HEAD_PAD, 0:1]
+                    for sb in pl.range(1, ctx_blocks):
+                        sb0 = gi0 * max_ctx_blocks * Q_HEAD_PAD + sb * Q_HEAD_PAD
+                        oi_tmp_valid0 = all_oi_tmp[sb0 : sb0 + Q_HEAD_PAD, :]
+                        cur_mi0 = all_cur_mi[sb0 : sb0 + Q_HEAD_PAD, 0:1]
+                        cur_li0 = all_cur_li[sb0 : sb0 + Q_HEAD_PAD, 0:1]
+                        mi_new0 = pl.maximum(mi0, cur_mi0)
+                        alpha0 = pl.exp(pl.sub(mi0, mi_new0))
+                        beta0 = pl.exp(pl.sub(cur_mi0, mi_new0))
+                        li0 = pl.add(pl.mul(alpha0, li0), pl.mul(beta0, cur_li0))
+                        oi0 = pl.add(pl.row_expand_mul(oi0, alpha0), pl.row_expand_mul(oi_tmp_valid0, beta0))
+                        mi0 = mi_new0
 
-                        ctx1 = pl.row_expand_div(oi1, li1)
-                        ctx_valid1 = ctx1[0:Q_HEAD_BATCH, :]
-                        ctx_flat_bf16_1 = pl.cast(pl.reshape(ctx_valid1, [1, Q_HEAD_BATCH * head_dim]), target_type=pl.BF16)
-                        attn_row = pl.assemble(attn_row, ctx_flat_bf16_1, [0, q_base1 * head_dim])
+                        sb1 = gi1 * max_ctx_blocks * Q_HEAD_PAD + sb * Q_HEAD_PAD
+                        oi_tmp_valid1 = all_oi_tmp[sb1 : sb1 + Q_HEAD_PAD, :]
+                        cur_mi1 = all_cur_mi[sb1 : sb1 + Q_HEAD_PAD, 0:1]
+                        cur_li1 = all_cur_li[sb1 : sb1 + Q_HEAD_PAD, 0:1]
+                        mi_new1 = pl.maximum(mi1, cur_mi1)
+                        alpha1 = pl.exp(pl.sub(mi1, mi_new1))
+                        beta1 = pl.exp(pl.sub(cur_mi1, mi_new1))
+                        li1 = pl.add(pl.mul(alpha1, li1), pl.mul(beta1, cur_li1))
+                        oi1 = pl.add(pl.row_expand_mul(oi1, alpha1), pl.row_expand_mul(oi_tmp_valid1, beta1))
+                        mi1 = mi_new1
+
+                    ctx0 = pl.row_expand_div(oi0, li0)
+                    ctx_valid0 = ctx0[0:Q_HEAD_BATCH, :]
+                    ctx_flat_bf16_0 = pl.cast(pl.reshape(ctx_valid0, [1, Q_HEAD_BATCH * head_dim]), target_type=pl.BF16)
+                    attn_row = pl.assemble(attn_row, ctx_flat_bf16_0, [0, q_base0 * head_dim])
+
+                    ctx1 = pl.row_expand_div(oi1, li1)
+                    ctx_valid1 = ctx1[0:Q_HEAD_BATCH, :]
+                    ctx_flat_bf16_1 = pl.cast(pl.reshape(ctx_valid1, [1, Q_HEAD_BATCH * head_dim]), target_type=pl.BF16)
+                    attn_row = pl.assemble(attn_row, ctx_flat_bf16_1, [0, q_base1 * head_dim])
 
                 attn_out = pl.assemble(attn_out, attn_row, [b, 0])
 
@@ -586,9 +652,13 @@ def build_qwen3_decode_program(
                         post_norm_tile = pl.assemble(post_norm_tile, normed_bf16, [0, k0])
 
                 mlp_tile = pl.create_tensor([BATCH_TILE, inter], dtype=pl.BF16)
-                for ob in pl.range(mlp_out_blocks):
-                    o0 = ob * MLP_OUT_CHUNK
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_proj"):
+                for ob_base in pl.parallel(0, mlp_out_blocks, MLP_SPMD_INNER):
+                    gate_group = pl.create_tensor([BATCH_TILE, MLP_GROUP_CHUNK], dtype=pl.FP32)
+                    up_group = pl.create_tensor([BATCH_TILE, MLP_GROUP_CHUNK], dtype=pl.FP32)
+
+                    for ob in pl.spmd(MLP_SPMD_INNER, name_hint="gate_proj"):
+                        o0 = (ob_base + ob) * MLP_OUT_CHUNK
+                        g0 = ob * MLP_OUT_CHUNK
                         gate_acc = pl.create_tensor([BATCH_TILE, MLP_OUT_CHUNK], dtype=pl.FP32)
                         for kb in pl.pipeline(0, hidden_blocks, stage=2):
                             k0 = kb * K_CHUNK
@@ -598,8 +668,11 @@ def build_qwen3_decode_program(
                                 gate_acc = pl.matmul(post_chunk, wg, out_dtype=pl.FP32)
                             else:
                                 gate_acc = pl.matmul_acc(gate_acc, post_chunk, wg)
+                        gate_group = pl.assemble(gate_group, gate_acc, [0, g0])
 
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="up_proj"):
+                    for ob in pl.spmd(MLP_SPMD_INNER, name_hint="up_proj"):
+                        o0 = (ob_base + ob) * MLP_OUT_CHUNK
+                        g0 = ob * MLP_OUT_CHUNK
                         up_acc = pl.create_tensor([BATCH_TILE, MLP_OUT_CHUNK], dtype=pl.FP32)
                         for kb in pl.pipeline(0, hidden_blocks, stage=2):
                             k0 = kb * K_CHUNK
@@ -609,8 +682,13 @@ def build_qwen3_decode_program(
                                 up_acc = pl.matmul(post_chunk, wu, out_dtype=pl.FP32)
                             else:
                                 up_acc = pl.matmul_acc(up_acc, post_chunk, wu)
+                        up_group = pl.assemble(up_group, up_acc, [0, g0])
 
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="silu"):
+                    for ob in pl.spmd(MLP_SPMD_INNER, name_hint="silu"):
+                        o0 = (ob_base + ob) * MLP_OUT_CHUNK
+                        g0 = ob * MLP_OUT_CHUNK
+                        gate_acc = gate_group[:, g0 : g0 + MLP_OUT_CHUNK]
+                        up_acc = up_group[:, g0 : g0 + MLP_OUT_CHUNK]
                         sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
                         mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
                         mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
