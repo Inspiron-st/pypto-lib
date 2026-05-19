@@ -209,6 +209,13 @@ jobs:
       - name: Show ccache stats (before)
         run: ccache -s || true
 
+      - name: Clone pto-isa repository (pinned)
+        run: |
+          timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git $GITHUB_WORKSPACE/pto-isa \
+            || { rm -rf $GITHUB_WORKSPACE/pto-isa; git clone https://gitcode.com/luohuan40/pto-isa.git $GITHUB_WORKSPACE/pto-isa; }
+          cd $GITHUB_WORKSPACE/pto-isa
+          git checkout ${{ env.PTO_ISA_COMMIT }}
+
       - name: Sync pypto source (local cache)
         run: |
           PYPTO_SRC="/opt/pypto-src"
@@ -258,13 +265,6 @@ jobs:
           tar -xzf "$CACHE_ARCHIVE" -C "$GITHUB_WORKSPACE/ptoas-bin"
           chmod +x "$GITHUB_WORKSPACE/ptoas-bin/ptoas"
           chmod +x "$GITHUB_WORKSPACE/ptoas-bin/bin/ptoas"
-
-      - name: Clone pto-isa repository (pinned)
-        run: |
-          timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git $GITHUB_WORKSPACE/pto-isa \
-            || { rm -rf $GITHUB_WORKSPACE/pto-isa; git clone https://gitcode.com/luohuan40/pto-isa.git $GITHUB_WORKSPACE/pto-isa; }
-          cd $GITHUB_WORKSPACE/pto-isa
-          git checkout ${{ env.PTO_ISA_COMMIT }}
 
       - name: Run a2a3 tests
         env:
