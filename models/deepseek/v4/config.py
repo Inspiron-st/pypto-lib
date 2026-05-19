@@ -155,7 +155,7 @@ FLASH = DeepSeekV4Config(
     rms_norm_eps=1e-6,
     vocab_size=129280,
     moe_intermediate_size=2048,
-    n_routed_experts=256//16, # local experts per EP (total experts = n_routed_experts * EP_WORLD_SIZE)
+    n_routed_experts=256,
     n_shared_experts=1,
     num_experts_per_tok=6,
     scoring_func="sqrtsoftplus",
@@ -251,6 +251,8 @@ INT8_AMAX_EPS = 1e-4                      # amax floor: avoids 127/0 on all-zero
 FP32_NEG_INF = -3.4028234663852886e38     # most-negative finite fp32 (softmax masking)
 
 # EP communication constants
-EP_WORLD_SIZE = 1   # demo 1; flash/pro depend on deployment (e.g. pro 16)
+EP_WORLD_SIZE = 16  # deployment EP world size (demo overrides to 1)
 EP_RANK = 0
-RECV_MAX = 768       # per-(local-expert) row upper bound (B*S*TOPK = 64*2*6)
+RECV_SAFETY = 4
+RECV_MAX = (DECODE_BATCH * DECODE_SEQ * FLASH.num_experts_per_tok
+            // (FLASH.n_routed_experts // EP_WORLD_SIZE)) * RECV_SAFETY

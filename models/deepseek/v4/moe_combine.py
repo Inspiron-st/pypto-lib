@@ -25,10 +25,8 @@ B = DECODE_BATCH
 S = DECODE_SEQ
 T = B * S
 D = M.hidden_size
-N_EXPERTS = M.n_routed_experts
-
-# EP layout / recv buffers
-N_LOCAL_EXPERTS = N_EXPERTS // EP_WORLD_SIZE
+# EP layout / recv buffers (single-card view: kernel only sees the local shard)
+N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 
 # tiling
 COL_CHUNK = 512

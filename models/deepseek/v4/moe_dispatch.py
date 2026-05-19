@@ -33,10 +33,8 @@ S = DECODE_SEQ
 T = B * S
 D = M.hidden_size
 TOPK = M.num_experts_per_tok
-N_EXPERTS = M.n_routed_experts
-
-# EP layout / recv buffers
-N_LOCAL_EXPERTS = N_EXPERTS // EP_WORLD_SIZE
+# EP layout / recv buffers (single-card view: kernel only sees the local shard)
+N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 EXPERTS_START_IDX = EP_RANK * N_LOCAL_EXPERTS
 
 # tiling
@@ -209,7 +207,7 @@ def build_tensor_specs():
 
     def init_indices():
         # Each token picks TOPK distinct experts.
-        rows = [torch.randperm(N_EXPERTS)[:TOPK] for _ in range(T)]
+        rows = [torch.randperm(N_LOCAL_EXPERTS)[:TOPK] for _ in range(T)]
         return torch.stack(rows).to(torch.int32)
 
     def init_weights():

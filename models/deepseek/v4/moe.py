@@ -60,13 +60,13 @@ MIX_HC = M.mix_hc
 HC_DIM = M.hc_dim
 
 # Router
-N_EXPERTS = M.n_routed_experts
+N_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE   # single-card simplification: router routes over local shard only
 TOPK = M.num_experts_per_tok
 VOCAB = M.vocab_size
 
 # Expert (must match moe_expert.py)
 MOE_INTER = M.moe_intermediate_size
-N_LOCAL_EXPERTS = N_EXPERTS // EP_WORLD_SIZE
+N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 
 # Sanity: chosen layout requires RECV_MAX >= T * TOPK.
 assert RECV_MAX >= T * TOPK, "packed layout needs RECV_MAX >= T * TOPK"

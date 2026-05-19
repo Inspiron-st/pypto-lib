@@ -11,7 +11,7 @@
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, FP32_NEG_INF
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, FP32_NEG_INF, EP_WORLD_SIZE
 
 
 # model config
@@ -20,7 +20,7 @@ S             = DECODE_SEQ
 T             = B * S
 D             = M.hidden_size
 NORM_EPS      = M.rms_norm_eps
-N_EXPERTS     = M.n_routed_experts
+N_EXPERTS     = M.n_routed_experts // EP_WORLD_SIZE   # single-card view: route only over local shard
 TOPK          = M.num_experts_per_tok
 ROUTE_SCALE   = M.routed_scaling_factor
 VOCAB         = M.vocab_size

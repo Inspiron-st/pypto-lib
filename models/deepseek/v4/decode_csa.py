@@ -86,11 +86,11 @@ assert SHOULD_COMPRESS and START_POS >= WIN - S, (
 )
 
 # ---- moe-local constants ----
-N_EXPERTS = M.n_routed_experts
+N_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE   # single-card simplification: router routes over local shard only
 TOPK_E = M.num_experts_per_tok
 VOCAB = M.vocab_size
 MOE_INTER = M.moe_intermediate_size
-N_LOCAL_EXPERTS = N_EXPERTS // EP_WORLD_SIZE
+N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 assert RECV_MAX >= T * TOPK_E, "packed layout needs RECV_MAX >= T * TOPK_E"
 
 

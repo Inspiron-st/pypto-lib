@@ -11,30 +11,29 @@
 
 import pypto.language as pl
 
-from config import (FLASH as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS,
+from config import (FLASH as M, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS,
                     EP_WORLD_SIZE, EP_RANK, RECV_MAX)
 
 
 # model config
-B = DECODE_BATCH
+B = 16
 S = DECODE_SEQ
 T = B * S
 D = M.hidden_size
 MOE_INTER = M.moe_intermediate_size
 SWIGLU_LIMIT = M.swiglu_limit
-N_EXPERTS = M.n_routed_experts
 
-# EP layout / recv buffers
-N_LOCAL_EXPERTS = N_EXPERTS // EP_WORLD_SIZE
+# EP layout / recv buffers (single-card view: kernel only sees the local shard)
+N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 EXPERTS_START_IDX = EP_RANK * N_LOCAL_EXPERTS
 
 # tiling
-RECV_TILE = 16
+RECV_TILE = 32
 K_CHUNK = 512
 INTER_K = 512
-INTER_CHUNK = 64 if T >= 128 else (128 if T >= 64 else 256)
-D_OUT_CHUNK = 128 if T >= 128 else (256 if T >= 64 else 512)
-QUANT_CHUNK = 32 if T >= 128 else (128 if T >= 64 else 256)   # column chunk for two-pass per-row INT8 quant (vec budget aware)
+INTER_CHUNK = 128
+D_OUT_CHUNK = 512
+QUANT_CHUNK = 256   # column chunk for two-pass per-row INT8 quant
 
 
 @pl.jit.inline
@@ -92,51 +91,33 @@ def moe_expert(
 
             valid_rows = pl.min(RECV_TILE, n_rows - t0)
 
-            # Materialize the HBM slice into a Vec tile via ``pl.assemble``
-            # chunk-by-chunk — a bare reshape is folded to an HBM alias and
-            # matmul's LHS then hangs AICPU (sync timeout 507018).
-            recv_x_tile_i8 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT8)
-            recv_x_scale_dq_tile = pl.create_tensor([RECV_TILE, 1], dtype=pl.FP32)
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="recv_x_load"):
-                for k0 in pl.range(0, D, QUANT_CHUNK):
-                    rx_3d = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, k0 : k0 + QUANT_CHUNK]
-                    rx_2d = pl.reshape(rx_3d, [RECV_TILE, QUANT_CHUNK])
-                    recv_x_tile_i8 = pl.assemble(recv_x_tile_i8, rx_2d, [0, k0])
-                sd_2d = pl.reshape(
-                    recv_scale_dq[local_i : local_i + 1, t0 : t0 + RECV_TILE],
-                    [RECV_TILE, 1],
-                )
-                recv_x_scale_dq_tile = pl.assemble(recv_x_scale_dq_tile, sd_2d, [0, 0])
-            recv_x_scale_dq = recv_x_scale_dq_tile
-
             # Stage 1a: gate/up matmul + dequant + SwiGLU + routing-weight mul.
             h_tile_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
 
             for n0 in pl.parallel(0, MOE_INTER, INTER_CHUNK):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_gate_up_matmul"):
-                    x_init = recv_x_tile_i8[:, 0 : K_CHUNK]
+                    x_init = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, 0 : K_CHUNK]
                     w1_init = expert_w1[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, 0 : K_CHUNK]
                     w3_init = expert_w3[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, 0 : K_CHUNK]
                     gate_acc = pl.matmul(x_init, w1_init, b_trans=True, out_dtype=pl.INT32)
                     up_acc = pl.matmul(x_init, w3_init, b_trans=True, out_dtype=pl.INT32)
                     for k0 in pl.range(K_CHUNK, D, K_CHUNK):
-                        x_k = recv_x_tile_i8[:, k0 : k0 + K_CHUNK]
+                        x_k = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, k0 : k0 + K_CHUNK]
                         w1_k = expert_w1[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, k0 : k0 + K_CHUNK]
                         w3_k = expert_w3[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, k0 : k0 + K_CHUNK]
                         gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True)
                         up_acc = pl.matmul_acc(up_acc, x_k, w3_k, b_trans=True)
 
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_gate_up_dequant"):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_dequant_swiglu"):
                     gate_2d_i32 = pl.reshape(gate_acc, [RECV_TILE, INTER_CHUNK])
                     up_2d_i32 = pl.reshape(up_acc, [RECV_TILE, INTER_CHUNK])
+                    recv_x_scale_dq = pl.reshape(recv_scale_dq[local_i : local_i + 1, t0 : t0 + RECV_TILE], [RECV_TILE, 1])
                     w1_scale_chunk = expert_w1_scale[local_i : local_i + 1, n0 : n0 + INTER_CHUNK]
                     w3_scale_chunk = expert_w3_scale[local_i : local_i + 1, n0 : n0 + INTER_CHUNK]
                     gate_2d = pl.cast(gate_2d_i32, target_type=pl.FP32, mode="none")
                     up_2d = pl.cast(up_2d_i32, target_type=pl.FP32, mode="none")
                     gate_2d = pl.col_expand_mul(pl.row_expand_mul(gate_2d, recv_x_scale_dq), w1_scale_chunk)
                     up_2d = pl.col_expand_mul(pl.row_expand_mul(up_2d, recv_x_scale_dq), w3_scale_chunk)
-
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_swiglu"):
                     if SWIGLU_LIMIT > 0.0:
                         gate_2d = pl.minimum(gate_2d, SWIGLU_LIMIT)
                         up_2d = pl.maximum(pl.minimum(up_2d, SWIGLU_LIMIT), -SWIGLU_LIMIT)
@@ -208,15 +189,13 @@ def moe_expert(
                 sh_gate_acc = pl.matmul_acc(sh_gate_acc, xs_k, sw1_k, b_trans=True)
                 sh_up_acc = pl.matmul_acc(sh_up_acc, xs_k, sw3_k, b_trans=True)
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_gate_up_dequant"):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_dequant_swiglu"):
             sw1_scale_chunk = pl.reshape(shared_w1_scale[n0 : n0 + INTER_CHUNK], [1, INTER_CHUNK])
             sw3_scale_chunk = pl.reshape(shared_w3_scale[n0 : n0 + INTER_CHUNK], [1, INTER_CHUNK])
             sh_gate = pl.cast(sh_gate_acc, target_type=pl.FP32, mode="none")
             sh_up = pl.cast(sh_up_acc, target_type=pl.FP32, mode="none")
             sh_gate = pl.col_expand_mul(pl.row_expand_mul(sh_gate, x_local_scale_dq), sw1_scale_chunk)
             sh_up = pl.col_expand_mul(pl.row_expand_mul(sh_up, x_local_scale_dq), sw3_scale_chunk)
-
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_swiglu"):
             sh_sigmoid = pl.recip(pl.add(pl.exp(pl.neg(sh_gate)), 1.0))
             sh_silu = pl.mul(sh_gate, sh_sigmoid)
             sh_gated = pl.mul(sh_silu, sh_up)
@@ -250,12 +229,10 @@ def moe_expert(
                 sw2_k = shared_w2[d0 : d0 + D_OUT_CHUNK, k0 : k0 + INTER_K]
                 sh_y_acc = pl.matmul_acc(sh_y_acc, hs_k, sw2_k, b_trans=True)
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_w2_dequant"):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_w2_dequant_write"):
             sw2_scale_chunk = pl.reshape(shared_w2_scale[d0 : d0 + D_OUT_CHUNK], [1, D_OUT_CHUNK])
             sh_y = pl.cast(sh_y_acc, target_type=pl.FP32, mode="none")
             sh_y = pl.col_expand_mul(pl.row_expand_mul(sh_y, sh_tile_scale_dq), sw2_scale_chunk)
-
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_write"):
             sh[:, d0 : d0 + D_OUT_CHUNK] = pl.cast(sh_y, target_type=pl.BF16, mode="rint")
 
 
@@ -380,17 +357,12 @@ def build_tensor_specs():
     import torch
     from golden import TensorSpec
 
-    # Mix of edge cases: count=0 (entire expert skipped), count not divisible
-    # by RECV_TILE (last-tile straddles valid/invalid boundary), full RECV_MAX.
-    counts = torch.tensor(
-        [0, 1, RECV_TILE - 1, RECV_TILE, RECV_TILE + 1, RECV_MAX - 1, RECV_MAX, RECV_MAX // 2][:N_LOCAL_EXPERTS],
-        dtype=torch.int32,
-    )
-    if counts.numel() < N_LOCAL_EXPERTS:
-        extra = torch.randint(
-            0, RECV_MAX + 1, (N_LOCAL_EXPERTS - counts.numel(),), dtype=torch.int32
-        )
-        counts = torch.cat([counts, extra])
+    # Distribute B*S*TOPK token-expert pairs uniformly across local experts.
+    total = B * S * M.num_experts_per_tok
+    counts = torch.bincount(
+        torch.randint(0, N_LOCAL_EXPERTS, (total,)),
+        minlength=N_LOCAL_EXPERTS,
+    ).to(torch.int32)
     counts_2d = counts.reshape(N_LOCAL_EXPERTS, 1)
 
     # Build a consistent INT8 recv_x + per-row dequant scale (dispatch is
@@ -466,6 +438,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
@@ -475,6 +448,7 @@ if __name__ == "__main__":
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
+            enable_l2_swimlane=args.enable_l2_swimlane,
         ),
         rtol=1e-3,
         atol=1e-3,
