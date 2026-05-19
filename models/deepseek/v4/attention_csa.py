@@ -156,7 +156,7 @@ def attention_csa(
     x_out: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
     start_pos: pl.Scalar[pl.INT32],
 ):
-    compress_rem = (start_pos + S) % COMPRESS_RATIO
+    compress_offset = COMPRESS_RATIO - (start_pos % COMPRESS_RATIO)
 
     x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
     post_t = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
@@ -203,8 +203,8 @@ def attention_csa(
         cmp_sin_base = pl.full([1, HALF_ROPE], dtype=pl.FP32, value=0.0)
         cmp_cos = cmp_cos_base
         cmp_sin = cmp_sin_base
-        if start_pos + 1 >= COMPRESS_RATIO:
-            cmp_pos = pl.cast(start_pos + 1 - COMPRESS_RATIO, pl.INDEX)
+        if (start_pos % COMPRESS_RATIO) + S >= COMPRESS_RATIO:
+            cmp_pos = pl.cast(start_pos + compress_offset - COMPRESS_RATIO, pl.INDEX)
             cmp_cos = pl.col_expand(
                 cmp_cos_base,
                 pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [cmp_pos, 0]), target_type=pl.FP32),
@@ -273,7 +273,7 @@ def attention_csa(
         ROTATE_MAIN,
     )
 
-    if compress_rem == 0:
+    if (start_pos % COMPRESS_RATIO) + S >= COMPRESS_RATIO:
         cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
         cmp_block_table_flat = pl.reshape(cmp_block_table, [B * CMP_MAX_BLOCKS])
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_scatter_cmp"):
@@ -608,9 +608,12 @@ def golden_attention_csa(tensors):
     rope_sin_t = freqs_sin[start_pos:start_pos + 1].expand(T, ROPE_HEAD_DIM).contiguous()
     step_cos = freqs_cos[start_pos:start_pos + 1, :HALF_ROPE].contiguous()
     step_sin = freqs_sin[start_pos:start_pos + 1, :HALF_ROPE].contiguous()
-    if start_pos + 1 >= COMPRESS_RATIO:
-        cmp_cos = freqs_cos[start_pos + 1 - COMPRESS_RATIO:start_pos + 2 - COMPRESS_RATIO, :HALF_ROPE].contiguous()
-        cmp_sin = freqs_sin[start_pos + 1 - COMPRESS_RATIO:start_pos + 2 - COMPRESS_RATIO, :HALF_ROPE].contiguous()
+    compress_offset = COMPRESS_RATIO - (start_pos % COMPRESS_RATIO)
+    should_compress = compress_offset <= S
+    if should_compress:
+        cmp_pos = start_pos + compress_offset - COMPRESS_RATIO
+        cmp_cos = freqs_cos[cmp_pos:cmp_pos + 1, :HALF_ROPE].contiguous()
+        cmp_sin = freqs_sin[cmp_pos:cmp_pos + 1, :HALF_ROPE].contiguous()
     else:
         cmp_cos = torch.zeros(1, HALF_ROPE, dtype=torch.bfloat16)
         cmp_sin = torch.zeros(1, HALF_ROPE, dtype=torch.bfloat16)
@@ -670,7 +673,7 @@ def golden_attention_csa(tensors):
         "start_pos": tensors["start_pos"],
         "rotate": False,
     })
-    if (start_pos + S) % COMPRESS_RATIO == 0:
+    if should_compress:
         cmp_slot_rel = start_pos // COMPRESS_RATIO
         for b in range(B):
             blk_id = int(cmp_block_table[b, cmp_slot_rel // BLOCK_SIZE].item())

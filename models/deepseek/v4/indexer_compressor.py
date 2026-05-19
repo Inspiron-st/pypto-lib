@@ -37,12 +37,7 @@ COFF = 1 + int(OVERLAP)
 OUT_DIM = COFF * HEAD_DIM
 STATE_LEN = COFF * COMPRESS_RATIO
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
-START_POS = COMPRESS_RATIO - S       # ScalarSpec default; (START_POS+S)%COMPRESS_RATIO==0
-SHOULD_COMPRESS = COMPRESS_RATIO != 0 and ((START_POS + S) % COMPRESS_RATIO) == 0
-APE_ROW = START_POS % COMPRESS_RATIO if COMPRESS_RATIO != 0 else 0
-SCATTER_SLOT = (COMPRESS_RATIO + APE_ROW) if OVERLAP else APE_ROW
-# S-aware decode contract: each call writes S consecutive tokens to state slots
-# [SCATTER_SLOT, SCATTER_SLOT + S).
+START_POS = COMPRESS_RATIO - 1       # ScalarSpec default exercises S-token window-boundary scatter
 
 # tiling
 ROPE_CHUCK = 32
@@ -75,19 +70,14 @@ def indexer_compressor(
     rotate: pl.Scalar[pl.BOOL],
 ):
     x_flat = pl.reshape(x, [B * S, D])
-    kv_proj = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
-    score_proj = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
+    idx_cmp_kv_proj_scratch = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
+    idx_cmp_score_proj_scratch = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
     ape_row = pl.cast(start_pos % COMPRESS_RATIO, target_type=pl.INDEX)
-    compress_rem = (start_pos + S) % COMPRESS_RATIO
-    scatter_slot = COMPRESS_RATIO + ape_row
+    pre_tokens = COMPRESS_RATIO - (start_pos % COMPRESS_RATIO)
     kv_state_flat = pl.reshape(kv_state, [B, STATE_LEN * OUT_DIM])
     score_state_flat = pl.reshape(score_state, [B, STATE_LEN * OUT_DIM])
 
-    # 3D views (read-only) for per-token slicing of the projection outputs.
-    kv_proj_3d = pl.reshape(kv_proj, [B, S, OUT_DIM])
-    score_proj_3d = pl.reshape(score_proj, [B, S, OUT_DIM])
-
-    for o0 in pl.parallel(0, OUT_DIM, OUT_CHUNK):
+    for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_score_proj"):
             x_tile = x_flat[:, 0 : K_CHUNK]
             wkv_tile = wkv[0 : K_CHUNK, o0 : o0 + OUT_CHUNK]
@@ -102,18 +92,23 @@ def indexer_compressor(
                 kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile)
                 score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile)
 
-            kv_proj = pl.assemble(kv_proj, kv_acc, [0, o0])
-            score_proj = pl.assemble(score_proj, score_acc, [0, o0])
+            idx_cmp_kv_proj_scratch = pl.assemble(idx_cmp_kv_proj_scratch, kv_acc, [0, o0])
+            idx_cmp_score_proj_scratch = pl.assemble(idx_cmp_score_proj_scratch, score_acc, [0, o0])
 
-        # Per-token: read 3D slice, add ape, write directly to state slot s.
-        for s in pl.range(S):
+        idx_cmp_kv_proj_3d = pl.reshape(idx_cmp_kv_proj_scratch, [B, S, OUT_DIM])
+        idx_cmp_score_proj_3d = pl.reshape(idx_cmp_score_proj_scratch, [B, S, OUT_DIM])
+        scatter_stop = S
+        if pre_tokens < S:
+            scatter_stop = pre_tokens
+        for s in pl.range(scatter_stop):
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter"):
-                kv_tile = pl.reshape(kv_proj_3d[:, s : s + 1, o0 : o0 + OUT_CHUNK], [B, OUT_CHUNK])
-                score_tile = pl.reshape(score_proj_3d[:, s : s + 1, o0 : o0 + OUT_CHUNK], [B, OUT_CHUNK])
-                ape_tile = ape[ape_row + s : ape_row + s + 1, o0 : o0 + OUT_CHUNK]
+                kv_tile = pl.reshape(idx_cmp_kv_proj_3d[:, s : s + 1, o0 : o0 + OUT_CHUNK], [B, OUT_CHUNK])
+                score_tile = pl.reshape(idx_cmp_score_proj_3d[:, s : s + 1, o0 : o0 + OUT_CHUNK], [B, OUT_CHUNK])
+                token_ape_row = (ape_row + s) % COMPRESS_RATIO
+                ape_tile = ape[token_ape_row : token_ape_row + 1, o0 : o0 + OUT_CHUNK]
                 ape_base = pl.full([B, OUT_CHUNK], dtype=pl.FP32, value=0.0)
                 score_tile = pl.add(score_tile, pl.col_expand(ape_base, ape_tile))
-                slot_col0_s = (scatter_slot + s) * OUT_DIM
+                slot_col0_s = (COMPRESS_RATIO + token_ape_row) * OUT_DIM
                 kv_state_flat = pl.assemble(kv_state_flat, kv_tile, [0, slot_col0_s + o0])
                 score_state_flat = pl.assemble(score_state_flat, score_tile, [0, slot_col0_s + o0])
 
@@ -122,7 +117,7 @@ def indexer_compressor(
     kv_final = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
     kv_flat = pl.reshape(kv, [B * S, HEAD_DIM])
 
-    if compress_rem == 0:
+    if (start_pos % COMPRESS_RATIO) + S >= COMPRESS_RATIO:
         for hb in pl.parallel(0, HEAD_BLOCKS, 1):
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="softmax_pool"):
                 h0 = hb * HEAD_CHUNK
@@ -156,7 +151,7 @@ def indexer_compressor(
                 pooled_chunk = pl.div(oi, li)
                 pooled_kv = pl.assemble(pooled_kv, pooled_chunk, [0, h0])
 
-        for s in pl.parallel(0, COMPRESS_RATIO, 1):
+        for s in pl.range(0, COMPRESS_RATIO, 1):
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_shift"):
                 src_col0 = (COMPRESS_RATIO + s) * OUT_DIM
                 dst_col0 = s * OUT_DIM
@@ -273,6 +268,40 @@ def indexer_compressor(
                     pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint"),
                     [cache_row, 0],
                 )
+        idx_cmp_kv_proj_3d = pl.reshape(idx_cmp_kv_proj_scratch, [B, S, OUT_DIM])
+        idx_cmp_score_proj_3d = pl.reshape(idx_cmp_score_proj_scratch, [B, S, OUT_DIM])
+        if pre_tokens < S:
+            for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
+                for s in pl.range(pre_tokens, S):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_next"):
+                        kv_tile = pl.reshape(idx_cmp_kv_proj_3d[:, s : s + 1, o0 : o0 + OUT_CHUNK], [B, OUT_CHUNK])
+                        score_tile = pl.reshape(idx_cmp_score_proj_3d[:, s : s + 1, o0 : o0 + OUT_CHUNK], [B, OUT_CHUNK])
+                        shift_dep_col0 = (COMPRESS_RATIO - 1) * OUT_DIM + o0
+                        dep_zero = pl.sub(
+                            kv_state_flat[:, shift_dep_col0 : shift_dep_col0 + OUT_CHUNK],
+                            kv_state_flat[:, shift_dep_col0 : shift_dep_col0 + OUT_CHUNK],
+                        )
+                        kv_tile = pl.add(kv_tile, dep_zero)
+                        score_tile = pl.add(score_tile, dep_zero)
+                        token_ape_row = (ape_row + s) % COMPRESS_RATIO
+                        ape_tile = ape[token_ape_row : token_ape_row + 1, o0 : o0 + OUT_CHUNK]
+                        ape_base = pl.full([B, OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                        score_tile = pl.add(score_tile, pl.col_expand(ape_base, ape_tile))
+                        slot_col0_s = (COMPRESS_RATIO + token_ape_row) * OUT_DIM
+                        kv_state_flat = pl.assemble(kv_state_flat, kv_tile, [0, slot_col0_s + o0])
+                        score_state_flat = pl.assemble(score_state_flat, score_tile, [0, slot_col0_s + o0])
+
+        for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
+            for s in pl.range(pre_tokens):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_shift_boundary"):
+                    token_ape_row = (ape_row + s) % COMPRESS_RATIO
+                    src_col0 = (COMPRESS_RATIO + token_ape_row) * OUT_DIM
+                    dst_col0 = token_ape_row * OUT_DIM
+                    kv_tile = kv_state_flat[:, src_col0 + o0 : src_col0 + o0 + OUT_CHUNK]
+                    score_tile = score_state_flat[:, src_col0 + o0 : src_col0 + o0 + OUT_CHUNK]
+                    kv_state_flat = pl.assemble(kv_state_flat, kv_tile, [0, dst_col0 + o0])
+                    score_state_flat = pl.assemble(score_state_flat, score_tile, [0, dst_col0 + o0])
+
         kv_cache = pl.reshape(kv_cache_flat, [B, IDX_KV_LEN, HEAD_DIM])
 
     kv_state = pl.reshape(kv_state_flat, [B, STATE_LEN, OUT_DIM])
@@ -328,15 +357,18 @@ def golden_compressor(tensors):
 
     kv = x @ wkv                        # [B, S, OUT_DIM]
     score = x @ wgate                   # [B, S, OUT_DIM]
+    kv_proj = kv
 
-    should_compress = (start_pos + S) % ratio == 0
+    pre_tokens = min(S, ratio - (start_pos % ratio))
+    should_compress = pre_tokens < S or (start_pos + S) % ratio == 0
 
-    # Per-token ape add + scatter to slot (ratio + ape_row + s) for overlap=True.
+    # Per-token ape add + scatter to wrapped overlap slots.
     ape_row_g = start_pos % ratio
-    for s in range(S):
-        score[:, s, :] = score[:, s, :] + ape[ape_row_g + s]
-        kv_state[:bsz, ratio + ape_row_g + s] = kv[:, s, :]
-        score_state[:bsz, ratio + ape_row_g + s] = score[:, s, :]
+    for s in range(pre_tokens):
+        token_ape_row = (ape_row_g + s) % ratio
+        score[:, s, :] = score[:, s, :] + ape[token_ape_row]
+        kv_state[:bsz, ratio + token_ape_row] = kv[:, s, :]
+        score_state[:bsz, ratio + token_ape_row] = score[:, s, :]
 
     if should_compress:
         kvs = torch.cat([kv_state[:bsz, :ratio, :d], kv_state[:bsz, ratio:, d:]], dim=1)
@@ -344,6 +376,13 @@ def golden_compressor(tensors):
         kv = (kvs * scs.softmax(dim=1)).sum(dim=1, keepdim=True)
         kv_state[:bsz, :ratio] = kv_state[:bsz, ratio:]
         score_state[:bsz, :ratio] = score_state[:bsz, ratio:]
+
+    if pre_tokens < S:
+        for s in range(pre_tokens, S):
+            token_ape_row = (ape_row_g + s) % ratio
+            score[:, s, :] = score[:, s, :] + ape[token_ape_row]
+            kv_state[:bsz, ratio + token_ape_row] = kv_proj[:, s, :]
+            score_state[:bsz, ratio + token_ape_row] = score[:, s, :]
 
     tensors["kv_state"][:] = kv_state
     tensors["score_state"][:] = score_state

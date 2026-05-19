@@ -123,7 +123,7 @@ def attention_hca(
     """HCA decode orchestration for compress_ratio=128. Caller contract:
     runtime ``start_pos`` MUST equal compile-time ``START_POS``.
     """
-    compress_rem = (start_pos + S) % COMPRESS_RATIO
+    compress_offset = COMPRESS_RATIO - (start_pos % COMPRESS_RATIO)
 
     x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
     post_t = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
@@ -160,11 +160,11 @@ def attention_hca(
     # negative table row.
     cmp_cos = pl.create_tensor([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     cmp_sin = pl.create_tensor([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    if start_pos + 1 >= COMPRESS_RATIO:
+    if (start_pos % COMPRESS_RATIO) + S >= COMPRESS_RATIO:
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cmp_rope"):
             cmp_cos_base = pl.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
             cmp_sin_base = pl.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-            cmp_pos = pl.cast(start_pos + 1 - COMPRESS_RATIO, pl.INDEX)
+            cmp_pos = pl.cast(start_pos + compress_offset - COMPRESS_RATIO, pl.INDEX)
             cmp_cos = pl.col_expand(
                 cmp_cos_base,
                 pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM // 2], [cmp_pos, 0]), target_type=pl.FP32),
@@ -248,7 +248,7 @@ def attention_hca(
 
     # cmp_kv scatter only happens on compression steps. Non-compression steps
     # update compressor state but keep the existing compressed cache intact.
-    if compress_rem == 0:
+    if (start_pos % COMPRESS_RATIO) + S >= COMPRESS_RATIO:
         cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
         cmp_block_table_flat = pl.reshape(cmp_block_table, [B * CMP_MAX_BLOCKS])
         cmp_kv_buf_flat = pl.reshape(cmp_kv_buf, [B * IDX_KV_LEN, HEAD_DIM])
@@ -411,7 +411,8 @@ def golden_attention_hca(tensors):
     win = WIN
     ratio = COMPRESS_RATIO
     rd = ROPE_HEAD_DIM
-    should_compress = ((start_pos + 1) % ratio) == 0
+    compress_offset = ratio - (start_pos % ratio)
+    should_compress = compress_offset <= S
 
     freqs_cos = tensors["freqs_cos"]
     freqs_sin = tensors["freqs_sin"]
@@ -420,9 +421,10 @@ def golden_attention_hca(tensors):
     rope_cos_T = step_cos.expand(T, rd).contiguous()
     rope_sin_T = step_sin.expand(T, rd).contiguous()
     half_rd = rd // 2
-    if start_pos + 1 >= ratio:
-        cmp_cos = freqs_cos[start_pos + 1 - ratio:start_pos + 2 - ratio, :half_rd]   # ratio128 compressor: half-vec [1, rd//2]
-        cmp_sin = freqs_sin[start_pos + 1 - ratio:start_pos + 2 - ratio, :half_rd]
+    if should_compress:
+        cmp_pos = start_pos + compress_offset - ratio
+        cmp_cos = freqs_cos[cmp_pos:cmp_pos + 1, :half_rd]   # ratio128 compressor: half-vec [1, rd//2]
+        cmp_sin = freqs_sin[cmp_pos:cmp_pos + 1, :half_rd]
     else:
         cmp_cos = torch.zeros(1, half_rd, dtype=torch.bfloat16)
         cmp_sin = torch.zeros(1, half_rd, dtype=torch.bfloat16)
@@ -454,7 +456,7 @@ def golden_attention_hca(tensors):
     topk_idxs = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
     topk_idxs[:, :win] = torch.arange(win, dtype=torch.int32)
     offset = win
-    cache_len = (start_pos + 1) // ratio
+    cache_len = (start_pos + seqlen) // ratio
     if cache_len > 0:
         k = min(cache_len, CMP_TOPK)
         topk_idxs[:, win:win + k] = torch.arange(k, dtype=torch.int32) + offset
