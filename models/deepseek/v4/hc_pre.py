@@ -156,7 +156,6 @@ def hc_pre(
         comb_logits = pl.assemble(comb_logits, comb_logits_val, [0, 0])
 
     post_pad_flat = pl.reshape(post_pad, [T * HC_PAD])
-    pre_val_t_flat = pl.reshape(pre_val_t, [HC_PAD * T])
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="transpose_pre"):
         for t0 in pl.range(0, T, T_TILE):
@@ -166,13 +165,8 @@ def hc_pre(
                 [T_TILE, HC_PAD],
                 target_memory=pl.MemorySpace.Vec,
             )
-            for ti in pl.unroll(T_TILE):
-                for h in pl.unroll(HC_MULT):
-                    pl.write(
-                        pre_val_t_flat,
-                        [h * T + t0 + ti],
-                        pl.read(pre_tile, [ti, h]),
-                    )
+            pre_tile_t = pl.transpose(pre_tile, axis1=0, axis2=1)
+            pre_val_t = pl.store(pre_tile_t, [0, t0], pre_val_t)
 
     for t0 in pl.parallel(0, T, COMB_T_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="comb_sinkhorn"):
