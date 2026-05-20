@@ -754,7 +754,7 @@ def build_qwen3_14b_l3_generate_program(
             user_batch = pl.tensor.dim(hidden_states, 0)
             batch_padded = ((user_batch + BATCH_TILE - 1) // BATCH_TILE) * BATCH_TILE
 
-            # Copy input into current_hidden (decode_full.py pattern).
+            # Copy input into current_hidden (decode_fwd.py pattern).
             current_hidden = pl.create_tensor([batch, hidden], dtype=pl.BF16)
             for b0 in pl.parallel(0, batch_padded, BATCH_TILE):
                 cur_valid = pl.min(BATCH_TILE, user_batch - b0)
