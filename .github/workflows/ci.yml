@@ -189,12 +189,25 @@ jobs:
           else
             FILES=$(find examples -name '*.py' ! -name '*draft*' | sort)
           fi
+          # Files that segfault on the simulator and are tracked separately;
+          # daily_ci covers the rest of Qwen3 14B and fails on sim too.
+          SIM_SKIPLIST="models/qwen3/14b/qwen3_14b_decode_mix.py"
           if [ -z "$FILES" ]; then
             echo "No runnable changed files; nothing to test."
             exit 0
           fi
           failed=()
           for f in $FILES; do
+            skip=0
+            for s in $SIM_SKIPLIST; do
+              [ "$f" = "$s" ] && skip=1 && break
+            done
+            if [ "$skip" = "1" ]; then
+              echo "::group::$f"
+              echo "Skipped on ${{ matrix.platform }} (in SIM_SKIPLIST)"
+              echo "::endgroup::"
+              continue
+            fi
             echo "::group::$f"
             if ! python "$f" -p ${{ matrix.platform }}; then
               failed+=("$f")
