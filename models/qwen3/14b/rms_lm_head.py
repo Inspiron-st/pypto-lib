@@ -81,7 +81,7 @@ def rms_lm_head(
                 lm_hidden_chunk = pl.slice(final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [b0, 0])
                 lm_weight_chunk = pl.slice(lm_head_weight, [VOCAB_CHUNK, LM_HEAD_K_CHUNK], [lm_o0, 0])
                 lm_acc = pl.matmul(lm_hidden_chunk, lm_weight_chunk, out_dtype=pl.FP32, b_trans=True)
-                for kb in pl.range(1, HIDDEN // LM_HEAD_K_CHUNK):
+                for kb in pl.pipeline(1, HIDDEN // LM_HEAD_K_CHUNK, stage=2):
                     lm_k0 = kb * LM_HEAD_K_CHUNK
                     lm_hidden_chunk = pl.slice(final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [b0, lm_k0])
                     lm_weight_chunk = pl.slice(
