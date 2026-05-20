@@ -79,6 +79,7 @@ ATTN_TOKEN_TILE = 8
 ROPE_TOKEN_TILE = 4
 ROPE_PACK_TOKEN_TILE = 32
 ROPE_PACK_GROUP_TILE = 1
+ROPE_PACK_SPMD_BLOCKS = (T // ROPE_PACK_TOKEN_TILE) * O_GROUPS
 MATMUL_ROW_PAD = 16
 SPARSE_ATTN_TILE = 64
 SPARSE_ATTN_BLOCKS = (TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE
@@ -89,6 +90,7 @@ A_N_CHUNK = 128
 B_K_CHUNK = 128
 B_N_CHUNK = 128 if T >= 128 else 256
 QUANT_CHUNK = 32 if T >= 128 else (128 if T >= 64 else 256)
+QUANT_TOKEN_TILE = 8
 
 
 def get_standalone_cmp_valid(compress_ratio: int) -> int:
@@ -124,6 +126,7 @@ def sparse_attn(
     """Run sparse decode attention, inverse RoPE, and grouped output projection."""
     A_K_BLOCKS = O_GROUP_IN // A_K_CHUNK
     A_N_BLOCKS = O_LORA // A_N_CHUNK
+    A_AMAX_BLOCKS = O_GROUPS * A_N_BLOCKS
     B_K_BLOCKS = (O_GROUPS * O_LORA) // B_K_CHUNK
     B_N_BLOCKS = D // B_N_CHUNK
 
@@ -421,39 +424,41 @@ def sparse_attn(
                         [rope_apply_head_row, 2 * rope_asm_r0],
                     )
 
-    for rope_combine_t0 in pl.parallel(0, T, ROPE_PACK_TOKEN_TILE):
-        for rope_pack_g0 in pl.parallel(0, O_GROUPS, ROPE_PACK_GROUP_TILE):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_rope_pack_group_tile"):
-                for rope_combine_dt in pl.range(ROPE_PACK_TOKEN_TILE):
-                    rope_combine_t = rope_combine_t0 + rope_combine_dt
-                    for rope_pack_dg in pl.range(ROPE_PACK_GROUP_TILE):
-                        rope_pack_g = rope_pack_g0 + rope_pack_dg
-                        rope_pack_head_row = rope_combine_t * H + rope_pack_g * HEADS_PER_GROUP
+    for rope_pack_block in pl.spmd(ROPE_PACK_SPMD_BLOCKS, name_hint="cfa_proj_rope_pack_group_spmd"):
+        rope_pack_token_block = rope_pack_block // O_GROUPS
+        rope_pack_g = rope_pack_block - rope_pack_token_block * O_GROUPS
+        rope_combine_t0 = rope_pack_token_block * ROPE_PACK_TOKEN_TILE
 
-                        # Merge and write only this group's inverse-RoPE tail.
-                        rope_even_tile = rope_even_interleave_buf[
-                            rope_pack_head_row : rope_pack_head_row + HEADS_PER_GROUP,
-                            0 : ROPE_DIM,
-                        ]
-                        rope_odd_tile = rope_odd_interleave_buf[
-                            rope_pack_head_row : rope_pack_head_row + HEADS_PER_GROUP,
-                            0 : ROPE_DIM,
-                        ]
-                        rope_full = pl.cast(
-                            pl.add(rope_even_tile, rope_odd_tile),
-                            target_type=pl.BF16,
-                        )
-                        rope_pack_row = rope_pack_g * T + rope_combine_t
-                        for rope_pack_hh in pl.range(HEADS_PER_GROUP):
-                            rope_pack_head_col = rope_pack_hh * HEAD_DIM + NOPE_DIM
-                            o_packed = pl.assemble(
-                                o_packed,
-                                rope_full[rope_pack_hh : rope_pack_hh + 1, 0:ROPE_DIM],
-                                [rope_pack_row, rope_pack_head_col],
-                            )
+        for rope_combine_dt in pl.range(ROPE_PACK_TOKEN_TILE):
+            rope_combine_t = rope_combine_t0 + rope_combine_dt
+            rope_pack_head_row = rope_combine_t * H + rope_pack_g * HEADS_PER_GROUP
+
+            # Merge and write only this group's inverse-RoPE tail.
+            rope_even_tile = rope_even_interleave_buf[
+                rope_pack_head_row : rope_pack_head_row + HEADS_PER_GROUP,
+                0 : ROPE_DIM,
+            ]
+            rope_odd_tile = rope_odd_interleave_buf[
+                rope_pack_head_row : rope_pack_head_row + HEADS_PER_GROUP,
+                0 : ROPE_DIM,
+            ]
+            rope_full = pl.cast(
+                pl.add(rope_even_tile, rope_odd_tile),
+                target_type=pl.BF16,
+            )
+            rope_pack_row = rope_pack_g * T + rope_combine_t
+            for rope_pack_hh in pl.range(HEADS_PER_GROUP):
+                rope_pack_head_col = rope_pack_hh * HEAD_DIM + NOPE_DIM
+                o_packed = pl.assemble(
+                    o_packed,
+                    rope_full[rope_pack_hh : rope_pack_hh + 1, 0:ROPE_DIM],
+                    [rope_pack_row, rope_pack_head_col],
+                )
 
     o_r = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.BF16)
     o_r_i8 = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.INT8)
+    o_r_amax_parts = pl.create_tensor([A_AMAX_BLOCKS, T], dtype=pl.FP32)
+    o_r_scale_dq = pl.create_tensor([T, 1], dtype=pl.FP32)
 
     # Stage 5: grouped BF16 projection `o_packed @ wo_a^T`, producing the
     # low-rank intermediate activation `o_r`.
@@ -475,32 +480,42 @@ def sparse_attn(
                     wa_k_chunk = wo_a[g:g + 1, n0:n0 + A_N_CHUNK, k0:k0 + A_K_CHUNK]
                     acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
 
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_stage_a_store"):
-                # Store this projection tile back as BF16 activations.
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_stage_a_store_amax"):
+                # Store BF16 activations and expose the tile's row-wise partial amax for quant.
                 acc_a_2d = pl.reshape(acc_a, [T, A_N_CHUNK])
-                o_r[:, out_col_g + n0:out_col_g + n0 + A_N_CHUNK] = pl.cast(
+                acc_a_bf16 = pl.cast(
                     acc_a_2d,
                     target_type=pl.BF16,
                 )
+                o_r[:, out_col_g + n0:out_col_g + n0 + A_N_CHUNK] = acc_a_bf16
+                acc_a_f32 = pl.cast(acc_a_bf16, target_type=pl.FP32)
+                acc_a_abs = pl.maximum(acc_a_f32, pl.neg(acc_a_f32))
+                acc_a_amax = pl.reshape(pl.row_max(acc_a_abs), [1, T])
+                amax_part_row = g * A_N_BLOCKS + nb
+                o_r_amax_parts[amax_part_row:amax_part_row + 1, 0:T] = acc_a_amax
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_stage_b_quant"):
-        # Stage 6: per-row symmetric INT8 quantization of `o_r` for the W8A8C16
-        # second projection stage.
-        or_amax = pl.full([1, T], dtype=pl.FP32, value=INT8_AMAX_EPS)
-        for k0 in pl.range(0, O_GROUPS * O_LORA, QUANT_CHUNK):
-            or_a_f32 = pl.cast(o_r[:, k0:k0 + QUANT_CHUNK], target_type=pl.FP32)
-            or_a_abs = pl.maximum(or_a_f32, pl.neg(or_a_f32))
-            or_a_max = pl.reshape(pl.row_max(or_a_abs), [1, T])
-            or_amax = pl.maximum(or_amax, or_a_max)
-        or_sq_row = pl.div(pl.full([1, T], dtype=pl.FP32, value=INT8_SCALE_MAX), or_amax)
-        o_r_scale_dq = pl.reshape(pl.recip(or_sq_row), [T, 1])
-        or_sq_col = pl.reshape(or_sq_row, [T, 1])
-        for k1 in pl.range(0, O_GROUPS * O_LORA, QUANT_CHUNK):
-            or_q_f32 = pl.cast(o_r[:, k1:k1 + QUANT_CHUNK], target_type=pl.FP32)
-            or_q_scaled = pl.row_expand_mul(or_q_f32, or_sq_col)
-            or_q_i32 = pl.cast(or_q_scaled, target_type=pl.INT32, mode="rint")
-            or_q_half = pl.cast(or_q_i32, target_type=pl.FP16, mode="round")
-            o_r_i8[:, k1:k1 + QUANT_CHUNK] = pl.cast(or_q_half, target_type=pl.INT8, mode="trunc")
+    # Stage 6: per-row symmetric INT8 quantization of `o_r` for the W8A8C16
+    # second projection stage.
+    for quant_t0 in pl.parallel(0, T, QUANT_TOKEN_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_stage_b_quant_tile"):
+            or_amax = pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+            for ab in pl.range(0, A_AMAX_BLOCKS, 1):
+                or_a_part = o_r_amax_parts[ab:ab + 1, quant_t0:quant_t0 + QUANT_TOKEN_TILE]
+                or_amax = pl.maximum(or_amax, or_a_part)
+            or_sq_row = pl.div(pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), or_amax)
+            or_scale_dq = pl.reshape(pl.recip(or_sq_row), [QUANT_TOKEN_TILE, 1])
+            o_r_scale_dq[quant_t0:quant_t0 + QUANT_TOKEN_TILE, 0:1] = or_scale_dq
+            or_sq_col = pl.reshape(or_sq_row, [QUANT_TOKEN_TILE, 1])
+            for k1 in pl.range(0, O_GROUPS * O_LORA, QUANT_CHUNK):
+                or_q_f32 = pl.cast(o_r[quant_t0:quant_t0 + QUANT_TOKEN_TILE, k1:k1 + QUANT_CHUNK], target_type=pl.FP32)
+                or_q_scaled = pl.row_expand_mul(or_q_f32, or_sq_col)
+                or_q_i32 = pl.cast(or_q_scaled, target_type=pl.INT32, mode="rint")
+                or_q_half = pl.cast(or_q_i32, target_type=pl.FP16, mode="round")
+                o_r_i8[quant_t0:quant_t0 + QUANT_TOKEN_TILE, k1:k1 + QUANT_CHUNK] = pl.cast(
+                    or_q_half,
+                    target_type=pl.INT8,
+                    mode="trunc",
+                )
 
     # Stage 7: INT8 projection `o_r_i8 @ wo_b^T`, then dequantize with the
     # activation and weight scales into the final BF16 output.
