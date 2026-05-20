@@ -16,6 +16,8 @@ chunk adds the same scalar ``a`` elementwise.
 
 The parallel loop with chunk= lets the compiler split the iteration space
 into (chunk_loop, in_chunk_loop) and place the incore boundary automatically.
+
+This is the canonical "first kernel" for newcomers to the DSL.
 """
 import pypto.language as pl
 
