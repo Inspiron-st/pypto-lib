@@ -61,7 +61,11 @@ DOWN_MLP_CHUNK = 256
 DOWN_OUT_CHUNK = 256
 FINAL_RMS_K_CHUNK = 128
 LM_HEAD_K_CHUNK = 128
-VOCAB_CHUNK = 64
+# LM-head vocab tile. 152064 / 512 = 297 output blocks. Larger than the
+# old 64 (2376 blocks) to cut LM-head task count ~8x (the LM-head fan-out
+# dominates decode task count and the regime is scheduler-bound) and to
+# give the projection matmul a wider N dim.
+VOCAB_CHUNK = 512
 
 # Decode grouping.
 Q_PER_KV = NUM_HEADS // NUM_KV_HEADS
