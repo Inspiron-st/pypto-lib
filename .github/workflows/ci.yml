@@ -51,7 +51,42 @@ jobs:
       - name: Run golden unit tests
         run: pytest tests/golden -v
 
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.check.outputs.has_changes }}
+      files: ${{ steps.check.outputs.files }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: check
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "files=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only \
+            ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }} \
+            | grep -E '^(examples|models)/.*\.py$' | grep -v draft || true)
+          FILES=""
+          for f in $CHANGED; do
+            [ -f "$f" ] || continue
+            grep -q '__main__' "$f" && FILES="$FILES $f"
+          done
+          FILES=$(echo $FILES | xargs)
+          if [ -n "$FILES" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+          echo "Selected files: $FILES"
+
   sim:
+    needs: detect-changes
+    if: github.event_name != 'pull_request' || needs.detect-changes.outputs.has_changes == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -147,17 +182,38 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          for f in $(find examples -name '*.py' ! -name '*draft*' | sort); do
+          set +e
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            FILES="${{ needs.detect-changes.outputs.files }}"
+          else
+            FILES=$(find examples -name '*.py' ! -name '*draft*' | sort)
+          fi
+          if [ -z "$FILES" ]; then
+            echo "No runnable changed files; nothing to test."
+            exit 0
+          fi
+          failed=()
+          for f in $FILES; do
             echo "::group::$f"
-            python "$f" -p ${{ matrix.platform }}
+            if ! python "$f" -p ${{ matrix.platform }}; then
+              failed+=("$f")
+              echo "::error file=${f}::FAIL"
+            fi
             echo "::endgroup::"
           done
+          if [ ${#failed[@]} -ne 0 ]; then
+            printf 'FAILED: %s\n' "${failed[@]}"
+            exit 1
+          fi
+          echo "All selected files passed."
 
       - name: Clean up build artifacts
         if: always()
         run: rm -rf build_output
 
   a2a3:
+    needs: detect-changes
+    if: github.event_name != 'pull_request' || needs.detect-changes.outputs.has_changes == 'true'
     runs-on: [self-hosted, linux, arm64, npu]
     timeout-minutes: 30
     concurrency:
@@ -270,11 +326,30 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          for f in $(find examples -name '*.py' ! -name '*draft*' | sort); do
+          set +e
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            FILES="${{ needs.detect-changes.outputs.files }}"
+          else
+            FILES=$(find examples -name '*.py' ! -name '*draft*' | sort)
+          fi
+          if [ -z "$FILES" ]; then
+            echo "No runnable changed files; nothing to test."
+            exit 0
+          fi
+          failed=()
+          for f in $FILES; do
             echo "::group::$f"
-            python "$f" -p a2a3 -d $DEVICE_ID
+            if ! python "$f" -p a2a3 -d $DEVICE_ID; then
+              failed+=("$f")
+              echo "::error file=${f}::FAIL"
+            fi
             echo "::endgroup::"
           done
+          if [ ${#failed[@]} -ne 0 ]; then
+            printf 'FAILED: %s\n' "${failed[@]}"
+            exit 1
+          fi
+          echo "All selected files passed."
 
       - name: Clean up build artifacts
         if: always()
