@@ -79,6 +79,7 @@ ATTN_TOKEN_TILE = 8
 ROPE_TOKEN_TILE = 4
 ROPE_PACK_TOKEN_TILE = 32
 ROPE_PACK_GROUP_TILE = 1
+ROPE_PACK_SPMD_BLOCKS = (T // ROPE_PACK_TOKEN_TILE) * O_GROUPS
 MATMUL_ROW_PAD = 16
 SPARSE_ATTN_TILE = 64
 SPARSE_ATTN_BLOCKS = (TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE
@@ -89,6 +90,7 @@ A_N_CHUNK = 128
 B_K_CHUNK = 128
 B_N_CHUNK = 128 if T >= 128 else 256
 QUANT_CHUNK = 32 if T >= 128 else (128 if T >= 64 else 256)
+QUANT_TOKEN_TILE = 8
 
 
 def get_standalone_cmp_valid(compress_ratio: int) -> int:
@@ -124,6 +126,7 @@ def sparse_attn(
     """Run sparse decode attention, inverse RoPE, and grouped output projection."""
     A_K_BLOCKS = O_GROUP_IN // A_K_CHUNK
     A_N_BLOCKS = O_LORA // A_N_CHUNK
+    A_AMAX_BLOCKS = O_GROUPS * A_N_BLOCKS
     B_K_BLOCKS = (O_GROUPS * O_LORA) // B_K_CHUNK
     B_N_BLOCKS = D // B_N_CHUNK
 
@@ -144,8 +147,6 @@ def sparse_attn(
     sparse_oi = pl.create_tensor([T * H, HEAD_DIM], dtype=pl.FP32)
     o_proj_even = pl.create_tensor([T * H, HALF_ROPE], dtype=pl.FP32)
     o_proj_odd = pl.create_tensor([T * H, HALF_ROPE], dtype=pl.FP32)
-    rope_even = pl.create_tensor([T * H, HALF_ROPE], dtype=pl.BF16)
-    rope_odd = pl.create_tensor([T * H, HALF_ROPE], dtype=pl.BF16)
     rope_even_interleave_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     rope_odd_interleave_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
@@ -358,61 +359,56 @@ def sparse_attn(
                         rope_slice_head_row : rope_slice_head_row + H,
                         2 * rope_slice_r0 : 2 * rope_slice_r0 + ROPE_INTERLEAVE_CHUNK,
                     ]
-                    even_chunk = pl.matmul(rope_tile, even_select_local, out_dtype=pl.FP32)
-                    odd_chunk = pl.matmul(rope_tile, odd_select_local, out_dtype=pl.FP32)
-                    o_proj_even = pl.assemble(o_proj_even, even_chunk, [rope_slice_head_row, rope_slice_r0])
-                    o_proj_odd = pl.assemble(o_proj_odd, odd_chunk, [rope_slice_head_row, rope_slice_r0])
+                    rope_slice_even_chunk = pl.matmul(rope_tile, even_select_local, out_dtype=pl.FP32)
+                    rope_slice_odd_chunk = pl.matmul(rope_tile, odd_select_local, out_dtype=pl.FP32)
+                    o_proj_even = pl.assemble(o_proj_even, rope_slice_even_chunk, [rope_slice_head_row, rope_slice_r0])
+                    o_proj_odd = pl.assemble(o_proj_odd, rope_slice_odd_chunk, [rope_slice_head_row, rope_slice_r0])
 
-    # Stage 3: inverse RoPE on the rope slice of the attention output by
-    # rotating the even/odd halves, then reinterleaving into packed rows.
+    # Stage 3: rotate even/odd halves and immediately reinterleave them. Keeping
+    # the BF16 rint cast local avoids the new orchestration SSA collision on
+    # written-then-read RoPE GM scratch tensors.
     for rope_apply_t0 in pl.parallel(0, T, ROPE_TOKEN_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_rope_apply_tile"):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_rope_apply_assemble_tile"):
             for rope_apply_dt in pl.range(ROPE_TOKEN_TILE):
                 rope_apply_t = rope_apply_t0 + rope_apply_dt
                 rope_apply_head_row = rope_apply_t * H
 
-                # Apply inverse rotary mixing with this token's cos/sin tables.
-                cos_tile = pl.cast(freqs_cos[rope_apply_t : rope_apply_t + 1, 0 : HALF_ROPE], target_type=pl.FP32)
-                sin_tile = pl.cast(freqs_sin[rope_apply_t : rope_apply_t + 1, 0 : HALF_ROPE], target_type=pl.FP32)
-                even_tile = o_proj_even[rope_apply_head_row : rope_apply_head_row + H, :]
-                odd_tile = o_proj_odd[rope_apply_head_row : rope_apply_head_row + H, :]
-                rope_even_acc = pl.add(
-                    pl.col_expand_mul(even_tile, cos_tile),
-                    pl.col_expand_mul(odd_tile, sin_tile),
-                )
-                rope_odd_acc = pl.sub(
-                    pl.col_expand_mul(odd_tile, cos_tile),
-                    pl.col_expand_mul(even_tile, sin_tile),
-                )
-                rope_even = pl.assemble(
-                    rope_even,
-                    pl.cast(rope_even_acc, target_type=pl.BF16, mode="rint"),
-                    [rope_apply_head_row, 0],
-                )
-                rope_odd = pl.assemble(
-                    rope_odd,
-                    pl.cast(rope_odd_acc, target_type=pl.BF16, mode="rint"),
-                    [rope_apply_head_row, 0],
-                )
-
-    for rope_asm_t0 in pl.parallel(0, T, ROPE_TOKEN_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_rope_assemble_matmul_tile"):
-            for rope_asm_dt in pl.range(ROPE_TOKEN_TILE):
-                rope_asm_t = rope_asm_t0 + rope_asm_dt
-                rope_asm_head_row = rope_asm_t * H
-
                 # Reinterleave the rotated even/odd halves back to rope lane order.
                 for rope_asm_r0 in pl.range(0, HALF_ROPE, ROPE_CHUNK):
-                    rope_even_chunk = rope_even[rope_asm_head_row : rope_asm_head_row + H, rope_asm_r0 : rope_asm_r0 + ROPE_CHUNK]
-                    rope_odd_chunk = rope_odd[rope_asm_head_row : rope_asm_head_row + H, rope_asm_r0 : rope_asm_r0 + ROPE_CHUNK]
+                    cos_chunk = pl.cast(
+                        freqs_cos[rope_apply_t : rope_apply_t + 1, rope_asm_r0 : rope_asm_r0 + ROPE_CHUNK],
+                        target_type=pl.FP32,
+                    )
+                    sin_chunk = pl.cast(
+                        freqs_sin[rope_apply_t : rope_apply_t + 1, rope_asm_r0 : rope_asm_r0 + ROPE_CHUNK],
+                        target_type=pl.FP32,
+                    )
+                    rope_apply_even_chunk = o_proj_even[
+                        rope_apply_head_row : rope_apply_head_row + H,
+                        rope_asm_r0 : rope_asm_r0 + ROPE_CHUNK,
+                    ]
+                    rope_apply_odd_chunk = o_proj_odd[
+                        rope_apply_head_row : rope_apply_head_row + H,
+                        rope_asm_r0 : rope_asm_r0 + ROPE_CHUNK,
+                    ]
+                    rope_even_acc = pl.add(
+                        pl.col_expand_mul(rope_apply_even_chunk, cos_chunk),
+                        pl.col_expand_mul(rope_apply_odd_chunk, sin_chunk),
+                    )
+                    rope_odd_acc = pl.sub(
+                        pl.col_expand_mul(rope_apply_odd_chunk, cos_chunk),
+                        pl.col_expand_mul(rope_apply_even_chunk, sin_chunk),
+                    )
+                    rope_rot_even_chunk = pl.cast(rope_even_acc, target_type=pl.BF16, mode="rint")
+                    rope_rot_odd_chunk = pl.cast(rope_odd_acc, target_type=pl.BF16, mode="rint")
                     rope_even_interleave = pl.matmul(
-                        rope_even_chunk,
+                        rope_rot_even_chunk,
                         even_select_local,
                         b_trans=True,
                         out_dtype=pl.FP32,
                     )
                     rope_odd_interleave = pl.matmul(
-                        rope_odd_chunk,
+                        rope_rot_odd_chunk,
                         odd_select_local,
                         b_trans=True,
                         out_dtype=pl.FP32,
@@ -420,47 +416,49 @@ def sparse_attn(
                     rope_even_interleave_buf = pl.assemble(
                         rope_even_interleave_buf,
                         rope_even_interleave,
-                        [rope_asm_head_row, 2 * rope_asm_r0],
+                        [rope_apply_head_row, 2 * rope_asm_r0],
                     )
                     rope_odd_interleave_buf = pl.assemble(
                         rope_odd_interleave_buf,
                         rope_odd_interleave,
-                        [rope_asm_head_row, 2 * rope_asm_r0],
+                        [rope_apply_head_row, 2 * rope_asm_r0],
                     )
 
-    for rope_combine_t0 in pl.parallel(0, T, ROPE_PACK_TOKEN_TILE):
-        for rope_pack_g0 in pl.parallel(0, O_GROUPS, ROPE_PACK_GROUP_TILE):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_rope_pack_group_tile"):
-                for rope_combine_dt in pl.range(ROPE_PACK_TOKEN_TILE):
-                    rope_combine_t = rope_combine_t0 + rope_combine_dt
-                    for rope_pack_dg in pl.range(ROPE_PACK_GROUP_TILE):
-                        rope_pack_g = rope_pack_g0 + rope_pack_dg
-                        rope_pack_head_row = rope_combine_t * H + rope_pack_g * HEADS_PER_GROUP
+    for rope_pack_block in pl.spmd(ROPE_PACK_SPMD_BLOCKS, name_hint="cfa_proj_rope_pack_group_spmd"):
+        rope_pack_token_block = rope_pack_block // O_GROUPS
+        rope_pack_g = rope_pack_block - rope_pack_token_block * O_GROUPS
+        rope_combine_t0 = rope_pack_token_block * ROPE_PACK_TOKEN_TILE
 
-                        # Merge and write only this group's inverse-RoPE tail.
-                        rope_even_tile = rope_even_interleave_buf[
-                            rope_pack_head_row : rope_pack_head_row + HEADS_PER_GROUP,
-                            0 : ROPE_DIM,
-                        ]
-                        rope_odd_tile = rope_odd_interleave_buf[
-                            rope_pack_head_row : rope_pack_head_row + HEADS_PER_GROUP,
-                            0 : ROPE_DIM,
-                        ]
-                        rope_full = pl.cast(
-                            pl.add(rope_even_tile, rope_odd_tile),
-                            target_type=pl.BF16,
-                        )
-                        rope_pack_row = rope_pack_g * T + rope_combine_t
-                        for rope_pack_hh in pl.range(HEADS_PER_GROUP):
-                            rope_pack_head_col = rope_pack_hh * HEAD_DIM + NOPE_DIM
-                            o_packed = pl.assemble(
-                                o_packed,
-                                rope_full[rope_pack_hh : rope_pack_hh + 1, 0:ROPE_DIM],
-                                [rope_pack_row, rope_pack_head_col],
-                            )
+        for rope_combine_dt in pl.range(ROPE_PACK_TOKEN_TILE):
+            rope_combine_t = rope_combine_t0 + rope_combine_dt
+            rope_pack_head_row = rope_combine_t * H + rope_pack_g * HEADS_PER_GROUP
+
+            # Merge and write only this group's inverse-RoPE tail.
+            rope_even_tile = rope_even_interleave_buf[
+                rope_pack_head_row : rope_pack_head_row + HEADS_PER_GROUP,
+                0 : ROPE_DIM,
+            ]
+            rope_odd_tile = rope_odd_interleave_buf[
+                rope_pack_head_row : rope_pack_head_row + HEADS_PER_GROUP,
+                0 : ROPE_DIM,
+            ]
+            rope_full = pl.cast(
+                pl.add(rope_even_tile, rope_odd_tile),
+                target_type=pl.BF16,
+            )
+            rope_pack_row = rope_pack_g * T + rope_combine_t
+            for rope_pack_hh in pl.range(HEADS_PER_GROUP):
+                rope_pack_head_col = rope_pack_hh * HEAD_DIM + NOPE_DIM
+                o_packed = pl.assemble(
+                    o_packed,
+                    rope_full[rope_pack_hh : rope_pack_hh + 1, 0:ROPE_DIM],
+                    [rope_pack_row, rope_pack_head_col],
+                )
 
     o_r = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.BF16)
     o_r_i8 = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.INT8)
+    o_r_amax_parts = pl.create_tensor([A_AMAX_BLOCKS, T], dtype=pl.FP32)
+    o_r_scale_dq = pl.create_tensor([T, 1], dtype=pl.FP32)
 
     # Stage 5: grouped BF16 projection `o_packed @ wo_a^T`, producing the
     # low-rank intermediate activation `o_r`.
@@ -482,32 +480,42 @@ def sparse_attn(
                     wa_k_chunk = wo_a[g:g + 1, n0:n0 + A_N_CHUNK, k0:k0 + A_K_CHUNK]
                     acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
 
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_stage_a_store"):
-                # Store this projection tile back as BF16 activations.
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_stage_a_store_amax"):
+                # Store BF16 activations and expose the tile's row-wise partial amax for quant.
                 acc_a_2d = pl.reshape(acc_a, [T, A_N_CHUNK])
-                o_r[:, out_col_g + n0:out_col_g + n0 + A_N_CHUNK] = pl.cast(
+                acc_a_bf16 = pl.cast(
                     acc_a_2d,
                     target_type=pl.BF16,
                 )
+                o_r[:, out_col_g + n0:out_col_g + n0 + A_N_CHUNK] = acc_a_bf16
+                acc_a_f32 = pl.cast(acc_a_bf16, target_type=pl.FP32)
+                acc_a_abs = pl.maximum(acc_a_f32, pl.neg(acc_a_f32))
+                acc_a_amax = pl.reshape(pl.row_max(acc_a_abs), [1, T])
+                amax_part_row = g * A_N_BLOCKS + nb
+                o_r_amax_parts[amax_part_row:amax_part_row + 1, 0:T] = acc_a_amax
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_stage_b_quant"):
-        # Stage 6: per-row symmetric INT8 quantization of `o_r` for the W8A8C16
-        # second projection stage.
-        or_amax = pl.full([1, T], dtype=pl.FP32, value=INT8_AMAX_EPS)
-        for k0 in pl.range(0, O_GROUPS * O_LORA, QUANT_CHUNK):
-            or_a_f32 = pl.cast(o_r[:, k0:k0 + QUANT_CHUNK], target_type=pl.FP32)
-            or_a_abs = pl.maximum(or_a_f32, pl.neg(or_a_f32))
-            or_a_max = pl.reshape(pl.row_max(or_a_abs), [1, T])
-            or_amax = pl.maximum(or_amax, or_a_max)
-        or_sq_row = pl.div(pl.full([1, T], dtype=pl.FP32, value=INT8_SCALE_MAX), or_amax)
-        o_r_scale_dq = pl.reshape(pl.recip(or_sq_row), [T, 1])
-        or_sq_col = pl.reshape(or_sq_row, [T, 1])
-        for k1 in pl.range(0, O_GROUPS * O_LORA, QUANT_CHUNK):
-            or_q_f32 = pl.cast(o_r[:, k1:k1 + QUANT_CHUNK], target_type=pl.FP32)
-            or_q_scaled = pl.row_expand_mul(or_q_f32, or_sq_col)
-            or_q_i32 = pl.cast(or_q_scaled, target_type=pl.INT32, mode="rint")
-            or_q_half = pl.cast(or_q_i32, target_type=pl.FP16, mode="round")
-            o_r_i8[:, k1:k1 + QUANT_CHUNK] = pl.cast(or_q_half, target_type=pl.INT8, mode="trunc")
+    # Stage 6: per-row symmetric INT8 quantization of `o_r` for the W8A8C16
+    # second projection stage.
+    for quant_t0 in pl.parallel(0, T, QUANT_TOKEN_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_stage_b_quant_tile"):
+            or_amax = pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+            for ab in pl.range(0, A_AMAX_BLOCKS, 1):
+                or_a_part = o_r_amax_parts[ab:ab + 1, quant_t0:quant_t0 + QUANT_TOKEN_TILE]
+                or_amax = pl.maximum(or_amax, or_a_part)
+            or_sq_row = pl.div(pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), or_amax)
+            or_scale_dq = pl.reshape(pl.recip(or_sq_row), [QUANT_TOKEN_TILE, 1])
+            o_r_scale_dq[quant_t0:quant_t0 + QUANT_TOKEN_TILE, 0:1] = or_scale_dq
+            or_sq_col = pl.reshape(or_sq_row, [QUANT_TOKEN_TILE, 1])
+            for k1 in pl.range(0, O_GROUPS * O_LORA, QUANT_CHUNK):
+                or_q_f32 = pl.cast(o_r[quant_t0:quant_t0 + QUANT_TOKEN_TILE, k1:k1 + QUANT_CHUNK], target_type=pl.FP32)
+                or_q_scaled = pl.row_expand_mul(or_q_f32, or_sq_col)
+                or_q_i32 = pl.cast(or_q_scaled, target_type=pl.INT32, mode="rint")
+                or_q_half = pl.cast(or_q_i32, target_type=pl.FP16, mode="round")
+                o_r_i8[quant_t0:quant_t0 + QUANT_TOKEN_TILE, k1:k1 + QUANT_CHUNK] = pl.cast(
+                    or_q_half,
+                    target_type=pl.INT8,
+                    mode="trunc",
+                )
 
     # Stage 7: INT8 projection `o_r_i8 @ wo_b^T`, then dequantize with the
     # activation and weight scales into the final BF16 output.
